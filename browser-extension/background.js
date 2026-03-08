@@ -1,11 +1,14 @@
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:8765/inject";
 const BRIDGE_TIMEOUT_MS = 12000;
+/** TTS can be slow for long text (external API + encoding); use a longer timeout. */
+const TTS_BRIDGE_TIMEOUT_MS = 120000;
 const TRANSCRIPT_STATE_KEY = "sharedTranscriptKeys";
 const CLIENT_SESSION_ID_KEY = "clientSessionId";
 const PRIMARY_BROWSER_LABEL = "Hermes Sidecar";
 const LEGACY_BROWSER_LABEL = "Chrome Extension";
 const ACTIVE_LABEL_KEY = "activeBrowserLabel";
 const PAGE_CONTEXT_CACHE_TTL_MS = 90000;
+const TRANSCRIPT_TEXT_CACHE_TTL_MS = 10 * 60 * 1000;
 const REQUIRED_HOST_ORIGINS = new Set([
   "http://127.0.0.1/*",
   "http://localhost/*",
@@ -17,6 +20,7 @@ const REQUIRED_HOST_ORIGINS = new Set([
   "https://youtube.com/*"
 ]);
 const pageContextCache = new Map();
+const transcriptTextCache = new Map();
 
 function cloneContext(value) {
   try {
@@ -28,6 +32,56 @@ function cloneContext(value) {
 
 function getTextLength(value) {
   return String(value || "").length;
+}
+
+function getTranscriptCacheKey(context) {
+  const transcript = context?.transcript || {};
+  const transcriptKey = String(transcript.key || transcript.videoId || transcript.video_id || "").trim();
+  if (transcriptKey) {
+    return transcriptKey;
+  }
+  return String(context?.url || "").trim();
+}
+
+function readCachedTranscriptText(context) {
+  const cacheKey = getTranscriptCacheKey(context);
+  if (!cacheKey) {
+    return null;
+  }
+
+  const entry = transcriptTextCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+
+  const text = String(entry.text || "").trim();
+  if (!text) {
+    transcriptTextCache.delete(cacheKey);
+    return null;
+  }
+  const capturedAt = Number(entry.capturedAt || 0);
+  if (!capturedAt || Date.now() - capturedAt > TRANSCRIPT_TEXT_CACHE_TTL_MS) {
+    transcriptTextCache.delete(cacheKey);
+    return null;
+  }
+
+  return text;
+}
+
+function rememberTranscriptText(context, text) {
+  const cacheKey = getTranscriptCacheKey(context);
+  if (!cacheKey) {
+    return;
+  }
+  const normalizedText = String(text || "").trim();
+  if (!normalizedText) {
+    transcriptTextCache.delete(cacheKey);
+    return;
+  }
+  transcriptTextCache.set(cacheKey, {
+    capturedAt: Date.now(),
+    text: normalizedText
+  });
 }
 
 function withPageTextSource(context, sourceLabel) {
@@ -133,6 +187,147 @@ function readCachedPageContext(tabId, expectedUrl = "") {
     return null;
   }
   return cloneContext(entry.context || {});
+}
+
+function clampPreviewText(value, maxLength = 220) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) {
+    return "";
+  }
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
+}
+
+function summarizeMetadataPreview(context) {
+  const metadata = context?.metadata || {};
+  const parts = [];
+  const addPart = (value, prefix = "") => {
+    const text = clampPreviewText(value, 80);
+    if (text) {
+      parts.push(prefix ? `${prefix}${text}` : text);
+    }
+  };
+
+  addPart(context?.siteName, "Site: ");
+  addPart(context?.contentKind, "Kind: ");
+  addPart(context?.description, "Summary: ");
+  addPart(metadata.author, "Author: ");
+  addPart(metadata.byline, "Byline: ");
+  addPart(metadata.channelName, "Channel: ");
+  addPart(metadata.publishedTime, "Published: ");
+
+  return parts.slice(0, 4).join(" | ");
+}
+
+function normalizeContextOptions(options) {
+  const next = options && typeof options === "object" ? options : {};
+  return {
+    includeTitle: next.includeTitle !== false,
+    includeUrl: next.includeUrl !== false,
+    includeMetadata: next.includeMetadata !== false,
+    includeSelection: next.includeSelection !== false,
+    includePageText: next.includePageText !== false
+  };
+}
+
+function buildContextBundlePreview(context, transcriptAlreadyShared = false) {
+  const transcript = context?.transcript || {};
+  const transcriptText = String(transcript.text || "");
+  const transcriptLength = getTextLength(transcriptText);
+  const transcriptReady = transcriptLength > 0;
+  const transcriptChunkAvailable = transcriptReady || transcriptAlreadyShared;
+  const metadataPreview = summarizeMetadataPreview(context);
+  return {
+    chunks: {
+      title: {
+        key: "title",
+        label: "Title",
+        available: Boolean(context?.title),
+        includedByDefault: Boolean(context?.title),
+        length: getTextLength(context?.title),
+        preview: clampPreviewText(context?.title, 120),
+        reason: "Quickly tells Hermes what page or tab this came from."
+      },
+      url: {
+        key: "url",
+        label: "URL",
+        available: Boolean(context?.url),
+        includedByDefault: Boolean(context?.url),
+        length: getTextLength(context?.url),
+        preview: clampPreviewText(context?.url, 140),
+        reason: "Preserves the exact source and makes follow-up references clearer."
+      },
+      metadata: {
+        key: "metadata",
+        label: "Metadata",
+        available: Boolean(metadataPreview),
+        includedByDefault: Boolean(metadataPreview),
+        length: getTextLength(metadataPreview),
+        preview: metadataPreview,
+        reason: "Adds author, site, kind, and other framing details when they help."
+      },
+      selection: {
+        key: "selection",
+        label: "Selected text",
+        available: Boolean(context?.selection),
+        includedByDefault: Boolean(context?.selection),
+        length: getTextLength(context?.selection),
+        preview: clampPreviewText(context?.selection, 220),
+        reason: "Usually the highest-signal chunk because you pointed at it directly."
+      },
+      pageText: {
+        key: "pageText",
+        label: "Page text",
+        available: Boolean(context?.pageText),
+        includedByDefault: Boolean(context?.pageText),
+        length: getTextLength(context?.pageText),
+        preview: clampPreviewText(context?.pageText, 220),
+        reason: "Gives Hermes the surrounding page context beyond the exact selection."
+      },
+      transcript: {
+        key: "transcript",
+        label: "YouTube transcript",
+        available: transcriptChunkAvailable,
+        includedByDefault: transcriptReady && !transcriptAlreadyShared,
+        length: transcriptLength,
+        preview: transcriptAlreadyShared
+          ? "Already shared earlier in this browser session."
+          : transcriptReady
+            ? transcript.language
+              ? `Full transcript ready (${transcript.language}).`
+              : "Full transcript ready."
+            : "",
+        reason: "Best for spoken content that is missing from the visible page."
+      }
+    }
+  };
+}
+
+function applyContextOptionsToPayload(context, options) {
+  const normalized = normalizeContextOptions(options);
+  return {
+    ...context,
+    title: normalized.includeTitle ? String(context?.title || "") : "",
+    url: normalized.includeUrl ? String(context?.url || "") : "",
+    description: normalized.includeMetadata ? String(context?.description || "") : "",
+    canonicalUrl: normalized.includeMetadata ? String(context?.canonicalUrl || "") : "",
+    siteName: normalized.includeMetadata ? String(context?.siteName || "") : "",
+    contentKind: normalized.includeMetadata ? String(context?.contentKind || "") : "",
+    metadata: normalized.includeMetadata ? cloneContext(context?.metadata || {}) : {},
+    selection: normalized.includeSelection ? String(context?.selection || "") : "",
+    pageText: normalized.includePageText ? String(context?.pageText || "") : ""
+  };
+}
+
+function isYouTubeWatchUrl(rawUrl) {
+  try {
+    const u = new URL(String(rawUrl || ""));
+    return (/^(www\.)?youtube\.com$/i.test(u.hostname) && u.pathname === "/watch" && u.searchParams.has("v"));
+  } catch (_e) {
+    return false;
+  }
 }
 
 function isRestrictedPageUrl(rawUrl) {
@@ -316,11 +511,11 @@ function resolveBridgeEndpoint(pathname, bridgeUrl) {
   return url.toString();
 }
 
-async function callBridge(pathname, { method = "POST", token = "", body } = {}) {
+async function callBridge(pathname, { method = "POST", token = "", body, timeoutMs = BRIDGE_TIMEOUT_MS } = {}) {
   const settings = await getSettings();
   const headers = {};
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), BRIDGE_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   if (token) {
     headers.Authorization = `Bearer ${token}`;
@@ -339,7 +534,7 @@ async function callBridge(pathname, { method = "POST", token = "", body } = {}) 
     });
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw new Error(`Bridge request timed out after ${BRIDGE_TIMEOUT_MS / 1000}s.`);
+      throw new Error(`Bridge request timed out after ${timeoutMs / 1000}s.`);
     }
     throw error;
   } finally {
@@ -473,6 +668,43 @@ async function captureRenderedPageTextFallback(tabId) {
       }
     });
     return String(result || "").trim();
+  } catch (_error) {
+    return "";
+  }
+}
+
+async function fetchTranscriptTextViaBridge(context, urlHint = "") {
+  const cachedText = readCachedTranscriptText(context);
+  if (cachedText !== null) {
+    return cachedText;
+  }
+
+  const transcript = context?.transcript || {};
+  const targetUrl = String(context?.url || urlHint || "").trim();
+  const fallbackVideoId = String(
+    transcript.videoId || transcript.video_id || transcript.key || ""
+  ).trim();
+  if (!targetUrl && !fallbackVideoId) {
+    return "";
+  }
+
+  try {
+    const token = await getBridgeToken();
+    const language = String(transcript.language || "").trim();
+    const response = await callBridge("/session", {
+      token,
+      body: {
+        action: "fetch_transcript",
+        ...(targetUrl ? { url: targetUrl } : {}),
+        ...(!targetUrl && fallbackVideoId ? { video_id: fallbackVideoId } : {}),
+        language
+      }
+    });
+    const transcriptText = String(response?.transcript_text || "").trim();
+    if (transcriptText) {
+      rememberTranscriptText(context, transcriptText);
+    }
+    return transcriptText;
   } catch (_error) {
     return "";
   }
@@ -660,6 +892,65 @@ async function collectPageContext(tabId, includeTranscriptText, waitForHydration
   }
 }
 
+async function ensurePreviewTranscriptText(tabId, context, onYouTubeWatch, urlHint = "") {
+  if (!onYouTubeWatch) {
+    return context;
+  }
+
+  let nextContext = context;
+  let transcript = nextContext?.transcript || {};
+  const existingTranscriptText = String(transcript.text || "").trim();
+  if (existingTranscriptText) {
+    rememberTranscriptText(nextContext, existingTranscriptText);
+    return nextContext;
+  }
+
+  let bridgeTranscriptText = await fetchTranscriptTextViaBridge(nextContext, urlHint);
+  if (bridgeTranscriptText) {
+    return {
+      ...nextContext,
+      transcript: {
+        ...transcript,
+        available: true,
+        text: bridgeTranscriptText.slice(0, 30000),
+        source: transcript.source || "hermes-bridge-transcript"
+      }
+    };
+  }
+
+  const retried = await collectPageContext(tabId, true, true);
+  if ((retried.pageText || "").length > (nextContext.pageText || "").length) {
+    nextContext = retried;
+  } else {
+    nextContext = {
+      ...nextContext,
+      transcript: retried?.transcript || nextContext.transcript
+    };
+  }
+
+  transcript = nextContext?.transcript || {};
+  const hydratedTranscriptText = String(transcript.text || "").trim();
+  if (hydratedTranscriptText) {
+    rememberTranscriptText(nextContext, hydratedTranscriptText);
+    return nextContext;
+  }
+
+  bridgeTranscriptText = await fetchTranscriptTextViaBridge(nextContext, urlHint);
+  if (bridgeTranscriptText) {
+    return {
+      ...nextContext,
+      transcript: {
+        ...transcript,
+        available: true,
+        text: bridgeTranscriptText.slice(0, 30000),
+        source: transcript.source || "hermes-bridge-transcript"
+      }
+    };
+  }
+
+  return nextContext;
+}
+
 async function previewPageContext(tabId) {
   const tab = await getTabSnapshot(tabId);
   const tabUrl = String(tab?.url || "");
@@ -679,9 +970,15 @@ async function previewPageContext(tabId) {
     };
   }
 
-  let context = await collectPageContext(tabId, false, false);
+  const onYouTubeWatch = isYouTubeWatchUrl(tabUrl);
+  if (onYouTubeWatch) {
+    await ensureContentScript(tabId);
+  }
+  const wantTranscriptForPreview = onYouTubeWatch;
+  let context = await collectPageContext(tabId, wantTranscriptForPreview, wantTranscriptForPreview);
+  context = await ensurePreviewTranscriptText(tabId, context, onYouTubeWatch, tabUrl);
   if ((context.pageText || "").length < 300) {
-    const retried = await collectPageContext(tabId, false, true);
+    const retried = await collectPageContext(tabId, wantTranscriptForPreview, true);
     if ((retried.pageText || "").length > (context.pageText || "").length) {
       context = retried;
     }
@@ -698,20 +995,25 @@ async function previewPageContext(tabId) {
   const transcript = context.transcript || {};
   const state = await getTranscriptState();
   const transcriptKey = transcript.key || "";
+  const transcriptAlreadyShared = Boolean(transcriptKey && state[transcriptKey]);
+  const transcriptTextReady = Boolean(String(transcript.text || "").trim());
+  const transcriptReady = transcriptTextReady || transcriptAlreadyShared;
+
   return {
     title: context.title || "",
     url: context.url || "",
     contentKind: context.contentKind || "",
     selectionLength: (context.selection || "").length,
     pageTextLength: (context.pageText || "").length,
-    transcriptAvailable: Boolean(transcript.available),
-    transcriptAlreadyShared: Boolean(transcriptKey && state[transcriptKey]),
+    transcriptAvailable: transcriptReady,
+    transcriptAlreadyShared,
     transcriptLanguage: transcript.language || "",
-    transcriptKey
+    transcriptKey,
+    bundle: buildContextBundlePreview(context, transcriptAlreadyShared)
   };
 }
 
-async function buildPageContextPayload(tabId, message, includeTranscript, browserLabel) {
+async function buildPageContextPayload(tabId, message, includeTranscript, browserLabel, contextOptions = null) {
   const tab = await getTabSnapshot(tabId);
   const tabUrl = String(tab?.url || "");
   if (isRestrictedPageUrl(tab?.url || "")) {
@@ -723,12 +1025,26 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
 
   const preview = await previewPageContext(tabId);
   const cachedPreviewContext = readCachedPageContext(tabId, tabUrl || preview.url || "");
+  const onYouTubeWatch = isYouTubeWatchUrl(tabUrl);
   const shouldIncludeTranscript =
     Boolean(includeTranscript) &&
-    preview.transcriptAvailable &&
+    (preview.transcriptAvailable || onYouTubeWatch) &&
     !preview.transcriptAlreadyShared;
 
+  if (shouldIncludeTranscript && onYouTubeWatch) {
+    await ensureContentScript(tabId);
+  }
+
   let context = await collectPageContext(tabId, shouldIncludeTranscript, true);
+  if (shouldIncludeTranscript && onYouTubeWatch) {
+    context = await ensurePreviewTranscriptText(tabId, context, true, tabUrl || preview.url || "");
+    if (!String(context?.transcript?.text || "").trim()) {
+      throw new Error(
+        "YouTube transcript was requested but no transcript text was retrieved. " +
+        "Click Refresh now and send again."
+      );
+    }
+  }
   context = applySelectionFallback(context, "selection-fallback-background");
   if ((context.pageText || "").length < 220) {
     const retried = await collectPageContext(tabId, shouldIncludeTranscript, true);
@@ -772,6 +1088,7 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
     );
   }
 
+  context = applyContextOptionsToPayload(context, contextOptions);
   const transcript = context.transcript || {};
   return {
     preview,
@@ -900,7 +1217,7 @@ async function resetChatSession(sessionKey = "", createNew = false) {
   });
 }
 
-async function startChatMessage(tabId, message, sharePage, includeTranscript, sessionKey = "") {
+async function startChatMessage(tabId, message, sharePage, includeTranscript, sessionKey = "", contextOptions = null) {
   const token = await getBridgeToken();
   const clientSessionId = await getClientSessionId();
   const browserLabel = await getActiveBrowserLabel();
@@ -917,13 +1234,23 @@ async function startChatMessage(tabId, message, sharePage, includeTranscript, se
   let sentSelectionLength = 0;
   let sentPageTextLength = 0;
   if (sharePage) {
-    const pageContext = await buildPageContextPayload(tabId, message, includeTranscript, browserLabel);
+    const pageContext = await buildPageContextPayload(
+      tabId,
+      message,
+      includeTranscript,
+      browserLabel,
+      contextOptions
+    );
     body.pageContext = pageContext.payload;
     preview = pageContext.preview;
     sentSelectionLength = String(pageContext.payload.selection || "").length;
     sentPageTextLength = String(pageContext.payload.pageText || "").length;
+    const sentTranscript = pageContext.payload.transcript || {};
+    const sentTranscriptLength = String(sentTranscript.text || "").length;
     console.debug(
-      "[Hermes] Sending page context: pageText=" + sentPageTextLength + " chars, selection=" + sentSelectionLength + " chars, url=" + (pageContext.payload.url || "")
+      "[Hermes] Sending page context: pageText=" + sentPageTextLength + " chars, selection=" + sentSelectionLength + " chars" +
+      (sentTranscriptLength ? ", transcript=" + sentTranscriptLength + " chars" : "") +
+      ", url=" + (pageContext.payload.url || "")
     );
   }
 
@@ -972,6 +1299,18 @@ async function checkBridgeHealth() {
     throw new Error(`Health check failed with status ${response.status}.`);
   }
   return response.json();
+}
+
+async function generateChatSpeech(text) {
+  const token = await getBridgeToken();
+  return callBridge("/session", {
+    token,
+    timeoutMs: TTS_BRIDGE_TIMEOUT_MS,
+    body: {
+      action: "tts",
+      text: String(text || "")
+    }
+  });
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -1056,7 +1395,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         message.message || "",
         message.sharePage,
         message.includeTranscript,
-        message.sessionKey || ""
+        message.sessionKey || "",
+        message.contextOptions || null
       );
       sendResponse({ ok: true, result });
       return;
@@ -1077,6 +1417,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message.type === "hermes:speak-chat-message") {
+      const result = await generateChatSpeech(message.text || "");
+      sendResponse({ ok: true, result });
+      return;
+    }
+
     sendResponse({ ok: false, error: "Unknown message type." });
   })().catch((error) => {
     sendResponse({
@@ -1087,3 +1433,4 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return true;
 });
+

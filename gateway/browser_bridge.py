@@ -149,8 +149,23 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         normalized["page_text"] = normalized["selection"]
         metadata["pageTextSource"] = metadata.get("pageTextSource") or "selection-fallback-gateway"
 
-    if not normalized["url"]:
-        raise ValueError("Payload must include a page URL.")
+    has_reference_material = any(
+        [
+            normalized["url"],
+            normalized["title"],
+            normalized["selection"],
+            normalized["page_text"],
+            normalized["description"],
+            normalized["canonical_url"],
+            normalized["site_name"],
+            normalized["content_kind"],
+            bool(metadata),
+            bool(normalized["transcript"].get("text")),
+            bool(normalized["transcript"].get("available")),
+        ]
+    )
+    if not has_reference_material:
+        raise ValueError("Payload must include some page context.")
 
     return normalized
 
@@ -170,18 +185,21 @@ def build_browser_context_message(payload: dict[str, Any]) -> str:
         "",
         "User request:",
         note,
-        "",
-        "Page details:",
-        f"- Title: {normalized['title'] or '(untitled)'}",
-        f"- URL: {normalized['url']}",
     ]
 
+    detail_lines = []
+    if normalized["title"]:
+        detail_lines.append(f"- Title: {normalized['title']}")
+    if normalized["url"]:
+        detail_lines.append(f"- URL: {normalized['url']}")
     if normalized["canonical_url"] and normalized["canonical_url"] != normalized["url"]:
-        sections.append(f"- Canonical URL: {normalized['canonical_url']}")
+        detail_lines.append(f"- Canonical URL: {normalized['canonical_url']}")
     if normalized["site_name"]:
-        sections.append(f"- Site: {normalized['site_name']}")
+        detail_lines.append(f"- Site: {normalized['site_name']}")
     if normalized["content_kind"]:
-        sections.append(f"- Content kind: {normalized['content_kind']}")
+        detail_lines.append(f"- Content kind: {normalized['content_kind']}")
+    if detail_lines:
+        sections.extend(["", "Page details:", *detail_lines])
     if normalized["description"]:
         sections.extend(["", "Page description:", normalized["description"]])
 
@@ -436,4 +454,8 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError) as e:
+            # Client closed the connection (timeout, tab closed, etc.) before we finished.
+            logger.debug("Browser bridge client disconnected before response: %s", e)

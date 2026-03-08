@@ -14,11 +14,15 @@ Usage:
 """
 
 import asyncio
+import base64
+import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
 import shutil
+import subprocess
 import socket
 import sys
 import signal
@@ -1744,6 +1748,102 @@ class GatewayRunner:
                 return line[len(prefix):].strip()
         return ""
 
+    @staticmethod
+    def _extract_youtube_video_id(url_or_id: str) -> str:
+        value = str(url_or_id or "").strip()
+        patterns = [
+            r"(?:v=|youtu\.be/|shorts/|embed/|live/)([a-zA-Z0-9_-]{11})",
+            r"^([a-zA-Z0-9_-]{11})$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, value)
+            if match:
+                return match.group(1)
+        return value
+
+    @classmethod
+    def _fetch_bridge_youtube_transcript(
+        cls,
+        url_or_id: str,
+        language: str = "",
+    ) -> Dict[str, Any]:
+        """Fetch transcript text for browser bridge sidebar previews."""
+        video_id = cls._extract_youtube_video_id(url_or_id)
+        if not video_id:
+            raise ValueError("A YouTube URL or video ID is required.")
+
+        def _load_transcript_api():
+            from youtube_transcript_api import YouTubeTranscriptApi
+
+            return YouTubeTranscriptApi
+
+        try:
+            YouTubeTranscriptApi = _load_transcript_api()
+        except Exception:
+            install_cmd = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "youtube-transcript-api",
+            ]
+            install = subprocess.run(
+                install_cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+            )
+            if install.returncode != 0:
+                details = (install.stderr or install.stdout or "").strip()
+                raise ValueError(
+                    "Failed to install youtube-transcript-api in the Hermes gateway environment."
+                    + (f" Details: {details}" if details else "")
+                )
+            try:
+                YouTubeTranscriptApi = _load_transcript_api()
+            except Exception as exc:
+                raise ValueError(
+                    "youtube-transcript-api install completed but import still failed."
+                ) from exc
+
+        languages = [language.strip()] if language and language.strip() else None
+        api = YouTubeTranscriptApi()
+        kwargs = {"languages": languages} if languages else {}
+
+        if hasattr(api, "fetch"):
+            fetched = api.fetch(video_id, **kwargs)
+            segments = []
+            for segment in fetched:
+                if isinstance(segment, dict):
+                    text = str(segment.get("text") or "").strip()
+                else:
+                    text = str(getattr(segment, "text", "") or "").strip()
+                if text:
+                    segments.append(text)
+        else:
+            raw_segments = (
+                YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+                if languages
+                else YouTubeTranscriptApi.get_transcript(video_id)
+            )
+            segments = [
+                str(segment.get("text") or "").strip()
+                for segment in raw_segments
+                if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+            ]
+
+        full_text = " ".join(segments).strip()
+        return {
+            "video_id": video_id,
+            "language": (languages[0] if languages else ""),
+            "segment_count": len(segments),
+            "transcript_text": full_text,
+            "char_count": len(full_text),
+        }
+
     def _serialize_browser_bridge_history(
         self,
         history: List[Dict[str, Any]],
@@ -1845,6 +1945,22 @@ class GatewayRunner:
         client_session_id = str(payload.get("clientSessionId") or payload.get("client_session_id") or "").strip()
         selected_session_key = str(payload.get("sessionKey") or payload.get("session_key") or "").strip()
 
+        if action == "fetch_transcript":
+            target = str(payload.get("url") or payload.get("video_id") or "").strip()
+            language = str(payload.get("language") or "").strip()
+            if not target:
+                raise ValueError("fetch_transcript requires a YouTube URL or video_id.")
+
+            result = await asyncio.to_thread(
+                self._fetch_bridge_youtube_transcript,
+                target,
+                language,
+            )
+            return {
+                "ok": True,
+                **result,
+            }
+
         if action == "list":
             raw_limit = payload.get("limit", 20)
             try:
@@ -1874,6 +1990,43 @@ class GatewayRunner:
                 **snapshot,
             }
 
+        if action == "tts":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                raise ValueError("TTS text is required.")
+
+            from tools.tts_tool import text_to_speech_tool
+
+            audio_dir = _hermes_home / "audio_cache"
+            audio_dir.mkdir(parents=True, exist_ok=True)
+            output_path = audio_dir / f"browser_tts_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.mp3"
+
+            result_json = await asyncio.to_thread(
+                text_to_speech_tool,
+                text,
+                str(output_path),
+            )
+            try:
+                result = json.loads(result_json)
+            except Exception as exc:
+                raise ValueError(f"Invalid TTS response: {result_json}") from exc
+
+            if not result.get("success"):
+                raise ValueError(str(result.get("error") or "TTS generation failed."))
+
+            file_path = Path(str(result.get("file_path") or "").strip())
+            if not file_path.exists() or file_path.stat().st_size <= 0:
+                raise ValueError("TTS audio file was not created.")
+
+            mime_type = mimetypes.guess_type(str(file_path))[0] or "audio/mpeg"
+            audio_base64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
+            return {
+                "ok": True,
+                "provider": str(result.get("provider") or ""),
+                "mime_type": mime_type,
+                "audio_base64": audio_base64,
+            }
+
         source = self._resolve_browser_bridge_source(
             browser_label=browser_label,
             client_session_id=client_session_id,
@@ -1898,6 +2051,11 @@ class GatewayRunner:
             }
 
         if action not in {"send", "send_async"}:
+            if action == "tts":
+                raise ValueError(
+                    "TTS (Read aloud) is not available. Restart the Hermes gateway "
+                    "('hermes gateway') so it loads the latest code, then try again."
+                )
             raise ValueError(f"Unsupported browser bridge action: {action}")
 
         page_payload = payload.get("pageContext")

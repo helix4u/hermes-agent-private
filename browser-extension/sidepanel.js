@@ -20,6 +20,11 @@ const resetChatButton = document.getElementById("reset-chat-button");
 const activityPanel = document.getElementById("activity-panel");
 const sessionHistorySelect = document.getElementById("session-history-select");
 const refreshSessionsButton = document.getElementById("refresh-sessions-button");
+const challengeModeButton = document.getElementById("challenge-mode-button");
+const bundlePanel = document.getElementById("bundle-panel");
+const bundleList = document.getElementById("bundle-list");
+const bundleModeNote = document.getElementById("bundle-mode-note");
+const presetButtons = Array.from(document.querySelectorAll(".preset-button"));
 const STATUS_INLINE_MAX_CHARS = 220;
 const STATUS_INLINE_MAX_LINES = 3;
 const STATUS_ACTIVITY_MAX_CHARS = 700;
@@ -44,6 +49,11 @@ let selectedSessionKey = "";
 let isApplyingSessionSelection = false;
 let pageContextUnavailable = false;
 let latestDomainPermission = null;
+let challengeModeEnabled = false;
+let bundleSelectionState = null;
+let activeAudioMessageKey = "";
+let activeReplyAudio = null;
+let activeReplyAudioUrl = "";
 
 function compactStatusText(
   message,
@@ -147,6 +157,357 @@ function setStatus(message, { openActivity = false } = {}) {
   }
 }
 
+function getMessageText(message) {
+  return String(message?.display_content || message?.content || "").trim();
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text || "");
+  if (!value) {
+    return;
+  }
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const fallback = document.createElement("textarea");
+  fallback.value = value;
+  fallback.setAttribute("readonly", "readonly");
+  fallback.style.position = "fixed";
+  fallback.style.opacity = "0";
+  document.body.appendChild(fallback);
+  fallback.select();
+  document.execCommand("copy");
+  document.body.removeChild(fallback);
+}
+
+function rerenderCurrentMessages() {
+  renderMessages(currentMessages, currentProgress, pendingUserMessage);
+}
+
+function clearReplyAudioState() {
+  if (activeReplyAudio) {
+    try {
+      activeReplyAudio.pause();
+    } catch (_error) {
+      // Ignore pause failures during cleanup.
+    }
+    activeReplyAudio.src = "";
+  }
+  if (activeReplyAudioUrl) {
+    URL.revokeObjectURL(activeReplyAudioUrl);
+  }
+  activeReplyAudio = null;
+  activeReplyAudioUrl = "";
+  activeAudioMessageKey = "";
+}
+
+function stopReplySpeech({ rerender = true } = {}) {
+  clearReplyAudioState();
+  if (rerender) {
+    rerenderCurrentMessages();
+  }
+}
+
+function decodeBase64Audio(base64Text) {
+  const binary = atob(String(base64Text || ""));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+async function speakReply(message) {
+  const text = getMessageText(message);
+  if (!text) {
+    return;
+  }
+
+  const nextKey = messageKey(message);
+  if (activeAudioMessageKey === nextKey) {
+    stopReplySpeech();
+    return;
+  }
+
+  clearReplyAudioState();
+  activeAudioMessageKey = nextKey;
+  rerenderCurrentMessages();
+  setStatus("Generating reply audio with Hermes TTS...");
+
+  try {
+    const response = await sendRuntimeMessage({
+      type: "hermes:speak-chat-message",
+      text
+    });
+    const result = response.result || {};
+    const audioBase64 = String(result.audio_base64 || "");
+    if (!audioBase64) {
+      throw new Error("Hermes TTS did not return any audio.");
+    }
+
+    const mimeType = String(result.mime_type || "audio/mpeg");
+    const audioBytes = decodeBase64Audio(audioBase64);
+    const blob = new Blob([audioBytes], { type: mimeType });
+    const audioUrl = URL.createObjectURL(blob);
+    const audio = new Audio(audioUrl);
+
+    activeReplyAudio = audio;
+    activeReplyAudioUrl = audioUrl;
+    audio.onended = () => {
+      if (activeReplyAudio !== audio) {
+        return;
+      }
+      clearReplyAudioState();
+      rerenderCurrentMessages();
+    };
+    audio.onerror = () => {
+      if (activeReplyAudio !== audio) {
+        return;
+      }
+      clearReplyAudioState();
+      rerenderCurrentMessages();
+      setStatus("Could not play Hermes TTS audio.");
+    };
+
+    await audio.play();
+    const provider = String(result.provider || "").trim();
+    setStatus(
+      provider
+        ? `Playing reply with Hermes TTS (${provider}).`
+        : "Playing reply with Hermes TTS."
+    );
+  } catch (error) {
+    clearReplyAudioState();
+    rerenderCurrentMessages();
+    setStatus(error?.message || "Could not generate Hermes TTS audio.", { openActivity: true });
+  }
+}
+
+function formatCharCount(value) {
+  const count = Number(value || 0);
+  if (!count) {
+    return "0 chars";
+  }
+  return `${count.toLocaleString()} chars`;
+}
+
+function createDefaultBundleSelectionState(preview) {
+  const chunks = preview?.bundle?.chunks || {};
+  return {
+    includeTitle: Boolean(chunks.title?.includedByDefault),
+    includeUrl: Boolean(chunks.url?.includedByDefault),
+    includeMetadata: Boolean(chunks.metadata?.includedByDefault),
+    includeSelection: Boolean(chunks.selection?.includedByDefault),
+    includePageText: Boolean(chunks.pageText?.includedByDefault)
+  };
+}
+
+function syncBundleSelectionState(preview, { preserveExisting = false } = {}) {
+  const defaults = createDefaultBundleSelectionState(preview);
+  if (!preserveExisting || !bundleSelectionState) {
+    bundleSelectionState = defaults;
+    return;
+  }
+  bundleSelectionState = {
+    includeTitle: preview?.bundle?.chunks?.title?.available
+      ? bundleSelectionState.includeTitle !== false
+      : defaults.includeTitle,
+    includeUrl: preview?.bundle?.chunks?.url?.available
+      ? bundleSelectionState.includeUrl !== false
+      : defaults.includeUrl,
+    includeMetadata: preview?.bundle?.chunks?.metadata?.available
+      ? bundleSelectionState.includeMetadata !== false
+      : defaults.includeMetadata,
+    includeSelection: preview?.bundle?.chunks?.selection?.available
+      ? bundleSelectionState.includeSelection !== false
+      : defaults.includeSelection,
+    includePageText: preview?.bundle?.chunks?.pageText?.available
+      ? bundleSelectionState.includePageText !== false
+      : defaults.includePageText
+  };
+}
+
+function buildOutgoingMessage(message) {
+  const userMessage = String(message || "").trim();
+  if (!challengeModeEnabled) {
+    return userMessage;
+  }
+  const challengeInstruction =
+    "Before answering, briefly challenge my framing. " +
+    "Call out likely assumptions, missing context, and plausible alternative interpretations, then continue with the best answer.";
+  if (!userMessage) {
+    return challengeInstruction;
+  }
+  return `${userMessage}\n\n${challengeInstruction}`;
+}
+
+function getContextOptionsForSend() {
+  const state = bundleSelectionState || createDefaultBundleSelectionState(lastPreview);
+  return {
+    includeTitle: state.includeTitle !== false,
+    includeUrl: state.includeUrl !== false,
+    includeMetadata: state.includeMetadata !== false,
+    includeSelection: state.includeSelection !== false,
+    includePageText: state.includePageText !== false
+  };
+}
+
+function listEnabledBundleChunks() {
+  const chunks = lastPreview?.bundle?.chunks || {};
+  const enabled = [];
+  const state = getContextOptionsForSend();
+  if (chunks.title?.available && state.includeTitle) {
+    enabled.push(chunks.title.label || "Title");
+  }
+  if (chunks.url?.available && state.includeUrl) {
+    enabled.push(chunks.url.label || "URL");
+  }
+  if (chunks.metadata?.available && state.includeMetadata) {
+    enabled.push(chunks.metadata.label || "Metadata");
+  }
+  if (chunks.selection?.available && state.includeSelection) {
+    enabled.push(chunks.selection.label || "Selected text");
+  }
+  if (chunks.pageText?.available && state.includePageText) {
+    enabled.push(chunks.pageText.label || "Page text");
+  }
+  if (chunks.transcript?.available && includeTranscript.checked && !includeTranscript.disabled) {
+    enabled.push(chunks.transcript.label || "YouTube transcript");
+  }
+  return enabled;
+}
+
+function applyPresetTemplate(template) {
+  const value = String(template || "").trim();
+  if (!value) {
+    return;
+  }
+  const current = chatInput.value.trim();
+  chatInput.value = current ? `${current}\n\n${value}` : value;
+  chatInput.focus();
+  chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
+}
+
+function setChallengeModeEnabled(enabled) {
+  challengeModeEnabled = Boolean(enabled);
+  if (challengeModeButton) {
+    challengeModeButton.setAttribute("aria-pressed", challengeModeEnabled ? "true" : "false");
+  }
+  if (bundleModeNote) {
+    bundleModeNote.hidden = !challengeModeEnabled;
+  }
+}
+
+function renderContextBundle() {
+  if (!bundlePanel || !bundleList) {
+    return;
+  }
+  const preview = lastPreview;
+  const chunks = preview?.bundle?.chunks || {};
+  const shouldShow = Boolean(
+    sharePageCheckbox.checked &&
+    !pageContextUnavailable &&
+    preview &&
+    Object.values(chunks).some((chunk) => chunk?.available)
+  );
+
+  const wasHidden = bundlePanel.hidden;
+  bundlePanel.hidden = !shouldShow;
+  bundleList.textContent = "";
+  if (bundleModeNote) {
+    bundleModeNote.hidden = !challengeModeEnabled;
+  }
+  if (!shouldShow) {
+    return;
+  }
+  if (wasHidden) {
+    bundlePanel.open = true;
+  }
+
+  const rows = [
+    { chunkKey: "title", stateKey: "includeTitle" },
+    { chunkKey: "url", stateKey: "includeUrl" },
+    { chunkKey: "metadata", stateKey: "includeMetadata" },
+    { chunkKey: "selection", stateKey: "includeSelection" },
+    { chunkKey: "pageText", stateKey: "includePageText" },
+    { chunkKey: "transcript", stateKey: null }
+  ];
+
+  for (const row of rows) {
+    const chunk = chunks[row.chunkKey];
+    if (!chunk?.available) {
+      continue;
+    }
+
+    const wrapper = document.createElement("label");
+    wrapper.className = "bundle-row";
+
+    const toggle = document.createElement("input");
+    toggle.className = "bundle-toggle";
+    toggle.type = "checkbox";
+
+    let checked = false;
+    let disabled = false;
+    if (row.chunkKey === "transcript") {
+      checked = includeTranscript.checked && !includeTranscript.disabled;
+      disabled = includeTranscript.disabled;
+      toggle.addEventListener("change", () => {
+        includeTranscript.checked = toggle.checked;
+        renderContextBundle();
+      });
+    } else {
+      checked = bundleSelectionState?.[row.stateKey] !== false;
+      toggle.addEventListener("change", () => {
+        bundleSelectionState = {
+          ...(bundleSelectionState || createDefaultBundleSelectionState(preview)),
+          [row.stateKey]: toggle.checked
+        };
+        renderContextBundle();
+      });
+    }
+    toggle.checked = checked;
+    toggle.disabled = disabled;
+    wrapper.classList.toggle("is-disabled", !checked || disabled);
+    wrapper.appendChild(toggle);
+
+    const body = document.createElement("div");
+    body.className = "bundle-body";
+
+    const top = document.createElement("div");
+    top.className = "bundle-row-top";
+
+    const label = document.createElement("span");
+    label.className = "bundle-label";
+    label.textContent = chunk.label || row.chunkKey;
+    top.appendChild(label);
+
+    const metric = document.createElement("span");
+    metric.className = "bundle-metric";
+    metric.textContent = formatCharCount(chunk.length || 0);
+    top.appendChild(metric);
+    body.appendChild(top);
+
+    if (chunk.preview) {
+      const previewText = document.createElement("p");
+      previewText.className = "bundle-preview";
+      previewText.textContent = chunk.preview;
+      body.appendChild(previewText);
+    }
+
+    if (chunk.reason) {
+      const reason = document.createElement("p");
+      reason.className = "bundle-reason";
+      reason.textContent = chunk.reason;
+      body.appendChild(reason);
+    }
+
+    wrapper.appendChild(body);
+    bundleList.appendChild(wrapper);
+  }
+}
+
 function renderChatNotice(message) {
   chatMessages.textContent = "";
   const empty = document.createElement("div");
@@ -165,7 +526,10 @@ function setBusyState(busy) {
   if (refreshSessionsButton) {
     refreshSessionsButton.disabled = busy;
   }
-  sendButton.textContent = busy ? "Waiting for Hermes..." : "Send";
+  sendButton.textContent = busy ? "Working..." : "Send";
+  sendButton.title = busy
+    ? "Hermes is working on the current turn"
+    : "Send your current message to Hermes";
 }
 
 function stopPolling() {
@@ -541,8 +905,49 @@ function renderMessages(messages, progress = null, optimisticMessage = null) {
 
     const body = document.createElement("p");
     body.className = "message-body";
-    body.textContent = message.display_content || message.content || "";
+    body.textContent = getMessageText(message);
     bubble.appendChild(body);
+
+    const canActOnReply = message.role === "assistant" && message.kind !== "pending" && getMessageText(message);
+    if (canActOnReply) {
+      const actions = document.createElement("div");
+      actions.className = "message-actions";
+
+      const copyButton = document.createElement("button");
+      copyButton.className = "message-action-button";
+      copyButton.type = "button";
+      copyButton.textContent = "Copy";
+      copyButton.title = "Copy this reply to your clipboard";
+      copyButton.addEventListener("click", async () => {
+        try {
+          await copyTextToClipboard(getMessageText(message));
+          setStatus("Reply copied to clipboard.");
+        } catch (error) {
+          setStatus(error?.message || "Could not copy this reply.");
+        }
+      });
+      actions.appendChild(copyButton);
+
+      const speakButton = document.createElement("button");
+      speakButton.className = "message-action-button";
+      speakButton.type = "button";
+      const isSpeaking = activeAudioMessageKey === messageKey(message);
+      if (isSpeaking) {
+        speakButton.classList.add("is-active");
+      }
+      speakButton.textContent = isSpeaking ? "Stop audio" : "Read aloud";
+      speakButton.title = isSpeaking
+        ? "Stop Hermes TTS playback for this reply"
+        : "Read this reply aloud using Hermes' configured TTS voice";
+      speakButton.addEventListener("click", () => {
+        speakReply(message).catch((error) => {
+          setStatus(error?.message || "Could not generate Hermes TTS audio.", { openActivity: true });
+        });
+      });
+      actions.appendChild(speakButton);
+
+      bubble.appendChild(actions);
+    }
 
     wrapper.appendChild(bubble);
     chatMessages.appendChild(wrapper);
@@ -555,17 +960,21 @@ function applyTranscriptUiState(result) {
   if (result.contentKind === "youtube-watch" && result.transcriptAvailable && result.transcriptAlreadyShared) {
     includeTranscript.checked = false;
     includeTranscript.disabled = true;
-    includeTranscriptLabel.textContent = "Transcript already shared for this video";
+    includeTranscriptLabel.textContent = "Transcript already shared";
     return;
   }
 
   includeTranscript.disabled = false;
-  includeTranscriptLabel.textContent = "Include the YouTube transcript the first time this video is shared";
+  includeTranscriptLabel.textContent = "Include transcript once per video";
 }
 
 function renderPreview(result) {
   pageContextUnavailable = false;
+  const previousUrl = lastPreview?.url || "";
   lastPreview = result || null;
+  syncBundleSelectionState(result, {
+    preserveExisting: Boolean(previousUrl && previousUrl === (result?.url || ""))
+  });
   pageTitle.textContent = result.title || "Untitled page";
   pageUrl.textContent = result.url || "";
   contentKind.textContent = result.contentKind || "web-page";
@@ -578,8 +987,9 @@ function renderPreview(result) {
     sharePageCheckbox.disabled = true;
     includeTranscript.checked = false;
     includeTranscript.disabled = true;
-    includeTranscriptLabel.textContent = "Transcript is unavailable on browser internal tabs";
+    includeTranscriptLabel.textContent = "Transcript unavailable on this tab";
     transcriptStatus.textContent = "Unavailable on this tab";
+    renderContextBundle();
     return;
   }
 
@@ -598,11 +1008,13 @@ function renderPreview(result) {
   }
 
   applyTranscriptUiState(result);
+  renderContextBundle();
 }
 
 function renderUnavailablePreview(message) {
   pageContextUnavailable = true;
   lastPreview = null;
+  bundleSelectionState = null;
   pageTitle.textContent = "Page context unavailable";
   pageUrl.textContent = "";
   contentKind.textContent = "unavailable";
@@ -613,7 +1025,8 @@ function renderUnavailablePreview(message) {
   sharePageCheckbox.disabled = true;
   includeTranscript.checked = false;
   includeTranscript.disabled = true;
-  includeTranscriptLabel.textContent = "Transcript is unavailable until page context is available";
+  includeTranscriptLabel.textContent = "Transcript unavailable until page context loads";
+  renderContextBundle();
   if (message) {
     setStatus(message);
   }
@@ -625,6 +1038,7 @@ async function loadSettings() {
   includeTranscript.checked = settings.includeTranscriptByDefault !== false;
   sharePageByDefault = settings.sharePageByDefault !== false;
   sharePageCheckbox.checked = sharePageByDefault;
+  renderContextBundle();
 }
 
 async function refreshPreview({ quiet = false } = {}) {
@@ -750,7 +1164,8 @@ async function loadChatSession({ quiet = false, sessionKey = "" } = {}) {
   }
 }
 
-async function sendChatMessage() {
+async function sendChatMessage(messageOverride = null, options = {}) {
+  stopReplySpeech({ rerender: false });
   if (isBusy) {
     await loadChatSession({ quiet: true });
     if (isBusy) {
@@ -762,8 +1177,13 @@ async function sendChatMessage() {
     await getActiveTab();
   }
 
-  const message = chatInput.value.trim();
-  const sharePage = sharePageCheckbox.checked;
+  const message = messageOverride === null
+    ? chatInput.value.trim()
+    : String(messageOverride || "").trim();
+  const outgoingMessage = buildOutgoingMessage(message);
+  const forceIncludeTranscript = Boolean(options.forceIncludeTranscript);
+  const sharePage = forceIncludeTranscript || sharePageCheckbox.checked;
+  const includeTranscriptForSend = forceIncludeTranscript || includeTranscript.checked;
   if (sharePage && pageContextUnavailable) {
     throw new Error(
       "Current tab context is unavailable. Switch to a normal webpage tab, or turn off page sharing for this turn."
@@ -785,20 +1205,22 @@ async function sendChatMessage() {
     response = await sendRuntimeMessage({
       type: "hermes:start-chat-message",
       tabId: activeTabId,
-      message,
+      message: outgoingMessage,
       sharePage,
-      includeTranscript: includeTranscript.checked,
-      sessionKey: targetSessionKey
+      includeTranscript: includeTranscriptForSend,
+      sessionKey: targetSessionKey,
+      contextOptions: sharePage ? getContextOptionsForSend() : null
     });
   } catch (error) {
     if (String(error?.message || "").includes("Unknown message type")) {
       response = await sendRuntimeMessage({
         type: "hermes:send-chat-message",
         tabId: activeTabId,
-        message,
+        message: outgoingMessage,
         sharePage,
-        includeTranscript: includeTranscript.checked,
-        sessionKey: targetSessionKey
+        includeTranscript: includeTranscriptForSend,
+        sessionKey: targetSessionKey,
+        contextOptions: sharePage ? getContextOptionsForSend() : null
       });
     } else {
       throw error;
@@ -827,6 +1249,10 @@ async function sendChatMessage() {
   const sentPageTextLength = Number(response.result?.sent_page_text_length || 0);
   const sentSelectionLength = Number(response.result?.sent_selection_length || 0);
   if (sharePage) {
+    const enabledChunks = listEnabledBundleChunks();
+    if (enabledChunks.length) {
+      lines.push(`Included chunks: ${enabledChunks.join(", ")}.`);
+    }
     lines.push(
       `Sent page context: ${sentPageTextLength} chars page text, ${sentSelectionLength} chars selection.`
     );
@@ -844,7 +1270,9 @@ async function sendChatMessage() {
   }
   setStatus(lines.join("\n"), { openActivity: true });
 
-  chatInput.value = "";
+  if (messageOverride === null) {
+    chatInput.value = "";
+  }
   if (sharePage) {
     await refreshPreview({ quiet: true });
   }
@@ -852,7 +1280,15 @@ async function sendChatMessage() {
   schedulePolling();
 }
 
+function handleSendError(error) {
+  setBusyState(false);
+  pendingUserMessage = null;
+  renderMessages(currentMessages, null, null);
+  setStatus(explainBackgroundMismatch(error), { openActivity: true });
+}
+
 async function resetChatSession() {
+  stopReplySpeech({ rerender: false });
   if (isBusy) {
     setStatus("Wait for the current Hermes turn to finish before starting a new chat.", { openActivity: true });
     return;
@@ -987,12 +1423,7 @@ if (sessionHistorySelect) {
 }
 
 document.getElementById("send-button").addEventListener("click", () => {
-  sendChatMessage().catch((error) => {
-    setBusyState(false);
-    pendingUserMessage = null;
-    renderMessages(currentMessages, null, null);
-    setStatus(explainBackgroundMismatch(error), { openActivity: true });
-  });
+  sendChatMessage().catch(handleSendError);
 });
 
 document.getElementById("reset-chat-button").addEventListener("click", () => {
@@ -1006,15 +1437,38 @@ document.getElementById("open-options-button").addEventListener("click", () => {
   chrome.runtime.openOptionsPage();
 });
 
+if (challengeModeButton) {
+  challengeModeButton.addEventListener("click", () => {
+    setChallengeModeEnabled(!challengeModeEnabled);
+    renderContextBundle();
+  });
+}
+
+function isTranscriptPreset(template) {
+  const t = String(template || "").trim();
+  return t.startsWith("Summarize this video.") || t.includes("transcript");
+}
+
+for (const button of presetButtons) {
+  button.addEventListener("click", () => {
+    const template = button.dataset.template || "";
+    const options = isTranscriptPreset(template) ? { forceIncludeTranscript: true } : {};
+    sendChatMessage(template, options).catch(handleSendError);
+  });
+}
+
+sharePageCheckbox.addEventListener("change", () => {
+  renderContextBundle();
+});
+
+includeTranscript.addEventListener("change", () => {
+  renderContextBundle();
+});
+
 chatInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
-    sendChatMessage().catch((error) => {
-      setBusyState(false);
-      pendingUserMessage = null;
-      renderMessages(currentMessages, null, null);
-      setStatus(explainBackgroundMismatch(error), { openActivity: true });
-    });
+    sendChatMessage().catch(handleSendError);
   }
 });
 
@@ -1041,12 +1495,14 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
   if (changes.includeTranscriptByDefault) {
     includeTranscript.checked = Boolean(changes.includeTranscriptByDefault.newValue);
+    renderContextBundle();
   }
 
   if (changes.sharePageByDefault) {
     sharePageByDefault = changes.sharePageByDefault.newValue !== false;
     if (!isBusy) {
       sharePageCheckbox.checked = sharePageByDefault;
+      renderContextBundle();
     }
   }
 });
@@ -1107,5 +1563,6 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     setStatus("Hermes sidecar is ready.");
   }
 
+  setChallengeModeEnabled(false);
   startPreviewLoop();
 })();

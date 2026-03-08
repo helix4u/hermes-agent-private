@@ -14,25 +14,25 @@
             <p class="eyebrow">Hermes Agent</p>
             <h1>Hermes Sidecar</h1>
           </div>
-          <button id="open-options-button" class="ghost-button" type="button">Options</button>
+          <button id="open-options-button" class="ghost-button" type="button" title="Open sidecar settings">Options</button>
         </div>
-        <p class="subhead">Chat beside the page you are on, and pull that page into the turn when it matters.</p>
+        <p class="subhead">Chat beside the page and pull it into the turn only when it helps.</p>
       </header>
 
       <section class="card chat-card">
         <div class="section-head">
           <div>
             <h2>Conversation</h2>
-            <p class="section-copy">This sidecar keeps its own Hermes session history.</p>
+            <p class="section-copy">Separate browser-native session history.</p>
             <div class="session-picker">
-              <label for="session-history-select">Session history</label>
+              <label for="session-history-select">Sessions</label>
               <select id="session-history-select" class="session-history-select">
                 <option value="">Loading sessions...</option>
               </select>
-              <button id="refresh-sessions-button" class="ghost-button small-button" type="button">Refresh</button>
+              <button id="refresh-sessions-button" class="ghost-button small-button" type="button" title="Refresh the browser-side session list">Refresh</button>
             </div>
           </div>
-          <button id="reset-chat-button" class="ghost-button" type="button">New chat</button>
+          <button id="reset-chat-button" class="ghost-button" type="button" title="Start a fresh sidecar session">New chat</button>
         </div>
         <div id="chat-messages" class="chat-messages">
           <div class="empty-state">Loading Hermes sidecar history...</div>
@@ -47,19 +47,49 @@
             id="chat-input"
             class="chat-input"
             rows="4"
-            placeholder="Ask Hermes something, or leave this empty and just use the current page..."
+            placeholder="Ask Hermes something, or leave this empty and just share the page..."
           ></textarea>
-          <label class="checkbox-row compact-row">
-            <input id="share-page" type="checkbox">
-            <span>Use the current page in this turn</span>
-          </label>
-          <label class="checkbox-row compact-row">
-            <input id="include-transcript" type="checkbox">
-            <span id="include-transcript-label">Include the YouTube transcript the first time this video is shared</span>
-          </label>
-          <div class="composer-actions">
-            <button id="send-button" class="primary-button" type="button">Send</button>
+          <div class="composer-tools">
+            <div class="tool-row tool-row-top">
+              <span class="tool-label">Quick prompts</span>
+              <div class="tool-row-actions">
+                <button id="challenge-mode-button" class="ghost-button chip-button mode-button" type="button" aria-pressed="false" title="Tell Hermes to challenge your assumptions before answering">Challenge my framing</button>
+                <button id="send-button" class="primary-button inline-send-button compact-action-button" type="button" title="Send your current message to Hermes">Send</button>
+              </div>
+            </div>
+            <div class="preset-strip" aria-label="Prompt presets">
+              <button class="ghost-button chip-button preset-button" type="button" data-template="Summarize this page." title="Send a summarize-this-page prompt right away">Summarize page</button>
+              <button class="ghost-button chip-button preset-button" type="button" data-template="Summarize this video." title="Send a prompt to summarize the video (uses transcript when available)">Summarize the video</button>
+              <button class="ghost-button chip-button preset-button" type="button" data-template="Argue against my current approach." title="Send a prompt asking Hermes to push back on your approach">Argue against me</button>
+              <button class="ghost-button chip-button preset-button" type="button" data-template="Extract the action items and decisions from this page." title="Send a prompt to extract action items and decisions">Extract action items</button>
+              <button class="ghost-button chip-button preset-button" type="button" data-template="Turn this into coding context I can use right away." title="Send a prompt to turn the page into coding context">Coding context</button>
+              <button class="ghost-button chip-button preset-button" type="button" data-template="Compare what this page says to the transcript and call out any mismatch." title="Send a prompt to compare page content with the transcript">Compare to transcript</button>
+            </div>
           </div>
+          <div class="toggle-cluster">
+            <label class="checkbox-row compact-row">
+              <input id="share-page" type="checkbox">
+              <span>Use current page</span>
+            </label>
+            <label class="checkbox-row compact-row">
+              <input id="include-transcript" type="checkbox">
+              <span id="include-transcript-label">Include transcript once per video</span>
+            </label>
+          </div>
+          <details id="bundle-panel" class="bundle-panel" hidden open>
+            <summary class="bundle-summary" title="Show or hide the page context bundle for this turn">
+              <div class="bundle-head">
+                <div>
+                  <h3>About to send</h3>
+                  <p class="bundle-copy">Trim any chunk for this turn only.</p>
+                </div>
+                <span id="bundle-mode-note" class="bundle-mode-note" hidden>Challenge mode on</span>
+              </div>
+            </summary>
+            <div class="bundle-content">
+              <div id="bundle-list" class="bundle-list"></div>
+            </div>
+          </details>
         </div>
       </section>
 
@@ -67,7 +97,7 @@
         <summary class="details-summary">
           <div>
             <h2>Current page</h2>
-            <p class="section-copy">Follows the active tab and refreshes automatically.</p>
+            <p class="section-copy">Tracks the active tab automatically.</p>
           </div>
         </summary>
         <div class="details-body">
@@ -78,7 +108,7 @@
               <span id="page-text-length" class="summary-chip">0 chars page text</span>
               <span id="transcript-status" class="summary-chip">Checking transcript...</span>
             </div>
-            <button id="refresh-button" class="ghost-button" type="button">Refresh now</button>
+            <button id="refresh-button" class="ghost-button compact-action-button" type="button" title="Refresh the current page preview">Refresh now</button>
           </div>
           <p id="page-title" class="page-title">Loading page context...</p>
           <p id="page-url" class="page-url"></p>

@@ -395,6 +395,414 @@ function chooseTranscriptTrack(tracks) {
   return [...tracks].sort((left, right) => scoreTrack(right) - scoreTrack(left))[0];
 }
 
+function isElementVisible(element) {
+  if (!element) {
+    return false;
+  }
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+function collectTranscriptLinesFromDom() {
+  const lines = [];
+  const seen = new Set();
+
+  const segmentSelectors = [
+    "ytd-transcript-segment-renderer #segment-text",
+    "ytd-transcript-segment-renderer .segment-text",
+    "ytd-transcript-segment-renderer [id='text']"
+  ];
+
+  for (const selector of segmentSelectors) {
+    const nodes = document.querySelectorAll(selector);
+    for (const node of nodes) {
+      const line = normalizeTranscriptLine(node?.textContent || "");
+      if (!line || seen.has(line)) {
+        continue;
+      }
+      seen.add(line);
+      lines.push(line);
+    }
+    if (lines.length) {
+      break;
+    }
+  }
+
+  return lines;
+}
+
+async function fetchTranscriptFromPanelDom() {
+  let lines = collectTranscriptLinesFromDom();
+  if (lines.length) {
+    return lines.join("\n");
+  }
+
+  const transcriptButtons = Array.from(
+    document.querySelectorAll(
+      "button[aria-label], yt-button-shape button[aria-label], yt-formatted-string"
+    )
+  ).filter((element) => {
+    const label = (element.getAttribute?.("aria-label") || "").toLowerCase();
+    const text = (element.textContent || "").toLowerCase();
+    return (
+      label.includes("show transcript") ||
+      label === "transcript" ||
+      text.includes("show transcript")
+    );
+  });
+
+  const transcriptButton = transcriptButtons.find((element) => isElementVisible(element));
+  if (!transcriptButton) {
+    return "";
+  }
+
+  transcriptButton.click();
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await new Promise((r) => setTimeout(r, 400));
+    lines = collectTranscriptLinesFromDom();
+    if (lines.length) {
+      return lines.join("\n");
+    }
+  }
+
+  return "";
+}
+
+function decodeHtmlEntities(text) {
+  const source = String(text || "");
+  if (!source) {
+    return "";
+  }
+  const textarea = document.createElement("textarea");
+  textarea.innerHTML = source;
+  return textarea.value;
+}
+
+function normalizeTranscriptLine(text) {
+  return collapseWhitespace(
+    decodeHtmlEntities(String(text || "").replace(/<br\s*\/?>/gi, "\n"))
+  );
+}
+
+function dedupeSequentialTranscriptLines(lines) {
+  const deduped = [];
+  for (const rawLine of Array.isArray(lines) ? lines : []) {
+    const line = normalizeTranscriptLine(rawLine);
+    if (!line) {
+      continue;
+    }
+    if (deduped[deduped.length - 1] === line) {
+      continue;
+    }
+    deduped.push(line);
+  }
+  return deduped;
+}
+
+function parseXmlTranscriptText(source) {
+  try {
+    const doc = new DOMParser().parseFromString(source, "text/xml");
+    if (doc.querySelector("parsererror")) {
+      return "";
+    }
+
+    const textNodes = Array.from(doc.querySelectorAll("text"));
+    if (textNodes.length) {
+      return dedupeSequentialTranscriptLines(
+        textNodes.map((node) => node.textContent || "")
+      ).join("\n");
+    }
+
+    const paragraphNodes = Array.from(doc.querySelectorAll("p"));
+    if (paragraphNodes.length) {
+      const paragraphLines = paragraphNodes.map((node) => {
+        const segmentNodes = Array.from(node.querySelectorAll("s, span"));
+        if (segmentNodes.length) {
+          return segmentNodes.map((segment) => segment.textContent || "").join("");
+        }
+        return node.textContent || "";
+      });
+      return dedupeSequentialTranscriptLines(paragraphLines).join("\n");
+    }
+  } catch (_error) {
+    return "";
+  }
+
+  return "";
+}
+
+function parsePlainTranscriptText(source) {
+  const normalizedSource = String(source || "").replace(/\r\n/g, "\n");
+  if (!normalizedSource.trim()) {
+    return "";
+  }
+
+  const isTimestampLine = (line) =>
+    /^\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s+-->\s+\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?/.test(line);
+
+  const lines = [];
+  let buffer = [];
+
+  const flushBuffer = () => {
+    if (!buffer.length) {
+      return;
+    }
+    lines.push(buffer.join(" "));
+    buffer = [];
+  };
+
+  for (const rawLine of normalizedSource.split("\n")) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      flushBuffer();
+      continue;
+    }
+    if (
+      /^WEBVTT\b/i.test(trimmed) ||
+      /^NOTE\b/i.test(trimmed) ||
+      /^\d+$/.test(trimmed) ||
+      isTimestampLine(trimmed)
+    ) {
+      flushBuffer();
+      continue;
+    }
+
+    const withoutTags = trimmed.replace(/<\/?[^>]+>/g, " ");
+    const line = normalizeTranscriptLine(withoutTags);
+    if (!line) {
+      flushBuffer();
+      continue;
+    }
+    buffer.push(line);
+  }
+
+  flushBuffer();
+  return dedupeSequentialTranscriptLines(lines).join("\n");
+}
+
+function parseYouTubeTranscriptText(rawText) {
+  const source = String(rawText || "");
+  if (!source.trim()) {
+    return "";
+  }
+
+  const extractJson3Lines = (jsonValue) => {
+    const lines = [];
+    for (const event of jsonValue?.events || []) {
+      const line = collapseWhitespace(
+        (event.segs || [])
+          .map((segment) => segment.utf8 || "")
+          .join("")
+      );
+      if (line) {
+        lines.push(line);
+      }
+    }
+    return lines;
+  };
+
+  try {
+    const parsed = JSON.parse(source);
+    const lines = extractJson3Lines(parsed);
+    if (lines.length) {
+      return dedupeSequentialTranscriptLines(lines).join("\n");
+    }
+  } catch (_error) {
+    // Fall through to non-JSON parsing.
+  }
+
+  const xmlTranscript = parseXmlTranscriptText(source);
+  if (xmlTranscript) {
+    return xmlTranscript;
+  }
+
+  return parsePlainTranscriptText(source);
+}
+
+function getRunText(value) {
+  if (!value) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value.simpleText === "string") {
+    return value.simpleText;
+  }
+  if (Array.isArray(value.runs)) {
+    return value.runs.map((run) => run?.text || "").join("");
+  }
+  return "";
+}
+
+function extractTranscriptLinesFromYoutubeiPayload(payload) {
+  const lines = [];
+  const seen = new Set();
+
+  const addLine = (rawText) => {
+    const line = normalizeTranscriptLine(rawText || "");
+    if (!line || seen.has(line)) {
+      return;
+    }
+    seen.add(line);
+    lines.push(line);
+  };
+
+  const visit = (node) => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    if (node.transcriptCueRenderer?.cue) {
+      addLine(getRunText(node.transcriptCueRenderer.cue));
+    }
+    if (node.transcriptSegmentRenderer?.snippet) {
+      addLine(getRunText(node.transcriptSegmentRenderer.snippet));
+    }
+    if (node.transcriptSegmentListRenderer?.initialSegments) {
+      visit(node.transcriptSegmentListRenderer.initialSegments);
+    }
+    if (node.transcriptSearchPanelRenderer?.body) {
+      visit(node.transcriptSearchPanelRenderer.body);
+    }
+    if (node.transcriptBodyRenderer?.cueGroups) {
+      visit(node.transcriptBodyRenderer.cueGroups);
+    }
+    if (node.transcriptCueGroupRenderer?.cues) {
+      visit(node.transcriptCueGroupRenderer.cues);
+    }
+    if (node.cueGroupRenderer?.cues) {
+      visit(node.cueGroupRenderer.cues);
+    }
+
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") {
+        visit(value);
+      }
+    }
+  };
+
+  visit(payload);
+  return lines;
+}
+
+function findTranscriptEndpointParams(node) {
+  if (!node || typeof node !== "object") {
+    return "";
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const nested = findTranscriptEndpointParams(item);
+      if (nested) {
+        return nested;
+      }
+    }
+    return "";
+  }
+  if (node.getTranscriptEndpoint?.params) {
+    return String(node.getTranscriptEndpoint.params);
+  }
+  for (const value of Object.values(node)) {
+    const nested = findTranscriptEndpointParams(value);
+    if (nested) {
+      return nested;
+    }
+  }
+  return "";
+}
+
+async function fetchYouTubeTranscriptFromYoutubei() {
+  const params = findTranscriptEndpointParams(window.ytInitialData || {});
+  if (!params) {
+    return "";
+  }
+
+  const ytcfgData = window.ytcfg?.data_ || {};
+  const context =
+    ytcfgData.INNERTUBE_CONTEXT ||
+    {
+      client: {
+        clientName: ytcfgData.INNERTUBE_CLIENT_NAME || "WEB",
+        clientVersion: ytcfgData.INNERTUBE_CLIENT_VERSION || ""
+      }
+    };
+  const apiKey = String(ytcfgData.INNERTUBE_API_KEY || "").trim();
+  const visitorData = String(
+    ytcfgData.VISITOR_DATA ||
+    context?.client?.visitorData ||
+    ""
+  ).trim();
+  const clientName = String(ytcfgData.INNERTUBE_CONTEXT_CLIENT_NAME || 1);
+  const clientVersion = String(
+    ytcfgData.INNERTUBE_CONTEXT_CLIENT_VERSION ||
+    ytcfgData.INNERTUBE_CLIENT_VERSION ||
+    context?.client?.clientVersion ||
+    ""
+  );
+
+  const endpoints = [];
+  if (apiKey) {
+    endpoints.push(`/youtubei/v1/get_transcript?key=${encodeURIComponent(apiKey)}&prettyPrint=false`);
+  }
+  endpoints.push("/youtubei/v1/get_transcript?prettyPrint=false");
+
+  const body = JSON.stringify({
+    context,
+    params
+  });
+
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+        headers: {
+          "content-type": "application/json",
+          "x-youtube-client-name": clientName,
+          "x-youtube-client-version": clientVersion,
+          "x-goog-visitor-id": visitorData,
+          "x-origin": window.location.origin
+        },
+        body
+      });
+      if (!response.ok) {
+        continue;
+      }
+
+      const rawText = await response.text();
+      if (!rawText) {
+        continue;
+      }
+      let payload = null;
+      try {
+        payload = JSON.parse(rawText);
+      } catch (_error) {
+        payload = null;
+      }
+      if (!payload) {
+        continue;
+      }
+
+      const lines = extractTranscriptLinesFromYoutubeiPayload(payload);
+      if (lines.length) {
+        return lines.join("\n");
+      }
+    } catch (_error) {
+      // Try the next endpoint.
+    }
+  }
+
+  return "";
+}
+
 async function fetchYouTubeTranscript(includeText) {
   const url = new URL(window.location.href);
   const videoId = url.searchParams.get("v") || "";
@@ -405,7 +813,17 @@ async function fetchYouTubeTranscript(includeText) {
     videoId
   };
 
-  const playerResponse = findYouTubePlayerResponse();
+  let playerResponse = findYouTubePlayerResponse();
+  if (includeText && !playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length) {
+    for (let i = 0; i < 6; i += 1) {
+      await new Promise((r) => setTimeout(r, 500));
+      playerResponse = findYouTubePlayerResponse();
+      if (playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length) {
+        break;
+      }
+    }
+  }
+
   const tracks =
     playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
 
@@ -430,38 +848,73 @@ async function fetchYouTubeTranscript(includeText) {
     return transcript;
   }
 
-  const separator = track.baseUrl.includes("?") ? "&" : "?";
-  const transcriptUrl = /[?&]fmt=/.test(track.baseUrl)
-    ? track.baseUrl
-    : `${track.baseUrl}${separator}fmt=json3`;
-
+  let transcriptUrl = track.baseUrl;
   try {
-    const response = await fetch(transcriptUrl, { credentials: "omit" });
-    if (!response.ok) {
-      return transcript;
-    }
+    const parsedTranscriptUrl = new URL(track.baseUrl, window.location.origin);
+    parsedTranscriptUrl.searchParams.set("fmt", "json3");
+    transcriptUrl = parsedTranscriptUrl.toString();
+  } catch (_error) {
+    const separator = track.baseUrl.includes("?") ? "&" : "?";
+    transcriptUrl = new URL(
+      `${track.baseUrl}${separator}fmt=json3`,
+      window.location.origin
+    ).toString();
+  }
 
-    const data = await response.json();
-    const lines = [];
-    for (const event of data.events || []) {
-      const line = collapseWhitespace(
-        (event.segs || [])
-          .map((segment) => segment.utf8 || "")
-          .join("")
-      );
-      if (line) {
-        lines.push(line);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(transcriptUrl, {
+        credentials: "same-origin",
+        cache: "no-store"
+      });
+      if (!response.ok) {
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+        }
+        continue;
+      }
+
+      const rawText = await response.text();
+      const transcriptText = parseYouTubeTranscriptText(rawText);
+      if (transcriptText) {
+        return {
+          ...transcript,
+          text: clamp(transcriptText, 30000)
+        };
+      }
+    } catch (error) {
+      if (attempt === 2) {
+        console.debug("Hermes extension: failed to fetch YouTube transcript", error);
       }
     }
 
+    if (attempt < 2) {
+      await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+    }
+  }
+
+  const youtubeiTranscriptText = await fetchYouTubeTranscriptFromYoutubei();
+  if (youtubeiTranscriptText) {
     return {
       ...transcript,
-      text: clamp(lines.join("\n"), 30000)
+      text: clamp(youtubeiTranscriptText, 30000),
+      source: "youtube-transcript-api"
     };
-  } catch (error) {
-    console.debug("Hermes extension: failed to fetch YouTube transcript", error);
-    return transcript;
   }
+
+  const panelTranscriptText = await fetchTranscriptFromPanelDom();
+  if (panelTranscriptText) {
+    return {
+      ...transcript,
+      text: clamp(panelTranscriptText, 30000),
+      source: "youtube-transcript-panel-dom"
+    };
+  }
+
+  return {
+    ...transcript,
+    text: ""
+  };
 }
 
 async function collectPageContext(includeTranscriptText, waitForHydration = false) {
