@@ -62,6 +62,19 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Honcho user context (gated on honcho being active via check_fn)
     "query_user_context",
+    # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
+    "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+]
+
+_HERMES_BROWSER_TOOLS = [
+    "browser_navigate", "browser_snapshot", "browser_click",
+    "browser_type", "browser_scroll", "browser_back",
+    "browser_press", "browser_close", "browser_get_images",
+    "browser_vision",
+]
+
+_HERMES_SIDECAR_TOOLS = [
+    tool for tool in _HERMES_CORE_TOOLS if tool not in _HERMES_BROWSER_TOOLS
 ]
 
 
@@ -193,8 +206,12 @@ TOOLSETS = {
         "tools": ["query_user_context"],
         "includes": []
     },
-    
-    
+
+    "homeassistant": {
+        "description": "Home Assistant smart home control and monitoring",
+        "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "includes": []
+    },
     # Scenario-specific toolsets
     
     "debugging": {
@@ -220,6 +237,12 @@ TOOLSETS = {
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
         "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-sidecar": {
+        "description": "Browser sidecar toolset - Hermes core tools without Browserbase automation",
+        "tools": _HERMES_SIDECAR_TOOLS,
         "includes": []
     },
     

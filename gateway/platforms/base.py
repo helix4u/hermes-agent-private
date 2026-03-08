@@ -484,10 +484,14 @@ class BasePlatformAdapter(ABC):
             url = match.group(1)
             images.append((url, ""))
         
-        # Remove matched image tags from content if we found images
+        # Remove only the matched image tags from content (not all markdown images)
         if images:
-            cleaned = re.sub(md_pattern, '', cleaned)
-            cleaned = re.sub(html_pattern, '', cleaned)
+            extracted_urls = {url for url, _ in images}
+            def _remove_if_extracted(match):
+                url = match.group(2) if match.lastindex >= 2 else match.group(1)
+                return '' if url in extracted_urls else match.group(0)
+            cleaned = re.sub(md_pattern, _remove_if_extracted, cleaned)
+            cleaned = re.sub(html_pattern, _remove_if_extracted, cleaned)
             # Clean up leftover blank lines
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
@@ -511,7 +515,63 @@ class BasePlatformAdapter(ABC):
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
-    
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """
+        Send a video natively via the platform API.
+
+        Override in subclasses to send videos as inline playable media.
+        Default falls back to sending the file path as text.
+        """
+        text = f"🎬 Video: {video_path}"
+        if caption:
+            text = f"{caption}\n{text}"
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """
+        Send a document/file natively via the platform API.
+
+        Override in subclasses to send files as downloadable attachments.
+        Default falls back to sending the file path as text.
+        """
+        text = f"📎 File: {file_path}"
+        if caption:
+            text = f"{caption}\n{text}"
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """
+        Send a local image file natively via the platform API.
+
+        Unlike send_image() which takes a URL, this takes a local file path.
+        Override in subclasses for native photo attachments.
+        Default falls back to sending the file path as text.
+        """
+        text = f"🖼️ Image: {image_path}"
+        if caption:
+            text = f"{caption}\n{text}"
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+
     @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
         """
@@ -561,6 +621,18 @@ class BasePlatformAdapter(ABC):
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
+
+    @staticmethod
+    def _is_out_of_band_command(event: MessageEvent) -> bool:
+        """Return True if a command should bypass active-session interruption flow."""
+        text = (event.text or "").strip()
+        command = (event.get_command() or "").lower()
+
+        if not command and text.startswith("/"):
+            parts = text.split(maxsplit=1)
+            command = parts[0][1:].lower() if parts else ""
+
+        return command in {"help", "status", "usage", "cron"}
     
     async def handle_message(self, event: MessageEvent) -> None:
         """
@@ -577,6 +649,18 @@ class BasePlatformAdapter(ABC):
         
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            # Some commands should not interrupt a running agent. Handle them
+            # immediately in a separate task and return their response.
+            if self._is_out_of_band_command(event):
+                asyncio.create_task(
+                    self._process_message_background(
+                        event,
+                        session_key,
+                        allow_interrupt=False,
+                    )
+                )
+                return
+
             # Store this as a pending message - it will interrupt the running agent
             print(f"[{self.name}] ⚡ New message while session {session_key} is active - triggering interrupt")
             self._pending_messages[session_key] = event
@@ -608,14 +692,24 @@ class BasePlatformAdapter(ABC):
             min_ms, max_ms = 800, 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
-    async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+    async def _process_message_background(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        allow_interrupt: bool = True,
+    ) -> None:
         """Background task that actually processes the message."""
-        # Create interrupt event for this session
-        interrupt_event = asyncio.Event()
-        self._active_sessions[session_key] = interrupt_event
-        
-        # Start continuous typing indicator (refreshes every 2 seconds)
-        typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id))
+        interrupt_event = None
+        typing_task = None
+
+        if allow_interrupt:
+            # Create interrupt event for this session
+            interrupt_event = asyncio.Event()
+            self._active_sessions[session_key] = interrupt_event
+
+            # Start continuous typing indicator (refreshes every 2 seconds)
+            typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id))
         
         try:
             # Call the handler (this can take a while with tool calls)
@@ -689,35 +783,59 @@ class BasePlatformAdapter(ABC):
                     except Exception as img_err:
                         logger.exception("[%s] Error sending image: %s", self.name, img_err)
                 
-                # Send extracted audio/voice files as native attachments
-                for audio_path, is_voice in media_files:
-                    if not os.path.exists(audio_path):
-                        print(f"[{self.name}] Skipping stale voice path (missing file): {audio_path}")
+                # Send extracted media files — route by file type
+                _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
+                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.3gp'}
+                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+                for media_path, is_voice in media_files:
+                    if not os.path.exists(media_path):
+                        logger.warning("[%s] Skipping stale media path (missing file): %s", self.name, media_path)
                         continue
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
-                        voice_result = await self.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=audio_path,
-                        )
-                        if not voice_result.success:
-                            logger.error("[%s] Failed to send voice: %s", self.name, voice_result.error)
-                    except Exception as voice_err:
-                        logger.exception("[%s] Error sending voice: %s", self.name, voice_err)
+                        from pathlib import Path as _Path
+                        ext = _Path(media_path).suffix.lower()
+                        if ext in _AUDIO_EXTS:
+                            media_result = await self.send_voice(
+                                chat_id=event.source.chat_id,
+                                audio_path=media_path,
+                            )
+                        elif ext in _VIDEO_EXTS:
+                            media_result = await self.send_video(
+                                chat_id=event.source.chat_id,
+                                video_path=media_path,
+                            )
+                        elif ext in _IMAGE_EXTS:
+                            media_result = await self.send_image_file(
+                                chat_id=event.source.chat_id,
+                                image_path=media_path,
+                            )
+                        else:
+                            media_result = await self.send_document(
+                                chat_id=event.source.chat_id,
+                                file_path=media_path,
+                            )
+
+                        if not media_result.success:
+                            logger.error("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                    except Exception as media_err:
+                        logger.exception("[%s] Error sending media: %s", self.name, media_err)
             
             # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
+            if allow_interrupt and session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
                 print(f"[{self.name}] 📨 Processing queued message from interrupt")
                 # Clean up current session before processing pending
                 if session_key in self._active_sessions:
                     del self._active_sessions[session_key]
-                typing_task.cancel()
-                try:
-                    await typing_task
-                except asyncio.CancelledError:
-                    pass
+                if typing_task:
+                    typing_task.cancel()
+                    try:
+                        await typing_task
+                    except asyncio.CancelledError:
+                        pass
                 # Process pending message in new background task
                 await self._process_message_background(pending_event, session_key)
                 return  # Already cleaned up
@@ -726,13 +844,14 @@ class BasePlatformAdapter(ABC):
             logger.exception("[%s] Error handling message: %s", self.name, e)
         finally:
             # Stop typing indicator
-            typing_task.cancel()
-            try:
-                await typing_task
-            except asyncio.CancelledError:
-                pass
+            if typing_task:
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
             # Clean up session tracking
-            if session_key in self._active_sessions:
+            if allow_interrupt and session_key in self._active_sessions:
                 del self._active_sessions[session_key]
     
     def has_pending_interrupt(self, session_key: str) -> bool:
@@ -750,9 +869,13 @@ class BasePlatformAdapter(ABC):
         chat_type: str = "dm",
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
-        thread_id: Optional[str] = None
+        thread_id: Optional[str] = None,
+        chat_topic: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
+        # Normalize empty topic to None
+        if chat_topic is not None and not chat_topic.strip():
+            chat_topic = None
         return SessionSource(
             platform=self.platform,
             chat_id=str(chat_id),
@@ -761,6 +884,7 @@ class BasePlatformAdapter(ABC):
             user_id=str(user_id) if user_id else None,
             user_name=user_name,
             thread_id=str(thread_id) if thread_id else None,
+            chat_topic=chat_topic.strip() if chat_topic else None,
         )
     
     @abstractmethod
@@ -842,11 +966,11 @@ class BasePlatformAdapter(ABC):
 
             full_chunk = prefix + chunk_body
 
-            # Walk the chunk line-by-line to determine whether we end
-            # inside an open code block.
+            # Walk only the chunk_body (not the prefix we prepended) to
+            # determine whether we end inside an open code block.
             in_code = carry_lang is not None
             lang = carry_lang or ""
-            for line in full_chunk.split("\n"):
+            for line in chunk_body.split("\n"):
                 stripped = line.strip()
                 if stripped.startswith("```"):
                     if in_code:
@@ -875,7 +999,14 @@ class BasePlatformAdapter(ABC):
 
         return chunks
 
-    async def edit_message(self, chat_id: str, message_id: str, content: str) -> None:
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        include_listen_button: bool = False,
+    ) -> None:
         """
         Optional hook for platforms that support in-place message edits.
         
@@ -883,4 +1014,5 @@ class BasePlatformAdapter(ABC):
         can override this to update a single progress/status message instead
         of sending many separate updates.
         """
+        _ = include_listen_button
         return None

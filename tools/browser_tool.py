@@ -1253,34 +1253,60 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
                      "Set OPENROUTER_API_KEY or configure Nous Portal to enable browser vision."
         }, ensure_ascii=False)
     
-    # Create a temporary file for the screenshot
+    # Create a temporary file target for the screenshot.
+    # Some agent-browser builds may ignore this exact path and return their own;
+    # we handle both.
     temp_dir = Path(tempfile.gettempdir())
     screenshot_path = temp_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
     
     try:
-        # Take screenshot using agent-browser
-        result = _run_browser_command(
-            effective_task_id, 
-            "screenshot", 
-            [str(screenshot_path)],
-            timeout=30
-        )
-        
-        if not result.get("success"):
+        def _resolve_image_path(command_result: Dict[str, Any]) -> Path | None:
+            candidates: list[Path] = [screenshot_path]
+            data = command_result.get("data", {}) if isinstance(command_result, dict) else {}
+            for key in ("path", "screenshot_path", "screenshotPath", "file", "file_path"):
+                value = None
+                if isinstance(command_result, dict):
+                    value = command_result.get(key)
+                if not value and isinstance(data, dict):
+                    value = data.get(key)
+                if value:
+                    candidates.append(Path(str(value)))
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate
+            return None
+
+        # Take screenshot using agent-browser (with one retry).
+        result = None
+        image_path: Path | None = None
+        for _attempt in range(2):
+            result = _run_browser_command(
+                effective_task_id,
+                "screenshot",
+                [str(screenshot_path)],
+                timeout=30
+            )
+            if not result.get("success"):
+                continue
+            image_path = _resolve_image_path(result)
+            if image_path:
+                break
+
+        if not result or not result.get("success"):
             return json.dumps({
                 "success": False,
-                "error": f"Failed to take screenshot: {result.get('error', 'Unknown error')}"
+                "error": f"Failed to take screenshot: {(result or {}).get('error', 'Unknown error')}"
             }, ensure_ascii=False)
-        
-        # Check if screenshot file was created
-        if not screenshot_path.exists():
+
+        if not image_path:
             return json.dumps({
                 "success": False,
-                "error": "Screenshot file was not created"
+                "error": "Screenshot file was not created",
+                "details": result
             }, ensure_ascii=False)
         
         # Read and convert to base64
-        image_data = screenshot_path.read_bytes()
+        image_data = image_path.read_bytes()
         image_base64 = base64.b64encode(image_data).decode("ascii")
         data_url = f"data:image/png;base64,{image_base64}"
         
@@ -1327,6 +1353,11 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
         if screenshot_path.exists():
             try:
                 screenshot_path.unlink()
+            except Exception:
+                pass
+        if 'image_path' in locals() and image_path and image_path != screenshot_path and image_path.exists():
+            try:
+                image_path.unlink()
             except Exception:
                 pass
 

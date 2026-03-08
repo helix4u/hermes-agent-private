@@ -62,6 +62,9 @@ class TestEstimateMessagesTokensRough:
 # =========================================================================
 
 class TestDefaultContextLengths:
+    def test_gpt_5_4_is_capped_to_272k(self):
+        assert DEFAULT_CONTEXT_LENGTHS["gpt-5.4"] == 272000
+
     def test_claude_models_200k(self):
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
             if "claude" in key:

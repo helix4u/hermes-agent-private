@@ -15,6 +15,8 @@ from hermes_cli.auth import (
 from hermes_cli.config import load_config
 from hermes_constants import OPENROUTER_BASE_URL
 
+CODEX_DEFAULT_MODEL = (os.getenv("CODEX_DEFAULT_MODEL") or "gpt-5.4").strip() or "gpt-5.4"
+
 
 def _get_model_config() -> Dict[str, Any]:
     config = load_config()
@@ -24,6 +26,35 @@ def _get_model_config() -> Dict[str, Any]:
     if isinstance(model_cfg, str) and model_cfg.strip():
         return {"default": model_cfg.strip()}
     return {}
+
+
+def normalize_model_for_runtime(
+    model: Optional[str],
+    provider: Optional[str],
+    default_model: Optional[str] = CODEX_DEFAULT_MODEL,
+) -> str:
+    """Normalize model names after provider resolution.
+
+    OpenRouter-style provider-prefixed models are valid for chat-completions
+    backends, but Codex Responses expects plain OpenAI model IDs.
+    """
+    model_name = model.strip() if isinstance(model, str) else ""
+    provider_name = provider.strip().lower() if isinstance(provider, str) else ""
+    fallback_model = (
+        default_model.strip()
+        if isinstance(default_model, str) and default_model.strip()
+        else CODEX_DEFAULT_MODEL
+    )
+
+    if provider_name != "openai-codex":
+        return model_name
+    if not model_name:
+        return fallback_model
+    if model_name.lower().startswith("openai/"):
+        return model_name.split("/", 1)[1]
+    if "/" in model_name:
+        return fallback_model
+    return model_name
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
@@ -72,15 +103,12 @@ def _resolve_openrouter_runtime(
         or OPENROUTER_BASE_URL
     ).rstrip("/")
 
-    # Use the key that matches the endpoint: OpenRouter expects OPENROUTER_API_KEY,
-    # not OPENAI_API_KEY (e.g. sk-proj-...), or we get 401 Missing Authentication.
-    is_openrouter = "openrouter" in (base_url or "").lower()
-    if explicit_api_key and (explicit_api_key or "").strip():
-        api_key = explicit_api_key.strip()
-    elif is_openrouter:
-        api_key = (os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-    else:
-        api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip()
+    api_key = (
+        explicit_api_key
+        or os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    )
 
     source = "explicit" if (explicit_api_key or explicit_base_url) else "env/config"
 
@@ -113,37 +141,27 @@ def resolve_runtime_provider(
             min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
             timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
         )
-        api_key = (creds.get("api_key") or "").strip()
-        if api_key:
-            return {
-                "provider": "nous",
-                "api_mode": "chat_completions",
-                "base_url": creds.get("base_url", "").rstrip("/"),
-                "api_key": api_key,
-                "source": creds.get("source", "portal"),
-                "expires_at": creds.get("expires_at"),
-                "requested_provider": requested_provider,
-            }
-        # Nous token missing/expired: fall back to OpenRouter so env keys work
-        provider = "openrouter"
+        return {
+            "provider": "nous",
+            "api_mode": "chat_completions",
+            "base_url": creds.get("base_url", "").rstrip("/"),
+            "api_key": creds.get("api_key", ""),
+            "source": creds.get("source", "portal"),
+            "expires_at": creds.get("expires_at"),
+            "requested_provider": requested_provider,
+        }
 
     if provider == "openai-codex":
         creds = resolve_codex_runtime_credentials()
-        api_key = (creds.get("api_key") or "").strip()
-        if api_key:
-            return {
-                "provider": "openai-codex",
-                "api_mode": "codex_responses",
-                "base_url": creds.get("base_url", "").rstrip("/"),
-                "api_key": api_key,
-                "source": creds.get("source", "codex-auth-json"),
-                "auth_file": creds.get("auth_file"),
-                "codex_home": creds.get("codex_home"),
-                "last_refresh": creds.get("last_refresh"),
-                "requested_provider": requested_provider,
-            }
-        # Codex not logged in: fall back to OpenRouter
-        provider = "openrouter"
+        return {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": creds.get("base_url", "").rstrip("/"),
+            "api_key": creds.get("api_key", ""),
+            "source": creds.get("source", "hermes-auth-store"),
+            "last_refresh": creds.get("last_refresh"),
+            "requested_provider": requested_provider,
+        }
 
     runtime = _resolve_openrouter_runtime(
         requested_provider=requested_provider,

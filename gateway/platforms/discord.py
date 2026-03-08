@@ -16,6 +16,9 @@ import logging
 import os
 import time
 from typing import Dict, List, Optional, Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,86 @@ def check_discord_requirements() -> bool:
     return DISCORD_AVAILABLE
 
 
+_DEFAULT_INVOKEAI_HOST = "http://192.168.1.101:9090"
+_FALLBACK_IMAGE_MODEL_CHOICES = [
+    "badmix10step_badmix10stepQ4KS.gguf",
+    "brainflux_v10-Q4_K_S.gguf",
+    "FLUX Dev (Quantized)",
+    "FLUX.1 Kontext dev (quantized)",
+    "flux1-dev-Q3_K_S.gguf",
+    "flux1-krea-dev-Q4_K_M.gguf",
+    "flux1-schnell-Q2_K.gguf",
+    "fluxFusionV24StepsGGUFNF4_V2GGUFQ3KS.gguf",
+    "pixelwave_flux1_dev_Q4_K_M_03.gguf",
+    "526Mix-Anime-unreleased",
+    "526Mix-AnimeMac",
+    "526RealForTune",
+    "GMR4T_W5",
+    "MegaDistortedSerenity",
+    "NewerShitNormalizing_pass1",
+    "R4TGM",
+    "stable-diffusion-v1-5",
+    "stable-diffusion-v1-5-inpainting",
+    "memesXL_v10",
+    "SSD-1B",
+    "stable-diffusion-xl-refiner-1-0",
+    "Z-Image Turbo (quantized)",
+]
+_ASPECT_RATIO_CHOICES = [
+    ("Square 1:1", "1:1"),
+    ("Landscape 16:9", "16:9"),
+    ("Portrait 9:16", "9:16"),
+    ("Photo 4:3", "4:3"),
+    ("Photo 3:4", "3:4"),
+]
+
+
+def _get_invokeai_host() -> str:
+    """Resolve the configured InvokeAI host used for image-default choices."""
+    hermes_home = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes"))
+    config_path = hermes_home / "config.yaml"
+    try:
+        import yaml
+
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+            image_cfg = config.get("image_generation", {})
+            if isinstance(image_cfg, dict):
+                invokeai_cfg = image_cfg.get("invokeai", {})
+                if isinstance(invokeai_cfg, dict):
+                    host = (invokeai_cfg.get("host") or "").strip()
+                    if host:
+                        return host.rstrip("/")
+    except Exception:
+        logger.debug("[discord] failed to read InvokeAI host from config", exc_info=True)
+    return _DEFAULT_INVOKEAI_HOST
+
+
+def _fetch_invokeai_model_names(limit: int = 25) -> List[str]:
+    """Fetch up to `limit` model names for the invokeai-defaults dropdown."""
+    host = _get_invokeai_host().rstrip("/")
+    query = urlencode({"model_type": "main"})
+    url = f"{host}/api/v2/models/?{query}"
+    req = Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        logger.debug("[discord] using fallback image model choices", exc_info=True)
+        return _FALLBACK_IMAGE_MODEL_CHOICES[:limit]
+
+    models = data.get("models", [])
+    names = [
+        (model.get("name") or "").strip()
+        for model in models
+        if isinstance(model, dict) and (model.get("name") or "").strip()
+    ]
+    unique_names = sorted(dict.fromkeys(names), key=str.lower)
+    return (unique_names or _FALLBACK_IMAGE_MODEL_CHOICES)[:limit]
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -74,9 +157,42 @@ class DiscordAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
         self._client_task: Optional[asyncio.Task] = None
+        self._post_ready_task: Optional[asyncio.Task] = None
+        self._post_ready_initialized = False
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._seen_message_ids: Dict[int, float] = {}
+        self._listen_view_registered = False
+
+    async def _run_post_ready_startup(self, *, members: bool) -> None:
+        """Run slow, non-critical startup tasks after gateway readiness."""
+        if not self._client:
+            return
+        logger.info("[discord] post-ready startup begin")
+        if members:
+            try:
+                await self._resolve_allowed_usernames()
+            except Exception:
+                logger.exception("[discord] failed to resolve allowed usernames")
+
+        try:
+            synced = await self._client.tree.sync()
+            print(f"[{self.name}] Synced {len(synced)} slash command(s)")
+            try:
+                synced_names = [cmd.name for cmd in synced]
+                print(f"[{self.name}] Synced command names: {', '.join(synced_names)}")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[{self.name}] Slash command sync failed: {e}")
+
+        if not self._listen_view_registered:
+            try:
+                self._client.add_view(PersistentListenButtonView(self))
+                self._listen_view_registered = True
+            except Exception:
+                logger.exception("[discord] failed to register persistent listen view")
+        logger.info("[discord] post-ready startup complete")
     
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -101,6 +217,7 @@ class DiscordAdapter(BasePlatformAdapter):
         async def _attempt_connect(*, message_content: bool, members: bool) -> tuple[bool, Optional[Exception]]:
             """Try one connect profile and return (success, startup_exception)."""
             self._ready_event.clear()
+            self._post_ready_initialized = False
 
             intents = Intents.default()
             intents.message_content = message_content
@@ -123,19 +240,12 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_ready():
                 print(f"[{adapter_self.name}] Connected as {adapter_self._client.user}")
-
-                # Resolve any usernames in the allowed list to numeric IDs
-                # only if members intent is enabled.
-                if members:
-                    await adapter_self._resolve_allowed_usernames()
-
-                # Sync slash commands with Discord
-                try:
-                    synced = await adapter_self._client.tree.sync()
-                    print(f"[{adapter_self.name}] Synced {len(synced)} slash command(s)")
-                except Exception as e:
-                    print(f"[{adapter_self.name}] Slash command sync failed: {e}")
                 adapter_self._ready_event.set()
+                if not adapter_self._post_ready_initialized:
+                    adapter_self._post_ready_initialized = True
+                    adapter_self._post_ready_task = asyncio.create_task(
+                        adapter_self._run_post_ready_startup(members=members)
+                    )
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -289,6 +399,12 @@ class DiscordAdapter(BasePlatformAdapter):
     
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        if self._post_ready_task and not self._post_ready_task.done():
+            self._post_ready_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._post_ready_task
+        self._post_ready_task = None
+        self._post_ready_initialized = False
         if self._client:
             try:
                 await self._client.close()
@@ -310,6 +426,8 @@ class DiscordAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
+        *,
+        include_listen_button: bool = True,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Discord channel using chained embeds.
@@ -345,9 +463,9 @@ class DiscordAdapter(BasePlatformAdapter):
             
             for i, chunk in enumerate(chunks):
                 embed = discord.Embed(description=chunk)
-                # Attach listen controls to every chunk so each embed remains
-                # independently actionable in long chained responses.
-                view = ListenButtonView(self)
+                # Keep tool/callback UX clean by defaulting to no actions unless
+                # explicitly requested.
+                view = ListenButtonView(self) if include_listen_button else None
 
                 last_err: Optional[Exception] = None
                 for attempt in range(1, self.CHAIN_SEND_MAX_RETRIES + 1):
@@ -414,8 +532,16 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
 
-    async def edit_message(self, chat_id: str, message_id: str, content: str) -> None:
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        include_listen_button: bool = False,
+    ) -> None:
         """Edit an existing message's embed description, used for tool progress."""
+        _ = include_listen_button
         if not self._client:
             return
         channel = self._client.get_channel(int(chat_id))
@@ -653,6 +779,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         tree = self._client.tree
+        image_model_choices = [
+            discord.app_commands.Choice(name=name[:100], value=name)
+            for name in _fetch_invokeai_model_names(limit=25)
+        ]
+        aspect_ratio_choices = [
+            discord.app_commands.Choice(name=label, value=value)
+            for label, value in _ASPECT_RATIO_CHOICES
+        ]
 
         @tree.command(name="ask", description="Ask Hermes a question")
         @discord.app_commands.describe(question="Your question for Hermes")
@@ -698,6 +832,61 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 
+        @tree.command(name="invokeai-defaults", description="Show or change default InvokeAI image settings")
+        @discord.app_commands.describe(
+            model="Default InvokeAI model. Leave empty to see current.",
+            aspect_ratio="Default aspect ratio preset. Leave empty to keep current.",
+        )
+        @discord.app_commands.choices(
+            model=image_model_choices,
+            aspect_ratio=aspect_ratio_choices,
+        )
+        async def slash_invokeai_defaults(
+            interaction: discord.Interaction,
+            model: Optional[str] = None,
+            aspect_ratio: Optional[str] = None,
+        ):
+            await interaction.response.defer(ephemeral=True)
+            parts = ["/invokeai-defaults"]
+            if model:
+                parts.append(json.dumps(model))
+            if aspect_ratio:
+                parts.append(json.dumps(aspect_ratio))
+            event = self._build_slash_event(interaction, " ".join(parts))
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+
+        @tree.command(name="wiki-host", description="Enable, disable, or inspect LAN hosting for the local wiki")
+        @discord.app_commands.describe(
+            action="enable, disable, or status",
+            port="LAN port to use when enabling wiki hosting",
+        )
+        @discord.app_commands.choices(
+            action=[
+                discord.app_commands.Choice(name="Enable", value="enable"),
+                discord.app_commands.Choice(name="Disable", value="disable"),
+                discord.app_commands.Choice(name="Status", value="status"),
+            ],
+        )
+        async def slash_wiki_host(
+            interaction: discord.Interaction,
+            action: str,
+            port: Optional[int] = None,
+        ):
+            await interaction.response.defer(ephemeral=True)
+            text = f"/wiki-host {action}"
+            if port is not None:
+                text += f" {port}"
+            event = self._build_slash_event(interaction, text)
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+
         @tree.command(name="terminal", description="Show or change the local terminal shell (Windows)")
         @discord.app_commands.describe(mode="powershell, wsl, auto, or cmd. Leave empty to show current.")
         async def slash_terminal(interaction: discord.Interaction, mode: str = ""):
@@ -706,9 +895,9 @@ class DiscordAdapter(BasePlatformAdapter):
             event = self._build_slash_event(interaction, text)
             await self.handle_message(event)
             try:
-                await interaction.followup.send("Terminal mode updated (or shown)~", ephemeral=True)
+                await interaction.delete_original_response()
             except Exception as e:
-                logger.debug("Discord followup failed: %s", e)
+                logger.debug("Discord delete_original_response failed: %s", e)
 
         @tree.command(name="personality", description="Set a personality")
         @discord.app_commands.describe(name="Personality name. Leave empty to list available.")
@@ -720,6 +909,62 @@ class DiscordAdapter(BasePlatformAdapter):
                 await interaction.followup.send("Done~", ephemeral=True)
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
+
+        cron = discord.app_commands.Group(name="cron", description="Manage Hermes cron jobs")
+
+        @cron.command(name="list", description="List all scheduled cron jobs")
+        async def slash_cron_list(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            event = self._build_slash_event(interaction, "/cron list")
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+
+        @cron.command(name="add", description="Add a new cron job")
+        @discord.app_commands.describe(
+            schedule="Accepted: 30m | 2h | 1d | every 30m | 0 9 * * * | 2026-03-03T14:00:00",
+            prompt="What the job should do",
+        )
+        async def slash_cron_add(
+            interaction: discord.Interaction,
+            schedule: str,
+            prompt: str,
+        ):
+            await interaction.response.defer(ephemeral=True)
+            # Cron schedule parsing in the runner expects quoted schedules when
+            # spaces are present (e.g., cron expressions).
+            schedule_arg = f'"{schedule}"' if " " in schedule else schedule
+            event = self._build_slash_event(interaction, f"/cron add {schedule_arg} {prompt}")
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+
+        @cron.command(name="remove", description="Remove a cron job")
+        @discord.app_commands.describe(job_id="Job ID from /cron list")
+        async def slash_cron_remove(interaction: discord.Interaction, job_id: str):
+            await interaction.response.defer(ephemeral=True)
+            event = self._build_slash_event(interaction, f"/cron remove {job_id}")
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+
+        @cron.command(name="run", description="Run one cron job immediately")
+        @discord.app_commands.describe(job_id="Job ID from /cron list")
+        async def slash_cron_run(interaction: discord.Interaction, job_id: str):
+            await interaction.response.defer(ephemeral=True)
+            event = self._build_slash_event(interaction, f"/cron run {job_id}")
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug("Discord delete_original_response failed: %s", e)
+        tree.add_command(cron)
 
         @tree.command(name="retry", description="Retry your last message")
         async def slash_retry(interaction: discord.Interaction):
@@ -780,6 +1025,9 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_name = interaction.channel.name
             if hasattr(interaction.channel, "guild") and interaction.channel.guild:
                 chat_name = f"{interaction.channel.guild.name} / #{chat_name}"
+        
+        # Get channel topic (if available)
+        chat_topic = getattr(interaction.channel, "topic", None)
 
         source = self.build_source(
             chat_id=str(interaction.channel_id),
@@ -787,6 +1035,7 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=str(interaction.user.id),
             user_name=interaction.user.display_name,
+            chat_topic=chat_topic,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -840,6 +1089,20 @@ class DiscordAdapter(BasePlatformAdapter):
             isinstance(message.channel, discord.DMChannel),
             len(message.content or ""),
         )
+
+        # Discord can emit contentless message events that are not useful user
+        # input for Hermes (for example command/system stubs with no text and no
+        # attachments). Ignore them so they don't spawn bogus turns or
+        # accidentally interrupt a running agent.
+        if not (message.content or "").strip() and not getattr(message, "attachments", None):
+            logger.info(
+                "[discord] ignoring empty message event: msg_id=%s user_id=%s channel_id=%s",
+                str(message.id),
+                str(message.author.id),
+                str(message.channel.id),
+            )
+            return
+
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list.
         #
@@ -906,6 +1169,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if isinstance(message.channel, discord.Thread):
             thread_id = str(message.channel.id)
         
+        # Get channel topic (if available - TextChannels have topics, DMs/threads don't)
+        chat_topic = getattr(message.channel, "topic", None)
+        
         # Build source
         source = self.build_source(
             chat_id=str(message.channel.id),
@@ -914,6 +1180,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_id=str(message.author.id),
             user_name=message.author.display_name,
             thread_id=thread_id,
+            chat_topic=chat_topic,
         )
         
         # Build media URLs -- download image attachments to local cache so the
@@ -987,67 +1254,93 @@ if DISCORD_AVAILABLE:
         async def listen(
             self, interaction: discord.Interaction, button: discord.ui.Button
         ):
-            try:
-                if not interaction.message:
-                    await interaction.response.send_message(
-                        "No message context available for TTS.", ephemeral=True
-                    )
-                    return
+            await _handle_discord_listen(self.adapter, interaction)
 
-                # Use embed description first (gateway uses embeds for normal replies).
-                text = ""
-                if interaction.message.embeds:
-                    text = (interaction.message.embeds[0].description or "").strip()
-                if not text:
-                    text = (interaction.message.content or "").strip()
-                if not text:
-                    await interaction.response.send_message(
-                        "Nothing to read from this message.", ephemeral=True
-                    )
-                    return
+    class PersistentListenButtonView(discord.ui.View):
+        """Persistent listen button for messages sent through REST payloads."""
 
-                await interaction.response.defer(ephemeral=True, thinking=False)
+        CUSTOM_ID = "hermes:listen"
 
-                from tools.tts_tool import text_to_speech_tool
-                tts_json = await asyncio.to_thread(text_to_speech_tool, text)
-                data = json.loads(tts_json)
-                if not data.get("success"):
-                    await interaction.followup.send(
-                        f"TTS failed: {data.get('error', 'unknown error')}",
-                        ephemeral=True,
-                    )
-                    return
+        def __init__(self, adapter: "DiscordAdapter"):
+            super().__init__(timeout=None)  # Persistent while process is running
+            self.adapter = adapter
 
-                audio_path = str(data.get("file_path", "")).strip()
-                if not audio_path:
-                    await interaction.followup.send(
-                        "TTS returned no output file path.",
-                        ephemeral=True,
-                    )
-                    return
+        @discord.ui.button(
+            label="Listen",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔊",
+            custom_id=CUSTOM_ID,
+        )
+        async def listen(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            await _handle_discord_listen(self.adapter, interaction)
 
-                result = await self.adapter.send_voice(
-                    chat_id=str(interaction.channel_id),
-                    audio_path=audio_path,
-                    reply_to=str(interaction.message.id),
-                )
-                if not result.success:
-                    await interaction.followup.send(
-                        f"Failed to send audio: {result.error}",
-                        ephemeral=True,
-                    )
-                    return
 
-                # Success is silent: audio delivery in channel is the confirmation.
-            except Exception:
-                logger.exception("[discord] listen button handler failed")
-                try:
-                    if interaction.response.is_done():
-                        await interaction.followup.send("TTS failed unexpectedly.", ephemeral=True)
-                    else:
-                        await interaction.response.send_message("TTS failed unexpectedly.", ephemeral=True)
-                except Exception:
-                    pass
+async def _handle_discord_listen(
+    adapter: "DiscordAdapter", interaction: discord.Interaction
+) -> None:
+    try:
+        if not interaction.message:
+            await interaction.response.send_message(
+                "No message context available for TTS.", ephemeral=True
+            )
+            return
+
+        # Use embed description first (gateway uses embeds for normal replies).
+        text = ""
+        if interaction.message.embeds:
+            text = (interaction.message.embeds[0].description or "").strip()
+        if not text:
+            text = (interaction.message.content or "").strip()
+        if not text:
+            await interaction.response.send_message(
+                "Nothing to read from this message.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=False)
+
+        from tools.tts_tool import text_to_speech_tool
+        tts_json = await asyncio.to_thread(text_to_speech_tool, text)
+        data = json.loads(tts_json)
+        if not data.get("success"):
+            await interaction.followup.send(
+                f"TTS failed: {data.get('error', 'unknown error')}",
+                ephemeral=True,
+            )
+            return
+
+        audio_path = str(data.get("file_path", "")).strip()
+        if not audio_path:
+            await interaction.followup.send(
+                "TTS returned no output file path.",
+                ephemeral=True,
+            )
+            return
+
+        result = await adapter.send_voice(
+            chat_id=str(interaction.channel_id),
+            audio_path=audio_path,
+            reply_to=str(interaction.message.id),
+        )
+        if not result.success:
+            await interaction.followup.send(
+                f"Failed to send audio: {result.error}",
+                ephemeral=True,
+            )
+            return
+
+        # Success is silent: audio delivery in channel is the confirmation.
+    except Exception:
+        logger.exception("[discord] listen button handler failed")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("TTS failed unexpectedly.", ephemeral=True)
+            else:
+                await interaction.response.send_message("TTS failed unexpectedly.", ephemeral=True)
+        except Exception:
+            pass
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -1132,3 +1425,4 @@ if DISCORD_AVAILABLE:
             self.resolved = True
             for child in self.children:
                 child.disabled = True
+

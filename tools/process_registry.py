@@ -32,6 +32,7 @@ Usage:
 import json
 import logging
 import os
+import platform
 import shlex
 import shutil
 import signal
@@ -39,6 +40,8 @@ import subprocess
 import threading
 import time
 import uuid
+
+_IS_WINDOWS = platform.system() == "Windows"
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -93,13 +96,13 @@ class ProcessRegistry:
       - Cleanup thread (sandbox reaping coordination)
     """
 
-    # Noise lines emitted by interactive shells when stdin is not a terminal.
-    _SHELL_NOISE = frozenset({
+    _SHELL_NOISE_SUBSTRINGS = (
+        "bash: cannot set terminal process group",
         "bash: no job control in this shell",
-        "bash: no job control in this shell\n",
         "no job control in this shell",
-        "no job control in this shell\n",
-    })
+        "cannot set terminal process group",
+        "tcsetattr: Inappropriate ioctl for device",
+    )
 
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
@@ -112,10 +115,10 @@ class ProcessRegistry:
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
         """Strip shell startup warnings from the beginning of output."""
-        lines = text.split("\n", 2)
-        if lines and lines[0].strip() in ProcessRegistry._SHELL_NOISE:
-            return "\n".join(lines[1:])
-        return text
+        lines = text.split("\n")
+        while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
+            lines.pop(0)
+        return "\n".join(lines)
 
     # ----- Spawn -----
 
@@ -157,10 +160,12 @@ class ProcessRegistry:
             try:
                 import ptyprocess
                 user_shell = os.environ.get("SHELL") or shutil.which("bash") or "/bin/bash"
+                pty_env = os.environ | (env_vars or {})
+                pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = ptyprocess.PtyProcess.spawn(
                     [user_shell, "-lic", command],
                     cwd=session.cwd,
-                    env=os.environ | (env_vars or {}),
+                    env=pty_env,
                     dimensions=(30, 120),
                 )
                 session.pid = pty_proc.pid
@@ -193,10 +198,15 @@ class ProcessRegistry:
         popen_args, popen_platform_kwargs, _ = build_local_subprocess_invocation(
             command, session.cwd
         )
+        # Force unbuffered output for Python scripts so progress is visible
+        # during background execution (libraries like tqdm/datasets buffer when
+        # stdout is a pipe, hiding output from process(action="poll")).
+        bg_env = os.environ | (env_vars or {})
+        bg_env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
             popen_args,
             text=True,
-            env=os.environ | (env_vars or {}),
+            env=bg_env,
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,

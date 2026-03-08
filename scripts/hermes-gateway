@@ -35,10 +35,10 @@ PROJECT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
 # Load .env file
-from dotenv import load_dotenv
+from agent.env_loader import load_dotenv_with_fallback
 env_path = PROJECT_DIR / '.env'
 if env_path.exists():
-    load_dotenv(dotenv_path=env_path)
+    load_dotenv_with_fallback(env_path)
 
 
 # =============================================================================

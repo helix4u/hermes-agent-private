@@ -105,9 +105,15 @@ def prompt_choice(question: str, choices: list, default: int = 0) -> int:
     # Try to use interactive menu if available
     try:
         from simple_term_menu import TerminalMenu
+        import re
         
-        # Add visual indicators
-        menu_choices = [f"  {choice}" for choice in choices]
+        # Strip emoji characters — simple_term_menu miscalculates visual
+        # width of emojis, causing duplicated/garbled lines on redraw.
+        _emoji_re = re.compile(
+            "[\U0001f300-\U0001f9ff\U00002600-\U000027bf\U0000fe00-\U0000fe0f"
+            "\U0001fa00-\U0001fa6f\U0001fa70-\U0001faff\u200d]+", flags=re.UNICODE
+        )
+        menu_choices = [f"  {_emoji_re.sub('', choice).strip()}" for choice in choices]
         
         terminal_menu = TerminalMenu(
             menu_choices,
@@ -127,28 +133,32 @@ def prompt_choice(question: str, choices: list, default: int = 0) -> int:
         return idx
         
     except (ImportError, NotImplementedError):
-        # Fallback to number-based selection
-        for i, choice in enumerate(choices):
-            marker = "●" if i == default else "○"
-            if i == default:
-                print(color(f"  {marker} {choice}", Colors.GREEN))
-            else:
-                print(f"  {marker} {choice}")
-        
-        while True:
-            try:
-                value = input(color(f"  Select [1-{len(choices)}] ({default + 1}): ", Colors.DIM))
-                if not value:
-                    return default
-                idx = int(value) - 1
-                if 0 <= idx < len(choices):
-                    return idx
-                print_error(f"Please enter a number between 1 and {len(choices)}")
-            except ValueError:
-                print_error("Please enter a number")
-            except (KeyboardInterrupt, EOFError):
-                print()
-                sys.exit(1)
+        pass
+    except Exception as e:
+        print(f"  (Interactive menu unavailable: {e})")
+
+    # Fallback to number-based selection (simple_term_menu doesn't support Windows)
+    for i, choice in enumerate(choices):
+        marker = "●" if i == default else "○"
+        if i == default:
+            print(color(f"  {marker} {choice}", Colors.GREEN))
+        else:
+            print(f"  {marker} {choice}")
+
+    while True:
+        try:
+            value = input(color(f"  Select [1-{len(choices)}] ({default + 1}): ", Colors.DIM))
+            if not value:
+                return default
+            idx = int(value) - 1
+            if 0 <= idx < len(choices):
+                return idx
+            print_error(f"Please enter a number between 1 and {len(choices)}")
+        except ValueError:
+            print_error("Please enter a number")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(1)
 
 def prompt_yes_no(question: str, default: bool = True) -> bool:
     """Prompt for yes/no."""
@@ -410,6 +420,46 @@ def _print_setup_summary(config: dict, hermes_home):
     print()
 
 
+def _prompt_container_resources(config: dict):
+    """Prompt for container resource settings (Docker, Singularity, Modal)."""
+    terminal = config.setdefault('terminal', {})
+
+    print()
+    print_info("Container Resource Settings:")
+
+    # Persistence
+    current_persist = terminal.get('container_persistent', True)
+    persist_label = "yes" if current_persist else "no"
+    print_info(f"  Persistent filesystem keeps files between sessions.")
+    print_info(f"  Set to 'no' for ephemeral sandboxes that reset each time.")
+    persist_str = prompt(f"  Persist filesystem across sessions? (yes/no)", persist_label)
+    terminal['container_persistent'] = persist_str.lower() in ('yes', 'true', 'y', '1')
+
+    # CPU
+    current_cpu = terminal.get('container_cpu', 1)
+    cpu_str = prompt(f"  CPU cores", str(current_cpu))
+    try:
+        terminal['container_cpu'] = float(cpu_str)
+    except ValueError:
+        pass
+
+    # Memory
+    current_mem = terminal.get('container_memory', 5120)
+    mem_str = prompt(f"  Memory in MB (5120 = 5GB)", str(current_mem))
+    try:
+        terminal['container_memory'] = int(mem_str)
+    except ValueError:
+        pass
+
+    # Disk
+    current_disk = terminal.get('container_disk', 51200)
+    disk_str = prompt(f"  Disk in MB (51200 = 50GB)", str(current_disk))
+    try:
+        terminal['container_disk'] = int(disk_str)
+    except ValueError:
+        pass
+
+
 def run_setup_wizard(args):
     """Run the interactive setup wizard."""
     ensure_hermes_home()
@@ -417,11 +467,20 @@ def run_setup_wizard(args):
     config = load_config()
     hermes_home = get_hermes_home()
     
-    # Check if this is an existing installation with config (any provider or config file)
+    # Check if this is an existing installation with a provider configured.
+    # Just having config.yaml is NOT enough — the installer creates it from
+    # a template, so it always exists after install. We need an actual
+    # inference provider to consider it "existing" (otherwise quick mode
+    # would skip provider selection, leaving hermes non-functional).
+    # NOTE: Use bool() not `is not None` — the .env template has empty
+    # values (e.g. OPENROUTER_API_KEY=) that load_dotenv sets to "", which
+    # passes `is not None` but isn't a real configured provider.
+    from hermes_cli.auth import get_active_provider
+    active_provider = get_active_provider()
     is_existing = (
-        get_env_value("OPENROUTER_API_KEY") is not None
-        or get_env_value("OPENAI_BASE_URL") is not None
-        or get_config_path().exists()
+        bool(get_env_value("OPENROUTER_API_KEY"))
+        or bool(get_env_value("OPENAI_BASE_URL"))
+        or active_provider is not None
     )
     
     # Import migration helpers
@@ -661,10 +720,22 @@ def run_setup_wizard(args):
         format_auth_error, AuthError, fetch_nous_models,
         resolve_nous_runtime_credentials, _update_config_for_provider,
         _login_openai_codex, get_codex_auth_status, DEFAULT_CODEX_BASE_URL,
+        detect_external_credentials,
     )
     existing_custom = get_env_value("OPENAI_BASE_URL")
     existing_or = get_env_value("OPENROUTER_API_KEY")
     active_oauth = get_active_provider()
+
+    # Detect credentials from other CLI tools
+    detected_creds = detect_external_credentials()
+    if detected_creds:
+        print_info("Detected existing credentials:")
+        for cred in detected_creds:
+            if cred["provider"] == "openai-codex":
+                print_success(f"  * {cred['label']} -- select \"OpenAI Codex\" to use it")
+            else:
+                print_info(f"  * {cred['label']}")
+        print()
 
     # Detect if any provider is already configured
     has_any_provider = bool(active_oauth or existing_custom or existing_or)
@@ -734,11 +805,11 @@ def run_setup_wizard(args):
 
         except SystemExit:
             print_warning("Nous Portal login was cancelled or failed.")
-            print_info("You can try again later with: hermes login")
+            print_info("You can try again later with: hermes model")
             selected_provider = None
         except Exception as e:
             print_error(f"Login failed: {e}")
-            print_info("You can try again later with: hermes login")
+            print_info("You can try again later with: hermes model")
             selected_provider = None
 
     elif provider_idx == 1:  # OpenAI Codex
@@ -758,11 +829,11 @@ def run_setup_wizard(args):
             _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
         except SystemExit:
             print_warning("OpenAI Codex login was cancelled or failed.")
-            print_info("You can try again later with: hermes login --provider openai-codex")
+            print_info("You can try again later with: hermes model")
             selected_provider = None
         except Exception as e:
             print_error(f"Login failed: {e}")
-            print_info("You can try again later with: hermes login --provider openai-codex")
+            print_info("You can try again later with: hermes model")
             selected_provider = None
 
     elif provider_idx == 2:  # OpenRouter
@@ -874,7 +945,15 @@ def run_setup_wizard(args):
             # else: keep current
         elif selected_provider == "openai-codex":
             from hermes_cli.codex_models import get_codex_model_ids
-            codex_models = get_codex_model_ids()
+            # Try to get the access token for live model discovery
+            _codex_token = None
+            try:
+                from hermes_cli.auth import resolve_codex_runtime_credentials
+                _codex_creds = resolve_codex_runtime_credentials()
+                _codex_token = _codex_creds.get("api_key")
+            except Exception:
+                pass
+            codex_models = get_codex_model_ids(access_token=_codex_token)
             model_choices = [f"{m}" for m in codex_models]
             model_choices.append("Custom model")
             model_choices.append(f"Keep current ({current_model})")
@@ -993,6 +1072,10 @@ def run_setup_wizard(args):
             cwd_expanded = cwd_input
         save_env_value("MESSAGING_CWD", cwd_expanded)
         
+        print()
+        print_info("Note: Container resource settings (CPU, memory, disk, persistence)")
+        print_info("are in your config but only apply to Docker/Singularity/Modal backends.")
+
         if prompt_yes_no("  Enable sudo support? (allows agent to run sudo commands)", False):
             print_warning("  SECURITY WARNING: Sudo password will be stored in plaintext")
             sudo_pass = prompt("  Sudo password (leave empty to skip)", password=True)
@@ -1012,6 +1095,7 @@ def run_setup_wizard(args):
             print_info("Requires Docker Desktop for Windows")
         docker_image = prompt("  Docker image", default_docker)
         config['terminal']['docker_image'] = docker_image
+        _prompt_container_resources(config)
         print_success("Terminal set to Docker")
     
     elif selected_backend == 'singularity':
@@ -1021,6 +1105,7 @@ def run_setup_wizard(args):
         print_info("Requires apptainer or singularity to be installed")
         singularity_image = prompt("  Image (docker:// prefix for Docker Hub)", default_singularity)
         config['terminal']['singularity_image'] = singularity_image
+        _prompt_container_resources(config)
         print_success("Terminal set to Singularity/Apptainer")
     
     elif selected_backend == 'modal':
@@ -1071,6 +1156,7 @@ def run_setup_wizard(args):
         if token_secret:
             save_env_value("MODAL_TOKEN_SECRET", token_secret)
         
+        _prompt_container_resources(config)
         print_success("Terminal set to Modal")
     
     elif selected_backend == 'ssh':
@@ -1100,6 +1186,9 @@ def run_setup_wizard(args):
         if ssh_key:
             save_env_value("TERMINAL_SSH_KEY", ssh_key)
         
+        print()
+        print_info("Note: Container resource settings (CPU, memory, disk, persistence)")
+        print_info("are in your config but only apply to Docker/Singularity/Modal backends.")
         print_success("Terminal set to SSH")
     # else: Keep current (selected_backend is None)
     
@@ -1405,23 +1494,15 @@ def run_setup_wizard(args):
     existing_whatsapp = get_env_value('WHATSAPP_ENABLED')
     if not existing_whatsapp and prompt_yes_no("Set up WhatsApp?", False):
         print_info("WhatsApp connects via a built-in bridge (Baileys).")
-        print_info("Requires Node.js (already installed if you have browser tools).")
-        print_info("On first gateway start, you'll scan a QR code with your phone.")
+        print_info("Requires Node.js. Run 'hermes whatsapp' for guided setup.")
         print()
-        if prompt_yes_no("Enable WhatsApp?", True):
+        if prompt_yes_no("Enable WhatsApp now?", True):
             save_env_value("WHATSAPP_ENABLED", "true")
             print_success("WhatsApp enabled")
-            
-            allowed_users = prompt("  Your phone number (e.g. 15551234567, comma-separated for multiple)")
-            if allowed_users:
-                save_env_value("WHATSAPP_ALLOWED_USERS", allowed_users.replace(" ", ""))
-                print_success("WhatsApp allowlist configured")
-            else:
-                print_info("⚠️  No allowlist set — anyone who messages your WhatsApp will get a response!")
-            
-            print_info("Start the gateway with 'hermes gateway' and scan the QR code.")
+            print_info("Run 'hermes whatsapp' to choose your mode (separate bot number")
+            print_info("or personal self-chat) and pair via QR code.")
     
-    # Gateway reminder
+    # Gateway service setup
     any_messaging = (
         get_env_value('TELEGRAM_BOT_TOKEN')
         or get_env_value('DISCORD_BOT_TOKEN')
@@ -1432,10 +1513,7 @@ def run_setup_wizard(args):
         print()
         print_info("━" * 50)
         print_success("Messaging platforms configured!")
-        print_info("Start the gateway after setup to bring your bots online:")
-        print_info("   hermes gateway              # Run in foreground")
-        print_info("   hermes gateway install      # Install as background service (Linux)")
-        
+
         # Check if any home channels are missing
         missing_home = []
         if get_env_value('TELEGRAM_BOT_TOKEN') and not get_env_value('TELEGRAM_HOME_CHANNEL'):
@@ -1444,16 +1522,76 @@ def run_setup_wizard(args):
             missing_home.append("Discord")
         if get_env_value('SLACK_BOT_TOKEN') and not get_env_value('SLACK_HOME_CHANNEL'):
             missing_home.append("Slack")
-        
+
         if missing_home:
             print()
-            print_info(f"⚠️  No home channel set for: {', '.join(missing_home)}")
+            print_warning(f"No home channel set for: {', '.join(missing_home)}")
             print_info("   Without a home channel, cron jobs and cross-platform")
             print_info("   messages can't be delivered to those platforms.")
             print_info("   Set one later with /set-home in your chat, or:")
             for plat in missing_home:
                 print_info(f"     hermes config set {plat.upper()}_HOME_CHANNEL <channel_id>")
-        
+
+        # Offer to install the gateway as a system service
+        import platform as _platform
+        _is_linux = _platform.system() == "Linux"
+        _is_macos = _platform.system() == "Darwin"
+
+        from hermes_cli.gateway import (
+            _is_service_installed, _is_service_running,
+            systemd_install, systemd_start, systemd_restart,
+            launchd_install, launchd_start, launchd_restart,
+        )
+
+        service_installed = _is_service_installed()
+        service_running = _is_service_running()
+
+        print()
+        if service_running:
+            if prompt_yes_no("  Restart the gateway to pick up changes?", True):
+                try:
+                    if _is_linux:
+                        systemd_restart()
+                    elif _is_macos:
+                        launchd_restart()
+                except Exception as e:
+                    print_error(f"  Restart failed: {e}")
+        elif service_installed:
+            if prompt_yes_no("  Start the gateway service?", True):
+                try:
+                    if _is_linux:
+                        systemd_start()
+                    elif _is_macos:
+                        launchd_start()
+                except Exception as e:
+                    print_error(f"  Start failed: {e}")
+        elif _is_linux or _is_macos:
+            svc_name = "systemd" if _is_linux else "launchd"
+            if prompt_yes_no(f"  Install the gateway as a {svc_name} service? (runs in background, starts on boot)", True):
+                try:
+                    if _is_linux:
+                        systemd_install(force=False)
+                    else:
+                        launchd_install(force=False)
+                    print()
+                    if prompt_yes_no("  Start the service now?", True):
+                        try:
+                            if _is_linux:
+                                systemd_start()
+                            elif _is_macos:
+                                launchd_start()
+                        except Exception as e:
+                            print_error(f"  Start failed: {e}")
+                except Exception as e:
+                    print_error(f"  Install failed: {e}")
+                    print_info("  You can try manually: hermes gateway install")
+            else:
+                print_info("  You can install later: hermes gateway install")
+                print_info("  Or run in foreground:  hermes gateway")
+        else:
+            print_info("Start the gateway to bring your bots online:")
+            print_info("   hermes gateway              # Run in foreground")
+
         print_info("━" * 50)
     
     # =========================================================================

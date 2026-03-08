@@ -1,0 +1,188 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 380px;
+  background:
+    radial-gradient(circle at top right, rgba(255, 191, 73, 0.18), transparent 34%),
+    linear-gradient(180deg, #0f0d0a 0%, #17120d 100%);
+  color: #f8f0dc;
+  font: 14px/1.45 "Segoe UI", "Helvetica Neue", sans-serif;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+}
+
+.hero {
+  padding: 4px 2px 0;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: #d4a75d;
+  font: 600 11px/1.2 "Consolas", "Courier New", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: 24px;
+  line-height: 1.1;
+}
+
+.subhead {
+  margin: 8px 0 0;
+  color: #dbc8a3;
+}
+
+.card {
+  border: 1px solid rgba(212, 167, 93, 0.2);
+  border-radius: 16px;
+  background: rgba(27, 21, 15, 0.88);
+  box-shadow: inset 0 1px 0 rgba(255, 232, 184, 0.05);
+  padding: 14px;
+}
+
+.section-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.section-head h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.page-url {
+  margin: 6px 0 0;
+  color: #b89f76;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.meta-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
+.meta-chip {
+  border: 1px solid rgba(255, 219, 146, 0.08);
+  border-radius: 12px;
+  background: rgba(255, 219, 146, 0.04);
+  padding: 10px;
+}
+
+.meta-label {
+  color: #c6a970;
+  display: block;
+  font-size: 11px;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+
+.meta-value {
+  font: 600 12px/1.3 "Consolas", "Courier New", monospace;
+}
+
+.note-input,
+.field input {
+  width: 100%;
+  border: 1px solid rgba(212, 167, 93, 0.24);
+  border-radius: 12px;
+  background: rgba(7, 7, 7, 0.42);
+  color: #fff6e4;
+  padding: 10px 12px;
+  outline: none;
+}
+
+.note-input:focus,
+.field input:focus {
+  border-color: rgba(255, 191, 73, 0.75);
+  box-shadow: 0 0 0 1px rgba(255, 191, 73, 0.2);
+}
+
+.note-input {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.field {
+  display: block;
+  margin-bottom: 10px;
+}
+
+.field-label {
+  color: #c9af82;
+  display: block;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.checkbox-row {
+  align-items: flex-start;
+  color: #dbc8a3;
+  display: flex;
+  gap: 10px;
+  margin: 12px 0 14px;
+}
+
+.checkbox-row input {
+  margin-top: 3px;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  font: 600 13px/1 "Segoe UI", "Helvetica Neue", sans-serif;
+  padding: 12px 14px;
+  transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+button:active {
+  transform: translateY(0);
+}
+
+.primary-button {
+  width: 100%;
+  background: linear-gradient(135deg, #f1b44c, #d88a2d);
+  color: #241406;
+}
+
+.secondary-button,
+.ghost-button {
+  background: rgba(255, 219, 146, 0.08);
+  color: #f7dfb2;
+}
+
+.status-card {
+  min-height: 90px;
+}
+
+.status-text {
+  margin: 0;
+  color: #f0dbc1;
+  white-space: pre-wrap;
+}

@@ -1,17 +1,27 @@
 """
 Gateway subcommand for hermes CLI.
 
-Handles: hermes gateway [run|start|stop|restart|status|install|uninstall]
+Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import collections
 import os
 import signal
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+
+from hermes_cli.config import get_env_value, save_env_value
+from hermes_cli.setup import (
+    print_header, print_info, print_success, print_warning, print_error,
+    prompt, prompt_choice, prompt_yes_no,
+)
+from hermes_cli.colors import Colors, color
 
 
 # =============================================================================
@@ -22,6 +32,12 @@ def find_gateway_pids() -> list:
     """Find PIDs of running gateway processes."""
     pids = []
     try:
+        from gateway.status import get_gateway_pid
+
+        pid_from_file = get_gateway_pid()
+        if pid_from_file:
+            return [pid_from_file]
+
         if is_windows():
             ps_cmd = (
                 "Get-CimInstance Win32_Process | "
@@ -164,7 +180,14 @@ def get_launchd_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"
 
 def get_python_path() -> str:
-    venv_python = PROJECT_ROOT / "venv" / "bin" / "python"
+    if sys.platform == "win32":
+        venv_python = PROJECT_ROOT / "venv" / "Scripts" / "python.exe"
+        if not venv_python.exists():
+            venv_python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = PROJECT_ROOT / "venv" / "bin" / "python"
+        if not venv_python.exists():
+            venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
     if venv_python.exists():
         return str(venv_python)
     return sys.executable
@@ -179,6 +202,217 @@ def get_hermes_cli_path() -> str:
     
     # Fallback to direct module execution
     return f"{get_python_path()} -m hermes_cli.main"
+
+
+def get_windows_hermes_command() -> list[str]:
+    """Resolve the best command to launch the Hermes CLI on Windows."""
+    candidates = [
+        PROJECT_ROOT / "venv" / "Scripts" / "hermes.exe",
+        PROJECT_ROOT / ".venv" / "Scripts" / "hermes.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return [str(candidate)]
+
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin:
+        return [hermes_bin]
+
+    return [sys.executable, "-m", "hermes_cli.main"]
+
+
+def get_gateway_log_paths() -> tuple[Path, Path]:
+    """Return stdout/stderr log paths for detached gateway runs."""
+    log_dir = Path.home() / ".hermes" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "gateway.log", log_dir / "gateway-error.log"
+
+
+def reset_gateway_logs() -> tuple[Path, Path]:
+    """Clear on-disk gateway logs before starting a fresh Windows gateway session."""
+    stdout_log, stderr_log = get_gateway_log_paths()
+    for path in (stdout_log, stderr_log):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    return stdout_log, stderr_log
+
+
+def read_recent_gateway_logs(lines: int = 30, *, include_error: bool = False) -> str:
+    """Return the most recent gateway log lines from disk."""
+    stdout_log, stderr_log = get_gateway_log_paths()
+    targets = [stdout_log]
+    if include_error:
+        targets.append(stderr_log)
+
+    chunks: list[str] = []
+    for path in targets:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                tail = collections.deque(handle, maxlen=max(lines, 1))
+            if tail:
+                header = f"== {path.name} =="
+                chunks.append(header)
+                chunks.append("".join(tail).rstrip())
+        except Exception as exc:
+            chunks.append(f"== {path.name} ==\n[failed to read log: {exc}]")
+
+    return "\n\n".join(chunk for chunk in chunks if chunk).strip()
+
+
+def follow_gateway_logs(lines: int = 30, *, include_error: bool = False) -> None:
+    """Print recent gateway logs, then follow appended output until interrupted."""
+    snapshot = read_recent_gateway_logs(lines=lines, include_error=include_error)
+    if snapshot:
+        print(snapshot)
+    else:
+        print("No gateway logs found yet.")
+
+    stdout_log, stderr_log = get_gateway_log_paths()
+    targets = [stdout_log]
+    if include_error:
+        targets.append(stderr_log)
+
+    print()
+    print("Following gateway logs. Press Ctrl+C to stop.")
+
+    positions = {}
+    for path in targets:
+        if path.exists():
+            positions[path] = path.stat().st_size
+        else:
+            positions[path] = 0
+
+    try:
+        while True:
+            for path in targets:
+                if not path.exists():
+                    continue
+                current_size = path.stat().st_size
+                previous_size = positions.get(path, 0)
+                if current_size < previous_size:
+                    previous_size = 0
+                if current_size == previous_size:
+                    continue
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    handle.seek(previous_size)
+                    chunk = handle.read()
+                positions[path] = current_size
+                if chunk:
+                    print(chunk, end="" if chunk.endswith("\n") else "\n")
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print()
+        print("Stopped following gateway logs.")
+
+
+def windows_start_detached_gateway() -> None:
+    """Start the gateway in its own console window on Windows."""
+    from gateway.status import is_gateway_running
+
+    if is_gateway_running():
+        print("✓ Gateway is already running")
+        return
+
+    command = [*get_windows_hermes_command(), "gateway", "run"]
+    stdout_log, _stderr_log = reset_gateway_logs()
+
+    flags = 0
+    flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    flags |= getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+
+    proc = subprocess.Popen(
+        command,
+        cwd=str(PROJECT_ROOT),
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=flags,
+    )
+
+    time.sleep(1.5)
+
+    from gateway.status import get_gateway_pid
+
+    gateway_pid = get_gateway_pid()
+    if gateway_pid:
+        print(f"✓ Gateway started in its own window (PID: {gateway_pid})")
+        print("  Live status updates should appear in the Hermes Gateway console.")
+        print(f"  Logs were reset at startup: {stdout_log}")
+        return
+
+    if proc.poll() is None:
+        print(f"✓ Gateway launch requested in a new window (PID: {proc.pid})")
+        print("  Waiting for pid file; watch the Hermes Gateway console window.")
+        return
+
+    print("✗ Gateway failed to stay running")
+    print("  Check the Hermes Gateway console window for output.")
+    sys.exit(1)
+
+
+def windows_stop_gateway() -> None:
+    """Stop the Windows gateway process using the pid file when possible."""
+    from gateway.status import get_gateway_pid, remove_pid_file
+
+    pid = get_gateway_pid()
+    if pid:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            remove_pid_file()
+            print(f"✓ Stopped gateway process {pid}")
+            return
+
+    killed = kill_gateway_processes(force=True)
+    if killed:
+        remove_pid_file()
+        print(f"✓ Stopped {killed} gateway process(es)")
+    else:
+        print("✗ No gateway processes found")
+
+
+def windows_gateway_status() -> None:
+    """Show detached gateway status on Windows."""
+    from gateway.status import get_gateway_pid
+
+    stdout_log, _stderr_log = get_gateway_log_paths()
+    pid = get_gateway_pid()
+    if pid:
+        print(f"✓ Gateway is running (PID: {pid})")
+        print("  (Running in its own console window on Windows)")
+        print("  Live status updates appear in the Hermes Gateway console.")
+        print(f"  Log snapshot path: {stdout_log}")
+        return
+
+    pids = find_gateway_pids()
+    if pids:
+        print(f"✓ Gateway appears to be running (PID: {', '.join(map(str, pids))})")
+        print("  Warning: no pid file was found; status is based on process scan.")
+        print("  Live status updates appear in the Hermes Gateway console.")
+        print(f"  Log snapshot path: {stdout_log}")
+        return
+
+    print("✗ Gateway is not running")
+    print()
+    print("To start:")
+    print("  hermes gateway start")
+
+
+def show_gateway_logs(lines: int = 30, *, follow: bool = False, include_error: bool = False) -> None:
+    """Display gateway logs from the on-disk log files."""
+    if follow:
+        follow_gateway_logs(lines=lines, include_error=include_error)
+        return
+
+    snapshot = read_recent_gateway_logs(lines=lines, include_error=include_error)
+    if snapshot:
+        print(snapshot)
+    else:
+        print("No gateway logs found yet.")
 
 
 # =============================================================================
@@ -435,6 +669,370 @@ def run_gateway(verbose: bool = False):
 
 
 # =============================================================================
+# Gateway Setup (Interactive Messaging Platform Configuration)
+# =============================================================================
+
+# Per-platform config: each entry defines the env vars, setup instructions,
+# and prompts needed to configure a messaging platform.
+_PLATFORMS = [
+    {
+        "key": "telegram",
+        "label": "Telegram",
+        "emoji": "📱",
+        "token_var": "TELEGRAM_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Open Telegram and message @BotFather",
+            "2. Send /newbot and follow the prompts to create your bot",
+            "3. Copy the bot token BotFather gives you",
+            "4. To find your user ID: message @userinfobot — it replies with your numeric ID",
+        ],
+        "vars": [
+            {"name": "TELEGRAM_BOT_TOKEN", "prompt": "Bot token", "password": True,
+             "help": "Paste the token from @BotFather (step 3 above)."},
+            {"name": "TELEGRAM_ALLOWED_USERS", "prompt": "Allowed user IDs (comma-separated)", "password": False,
+             "is_allowlist": True,
+             "help": "Paste your user ID from step 4 above."},
+            {"name": "TELEGRAM_HOME_CHANNEL", "prompt": "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)", "password": False,
+             "help": "For DMs, this is your user ID. You can set it later by typing /set-home in chat."},
+        ],
+    },
+    {
+        "key": "discord",
+        "label": "Discord",
+        "emoji": "💬",
+        "token_var": "DISCORD_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Go to https://discord.com/developers/applications → New Application",
+            "2. Go to Bot → Reset Token → copy the bot token",
+            "3. Enable: Bot → Privileged Gateway Intents → Message Content Intent",
+            "4. Invite the bot to your server:",
+            "   OAuth2 → URL Generator → check BOTH scopes:",
+            "     - bot",
+            "     - applications.commands  (required for slash commands!)",
+            "   Bot Permissions: Send Messages, Read Message History, Attach Files",
+            "   Copy the URL and open it in your browser to invite.",
+            "5. Get your user ID: enable Developer Mode in Discord settings,",
+            "   then right-click your name → Copy ID",
+        ],
+        "vars": [
+            {"name": "DISCORD_BOT_TOKEN", "prompt": "Bot token", "password": True,
+             "help": "Paste the token from step 2 above."},
+            {"name": "DISCORD_ALLOWED_USERS", "prompt": "Allowed user IDs or usernames (comma-separated)", "password": False,
+             "is_allowlist": True,
+             "help": "Paste your user ID from step 5 above."},
+            {"name": "DISCORD_HOME_CHANNEL", "prompt": "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)", "password": False,
+             "help": "Right-click a channel → Copy Channel ID (requires Developer Mode)."},
+        ],
+    },
+    {
+        "key": "slack",
+        "label": "Slack",
+        "emoji": "💼",
+        "token_var": "SLACK_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Go to https://api.slack.com/apps → Create New App → From Scratch",
+            "2. Enable Socket Mode: App Settings → Socket Mode → Enable",
+            "3. Get Bot Token: OAuth & Permissions → Install to Workspace → copy xoxb-... token",
+            "4. Get App Token: Basic Information → App-Level Tokens → Generate",
+            "   Name it anything, add scope: connections:write → copy xapp-... token",
+            "5. Add bot scopes: OAuth & Permissions → Scopes → chat:write, im:history,",
+            "   im:read, im:write, channels:history, channels:read",
+            "6. Reinstall the app to your workspace after adding scopes",
+            "7. Find your user ID: click your profile → three dots → Copy member ID",
+        ],
+        "vars": [
+            {"name": "SLACK_BOT_TOKEN", "prompt": "Bot Token (xoxb-...)", "password": True,
+             "help": "Paste the bot token from step 3 above."},
+            {"name": "SLACK_APP_TOKEN", "prompt": "App Token (xapp-...)", "password": True,
+             "help": "Paste the app-level token from step 4 above."},
+            {"name": "SLACK_ALLOWED_USERS", "prompt": "Allowed user IDs (comma-separated)", "password": False,
+             "is_allowlist": True,
+             "help": "Paste your member ID from step 7 above."},
+        ],
+    },
+    {
+        "key": "whatsapp",
+        "label": "WhatsApp",
+        "emoji": "📲",
+        "token_var": "WHATSAPP_ENABLED",
+    },
+]
+
+
+def _platform_status(platform: dict) -> str:
+    """Return a plain-text status string for a platform.
+
+    Returns uncolored text so it can safely be embedded in
+    simple_term_menu items (ANSI codes break width calculation).
+    """
+    token_var = platform["token_var"]
+    val = get_env_value(token_var)
+    if token_var == "WHATSAPP_ENABLED":
+        if val and val.lower() == "true":
+            session_file = Path.home() / ".hermes" / "whatsapp" / "session" / "creds.json"
+            if session_file.exists():
+                return "configured + paired"
+            return "enabled, not paired"
+        return "not configured"
+    if val:
+        return "configured"
+    return "not configured"
+
+
+def _setup_standard_platform(platform: dict):
+    """Interactive setup for Telegram, Discord, or Slack."""
+    emoji = platform["emoji"]
+    label = platform["label"]
+    token_var = platform["token_var"]
+
+    print()
+    print(color(f"  ─── {emoji} {label} Setup ───", Colors.CYAN))
+
+    # Show step-by-step setup instructions if this platform has them
+    instructions = platform.get("setup_instructions")
+    if instructions:
+        print()
+        for line in instructions:
+            print_info(f"  {line}")
+
+    existing_token = get_env_value(token_var)
+    if existing_token:
+        print()
+        print_success(f"{label} is already configured.")
+        if not prompt_yes_no(f"  Reconfigure {label}?", False):
+            return
+
+    allowed_val_set = None  # Track if user set an allowlist (for home channel offer)
+
+    for var in platform["vars"]:
+        print()
+        print_info(f"  {var['help']}")
+        existing = get_env_value(var["name"])
+        if existing and var["name"] != token_var:
+            print_info(f"  Current: {existing}")
+
+        # Allowlist fields get special handling for the deny-by-default security model
+        if var.get("is_allowlist"):
+            print_info(f"  The gateway DENIES all users by default for security.")
+            print_info(f"  Enter user IDs to create an allowlist, or leave empty")
+            print_info(f"  and you'll be asked about open access next.")
+            value = prompt(f"  {var['prompt']}", password=False)
+            if value:
+                cleaned = value.replace(" ", "")
+                save_env_value(var["name"], cleaned)
+                print_success(f"  Saved — only these users can interact with the bot.")
+                allowed_val_set = cleaned
+            else:
+                # No allowlist — ask about open access vs DM pairing
+                print()
+                access_choices = [
+                    "Enable open access (anyone can message the bot)",
+                    "Use DM pairing (unknown users request access, you approve with 'hermes pairing approve')",
+                    "Skip for now (bot will deny all users until configured)",
+                ]
+                access_idx = prompt_choice("  How should unauthorized users be handled?", access_choices, 1)
+                if access_idx == 0:
+                    save_env_value("GATEWAY_ALLOW_ALL_USERS", "true")
+                    print_warning("  Open access enabled — anyone can use your bot!")
+                elif access_idx == 1:
+                    print_success("  DM pairing mode — users will receive a code to request access.")
+                    print_info("  Approve with: hermes pairing approve {platform} {code}")
+                else:
+                    print_info("  Skipped — configure later with 'hermes gateway setup'")
+            continue
+
+        value = prompt(f"  {var['prompt']}", password=var.get("password", False))
+        if value:
+            save_env_value(var["name"], value)
+            print_success(f"  Saved {var['name']}")
+        elif var["name"] == token_var:
+            print_warning(f"  Skipped — {label} won't work without this.")
+            return
+        else:
+            print_info(f"  Skipped (can configure later)")
+
+    # If an allowlist was set and home channel wasn't, offer to reuse
+    # the first user ID (common for Telegram DMs).
+    home_var = f"{label.upper()}_HOME_CHANNEL"
+    home_val = get_env_value(home_var)
+    if allowed_val_set and not home_val and label == "Telegram":
+        first_id = allowed_val_set.split(",")[0].strip()
+        if first_id and prompt_yes_no(f"  Use your user ID ({first_id}) as the home channel?", True):
+            save_env_value(home_var, first_id)
+            print_success(f"  Home channel set to {first_id}")
+
+    print()
+    print_success(f"{emoji} {label} configured!")
+
+
+def _setup_whatsapp():
+    """Delegate to the existing WhatsApp setup flow."""
+    from hermes_cli.main import cmd_whatsapp
+    import argparse
+    cmd_whatsapp(argparse.Namespace())
+
+
+def _is_service_installed() -> bool:
+    """Check if the gateway is installed as a system service."""
+    if is_linux():
+        return get_systemd_unit_path().exists()
+    elif is_macos():
+        return get_launchd_plist_path().exists()
+    return False
+
+
+def _is_service_running() -> bool:
+    """Check if the gateway service is currently running."""
+    if is_linux() and get_systemd_unit_path().exists():
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", SERVICE_NAME],
+            capture_output=True, text=True
+        )
+        return result.stdout.strip() == "active"
+    elif is_macos() and get_launchd_plist_path().exists():
+        result = subprocess.run(
+            ["launchctl", "list", "ai.hermes.gateway"],
+            capture_output=True, text=True
+        )
+        return result.returncode == 0
+    # Check for manual processes
+    return len(find_gateway_pids()) > 0
+
+
+def gateway_setup():
+    """Interactive setup for messaging platforms + gateway service."""
+
+    print()
+    print(color("┌─────────────────────────────────────────────────────────┐", Colors.MAGENTA))
+    print(color("│             ⚕ Gateway Setup                            │", Colors.MAGENTA))
+    print(color("├─────────────────────────────────────────────────────────┤", Colors.MAGENTA))
+    print(color("│  Configure messaging platforms and the gateway service. │", Colors.MAGENTA))
+    print(color("│  Press Ctrl+C at any time to exit.                     │", Colors.MAGENTA))
+    print(color("└─────────────────────────────────────────────────────────┘", Colors.MAGENTA))
+
+    # ── Gateway service status ──
+    print()
+    service_installed = _is_service_installed()
+    service_running = _is_service_running()
+
+    if service_installed and service_running:
+        print_success("Gateway service is installed and running.")
+    elif service_installed:
+        print_warning("Gateway service is installed but not running.")
+        if prompt_yes_no("  Start it now?", True):
+            try:
+                if is_linux():
+                    systemd_start()
+                elif is_macos():
+                    launchd_start()
+            except subprocess.CalledProcessError as e:
+                print_error(f"  Failed to start: {e}")
+    else:
+        print_info("Gateway service is not installed yet.")
+        print_info("You'll be offered to install it after configuring platforms.")
+
+    # ── Platform configuration loop ──
+    while True:
+        print()
+        print_header("Messaging Platforms")
+
+        menu_items = []
+        for plat in _PLATFORMS:
+            status = _platform_status(plat)
+            menu_items.append(f"{plat['label']}  ({status})")
+        menu_items.append("Done")
+
+        choice = prompt_choice("Select a platform to configure:", menu_items, len(menu_items) - 1)
+
+        if choice == len(_PLATFORMS):
+            break
+
+        platform = _PLATFORMS[choice]
+
+        if platform["key"] == "whatsapp":
+            _setup_whatsapp()
+        else:
+            _setup_standard_platform(platform)
+
+    # ── Post-setup: offer to install/restart gateway ──
+    any_configured = any(
+        bool(get_env_value(p["token_var"]))
+        for p in _PLATFORMS
+        if p["key"] != "whatsapp"
+    ) or (get_env_value("WHATSAPP_ENABLED") or "").lower() == "true"
+
+    if any_configured:
+        print()
+        print(color("─" * 58, Colors.DIM))
+        service_installed = _is_service_installed()
+        service_running = _is_service_running()
+
+        if service_running:
+            if prompt_yes_no("  Restart the gateway to pick up changes?", True):
+                try:
+                    if is_linux():
+                        systemd_restart()
+                    elif is_macos():
+                        launchd_restart()
+                    else:
+                        windows_stop_gateway()
+                        print_info("Start again with: hermes gateway start")
+                except subprocess.CalledProcessError as e:
+                    print_error(f"  Restart failed: {e}")
+        elif service_installed:
+            if prompt_yes_no("  Start the gateway service?", True):
+                try:
+                    if is_linux():
+                        systemd_start()
+                    elif is_macos():
+                        launchd_start()
+                    else:
+                        windows_start_detached_gateway()
+                except subprocess.CalledProcessError as e:
+                    print_error(f"  Start failed: {e}")
+        else:
+            print()
+            if is_linux() or is_macos():
+                platform_name = "systemd" if is_linux() else "launchd"
+                if prompt_yes_no(f"  Install the gateway as a {platform_name} service? (runs in background, starts on boot)", True):
+                    try:
+                        force = False
+                        if is_linux():
+                            systemd_install(force)
+                        else:
+                            launchd_install(force)
+                        print()
+                        if prompt_yes_no("  Start the service now?", True):
+                            try:
+                                if is_linux():
+                                    systemd_start()
+                                else:
+                                    launchd_start()
+                            except subprocess.CalledProcessError as e:
+                                print_error(f"  Start failed: {e}")
+                    except subprocess.CalledProcessError as e:
+                        print_error(f"  Install failed: {e}")
+                        print_info("  You can try manually: hermes gateway install")
+                else:
+                    print_info("  You can install later: hermes gateway install")
+                    if is_windows():
+                        print_info("  Or start in background: hermes gateway start")
+                    else:
+                        print_info("  Or run in foreground:  hermes gateway")
+            else:
+                print_info("  Service install not supported on this platform.")
+                if is_windows():
+                    print_info("  Start in background: hermes gateway start")
+                else:
+                    print_info("  Run in foreground: hermes gateway")
+    else:
+        print()
+        print_info("No platforms configured. Run 'hermes gateway setup' when ready.")
+
+    print()
+
+
+# =============================================================================
 # Main Command Handler
 # =============================================================================
 
@@ -447,7 +1045,11 @@ def gateway_command(args):
         verbose = getattr(args, 'verbose', False)
         run_gateway(verbose)
         return
-    
+
+    if subcmd == "setup":
+        gateway_setup()
+        return
+
     # Service management commands
     if subcmd == "install":
         force = getattr(args, 'force', False)
@@ -457,7 +1059,7 @@ def gateway_command(args):
             launchd_install(force)
         else:
             print("Service installation not supported on this platform.")
-            print("Run manually: hermes gateway run")
+            print("Use background mode instead: hermes gateway start")
             sys.exit(1)
     
     elif subcmd == "uninstall":
@@ -474,13 +1076,18 @@ def gateway_command(args):
             systemd_start()
         elif is_macos():
             launchd_start()
+        elif is_windows():
+            windows_start_detached_gateway()
         else:
-            print("Gateway service start is not supported on this platform.")
+            print("Gateway background start is not supported on this platform.")
             print("Run in foreground instead: hermes gateway")
-            print("For background execution on Windows, use Task Scheduler.")
             sys.exit(1)
     
     elif subcmd == "stop":
+        if is_windows():
+            windows_stop_gateway()
+            return
+
         # Try service first, fall back to killing processes directly
         service_available = False
         
@@ -514,6 +1121,12 @@ def gateway_command(args):
                 print("✗ No gateway processes found")
     
     elif subcmd == "restart":
+        if is_windows():
+            windows_stop_gateway()
+            time.sleep(1)
+            windows_start_detached_gateway()
+            return
+
         # Try service first, fall back to killing and restarting
         service_available = False
         
@@ -545,6 +1158,14 @@ def gateway_command(args):
     
     elif subcmd == "status":
         deep = getattr(args, 'deep', False)
+        if is_windows():
+            windows_gateway_status()
+            if deep:
+                print()
+                snapshot = read_recent_gateway_logs(lines=20, include_error=True)
+                if snapshot:
+                    print(snapshot)
+            return
         
         # Check for service first
         if is_linux() and get_systemd_unit_path().exists():
@@ -566,3 +1187,9 @@ def gateway_command(args):
                 print("To start:")
                 print("  hermes gateway          # Run in foreground")
                 print("  hermes gateway install  # Install as service")
+
+    elif subcmd == "logs":
+        lines = max(1, int(getattr(args, "lines", 30)))
+        follow = bool(getattr(args, "follow", False))
+        include_error = bool(getattr(args, "error", False))
+        show_gateway_logs(lines=lines, follow=follow, include_error=include_error)

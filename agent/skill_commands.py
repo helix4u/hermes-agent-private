@@ -26,8 +26,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         if not SKILLS_DIR.exists():
             return _skill_commands
         for skill_md in SKILLS_DIR.rglob("SKILL.md"):
-            path_str = str(skill_md)
-            if '/.git/' in path_str or '/.github/' in path_str or '/.hub/' in path_str:
+            if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
                 continue
             try:
                 content = skill_md.read_text(encoding='utf-8')
@@ -97,7 +96,7 @@ def build_skill_invocation_message(cmd_key: str, user_instruction: str = "") -> 
         if subdir_path.exists():
             for f in sorted(subdir_path.rglob("*")):
                 if f.is_file():
-                    rel = str(f.relative_to(skill_dir))
+                    rel = f.relative_to(skill_dir).as_posix()
                     supporting.append(rel)
 
     if supporting:
@@ -105,7 +104,7 @@ def build_skill_invocation_message(cmd_key: str, user_instruction: str = "") -> 
         parts.append("[This skill has supporting files you can load with the skill_view tool:]")
         for sf in supporting:
             parts.append(f"- {sf}")
-        parts.append(f'\nTo view any of these, use: skill_view(name="{skill_name}", file="<path>")')
+        parts.append(f'\nTo view any of these, use: skill_view(name="{skill_name}", file_path="<path>")')
 
     if user_instruction:
         parts.append("")

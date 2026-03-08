@@ -44,6 +44,7 @@ class SessionSource:
     user_id: Optional[str] = None
     user_name: Optional[str] = None
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
+    chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     
     @property
     def description(self) -> str:
@@ -75,6 +76,7 @@ class SessionSource:
             "user_id": self.user_id,
             "user_name": self.user_name,
             "thread_id": self.thread_id,
+            "chat_topic": self.chat_topic,
         }
     
     @classmethod
@@ -87,6 +89,7 @@ class SessionSource:
             user_id=data.get("user_id"),
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
+            chat_topic=data.get("chat_topic"),
         )
     
     @classmethod
@@ -154,6 +157,10 @@ def build_session_context_prompt(context: SessionContext) -> str:
         lines.append(f"**Source:** {platform_name} (the machine running this agent)")
     else:
         lines.append(f"**Source:** {platform_name} ({context.source.description})")
+    
+    # Channel topic (if available - provides context about the channel's purpose)
+    if context.source.chat_topic:
+        lines.append(f"**Channel Topic:** {context.source.chat_topic}")
 
     # User identity (especially useful for WhatsApp where multiple people DM)
     if context.source.user_name:
@@ -274,6 +281,20 @@ class SessionEntry:
         )
 
 
+def build_session_key(source: SessionSource) -> str:
+    """Build a deterministic session key from a message source.
+
+    This is the single source of truth for session key construction.
+    WhatsApp DMs include chat_id (multi-user), other DMs do not (single owner).
+    """
+    platform = source.platform.value
+    if source.chat_type == "dm":
+        if platform == "whatsapp" and source.chat_id:
+            return f"agent:main:{platform}:dm:{source.chat_id}"
+        return f"agent:main:{platform}:dm"
+    return f"agent:main:{platform}:{source.chat_type}:{source.chat_id}"
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
@@ -323,23 +344,18 @@ class SessionStore:
         """Save sessions index to disk (kept for session key -> ID mapping)."""
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         sessions_file = self.sessions_dir / "sessions.json"
-        
+
         data = {key: entry.to_dict() for key, entry in self._entries.items()}
-        with open(sessions_file, "w", encoding="utf-8", newline="") as f:
+        tmp_file = self.sessions_dir / "sessions.json.tmp"
+        with open(tmp_file, "w", encoding="utf-8", newline="") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, sessions_file)
     
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
-        platform = source.platform.value
-
-        if source.chat_type == "dm":
-            # WhatsApp DMs come from different people, each needs its own session.
-            # Other platforms (Telegram, Discord) have a single DM with the bot owner.
-            if platform == "whatsapp" and source.chat_id:
-                return f"agent:main:{platform}:dm:{source.chat_id}"
-            return f"agent:main:{platform}:dm"
-        else:
-            return f"agent:main:{platform}:{source.chat_type}:{source.chat_id}"
+        return build_session_key(source)
     
     def _should_reset(self, entry: SessionEntry, source: SessionSource) -> bool:
         """
@@ -383,9 +399,25 @@ class SessionStore:
         return False
     
     def has_any_sessions(self) -> bool:
-        """Check if any sessions have ever been created (across all platforms)."""
+        """Check if any sessions have ever been created (across all platforms).
+
+        Uses the SQLite database as the source of truth because it preserves
+        historical session records (ended sessions still count).  The in-memory
+        ``_entries`` dict replaces entries on reset, so ``len(_entries)`` would
+        stay at 1 for single-platform users — which is the bug this fixes.
+
+        The current session is already in the DB by the time this is called
+        (get_or_create_session runs first), so we check ``> 1``.
+        """
+        if self._db:
+            try:
+                return self._db.session_count() > 1
+            except Exception:
+                pass  # fall through to heuristic
+        # Fallback: check if sessions.json was loaded with existing data.
+        # This covers the rare case where the DB is unavailable.
         self._ensure_loaded()
-        return len(self._entries) > 1  # >1 because the current new session is already in _entries
+        return len(self._entries) > 1
     
     def get_or_create_session(
         self, 
@@ -481,6 +513,27 @@ class SessionStore:
                     )
                 except Exception as e:
                     logger.debug("Session DB operation failed: %s", e)
+
+    def update_session_id(self, session_key: str, new_session_id: str) -> bool:
+        """Update the active session ID mapped to a session key."""
+        self._ensure_loaded()
+        if session_key not in self._entries:
+            return False
+
+        normalized = (new_session_id or "").strip()
+        if not normalized:
+            return False
+
+        entry = self._entries[session_key]
+        if entry.session_id == normalized:
+            entry.updated_at = datetime.now()
+            self._save()
+            return True
+
+        entry.session_id = normalized
+        entry.updated_at = datetime.now()
+        self._save()
+        return True
     
     def reset_session(self, session_key: str) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
@@ -571,6 +624,34 @@ class SessionStore:
         with open(transcript_path, "a", encoding="utf-8", errors="replace", newline="") as f:
             f.write(line)
     
+    def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Replace the entire transcript for a session with new messages.
+        
+        Used by /retry, /undo, and /compress to persist modified conversation history.
+        Rewrites both SQLite and legacy JSONL storage.
+        """
+        # SQLite: clear old messages and re-insert
+        if self._db:
+            try:
+                self._db.clear_messages(session_id)
+                for msg in messages:
+                    self._db.append_message(
+                        session_id=session_id,
+                        role=msg.get("role", "unknown"),
+                        content=msg.get("content"),
+                        tool_name=msg.get("tool_name"),
+                        tool_calls=msg.get("tool_calls"),
+                        tool_call_id=msg.get("tool_call_id"),
+                    )
+            except Exception as e:
+                logger.debug("Failed to rewrite transcript in DB: %s", e)
+        
+        # JSONL: overwrite the file
+        transcript_path = self.get_transcript_path(session_id)
+        with open(transcript_path, "w", encoding="utf-8", errors="replace", newline="") as f:
+            for msg in messages:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""
         # Try SQLite first
@@ -589,7 +670,7 @@ class SessionStore:
             return []
         
         messages = []
-        with open(transcript_path, "r", encoding="utf-8") as f:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if line:

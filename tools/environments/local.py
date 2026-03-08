@@ -1,11 +1,14 @@
 """Local execution environment with interrupt support and non-blocking I/O."""
 
 import os
+import platform
 import shutil
 import signal
 import subprocess
 import threading
 import time
+
+_IS_WINDOWS = platform.system() == "Windows"
 
 from tools.environments.base import BaseEnvironment
 from tools.environments.shell_utils import (
@@ -13,22 +16,84 @@ from tools.environments.shell_utils import (
     terminate_process_tree,
 )
 
+# Unique marker to isolate real command output from shell init/exit noise.
+# printf (no trailing newline) keeps the boundaries clean for splitting.
+_OUTPUT_FENCE = "__HERMES_FENCE_a9f7b3__"
+
 # Noise lines emitted by interactive shells when stdin is not a terminal.
-# Filtered from output to keep tool results clean.
-_SHELL_NOISE = frozenset({
+# Used as a fallback when output fence markers are missing.
+_SHELL_NOISE_SUBSTRINGS = (
+    # bash
+    "bash: cannot set terminal process group",
     "bash: no job control in this shell",
-    "bash: no job control in this shell\n",
     "no job control in this shell",
-    "no job control in this shell\n",
-})
+    "cannot set terminal process group",
+    "tcsetattr: Inappropriate ioctl for device",
+    # zsh / oh-my-zsh / macOS terminal session
+    "Restored session:",
+    "Saving session...",
+    "Last login:",
+    "command not found:",
+    "Oh My Zsh",
+    "compinit:",
+)
 
 
 def _clean_shell_noise(output: str) -> str:
-    """Strip shell startup warnings that leak when using -i without a TTY."""
-    lines = output.split("\n", 2)  # only check first two lines
-    if lines and lines[0].strip() in _SHELL_NOISE:
-        return "\n".join(lines[1:])
-    return output
+    """Strip shell startup/exit warnings that leak when using -i without a TTY.
+
+    Removes lines matching known noise patterns from both the beginning
+    and end of the output.  Lines in the middle are left untouched.
+    """
+
+    def _is_noise(line: str) -> bool:
+        return any(noise in line for noise in _SHELL_NOISE_SUBSTRINGS)
+
+    lines = output.split("\n")
+
+    # Strip leading noise
+    while lines and _is_noise(lines[0]):
+        lines.pop(0)
+
+    # Strip trailing noise (walk backwards, skip empty lines from split)
+    end = len(lines) - 1
+    while end >= 0 and (not lines[end] or _is_noise(lines[end])):
+        end -= 1
+
+    if end < 0:
+        return ""
+
+    cleaned = lines[: end + 1]
+    result = "\n".join(cleaned)
+
+    # Preserve trailing newline if original had one
+    if output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _extract_fenced_output(raw: str) -> str:
+    """Extract real command output from between fence markers.
+
+    The execute() method wraps each command with printf(FENCE) markers.
+    This function finds the first and last fence and returns only the
+    content between them, which is the actual command output free of
+    any shell init/exit noise.
+
+    Falls back to pattern-based _clean_shell_noise if fences are missing.
+    """
+    first = raw.find(_OUTPUT_FENCE)
+    if first == -1:
+        return _clean_shell_noise(raw)
+
+    start = first + len(_OUTPUT_FENCE)
+    last = raw.rfind(_OUTPUT_FENCE)
+
+    if last <= first:
+        # Only start fence found (e.g. user command called `exit`)
+        return _clean_shell_noise(raw[start:])
+
+    return raw[start:last]
 
 
 class LocalEnvironment(BaseEnvironment):
@@ -55,9 +120,23 @@ class LocalEnvironment(BaseEnvironment):
         exec_command = self._prepare_command(command)
 
         try:
-            popen_args, popen_platform_kwargs, _ = build_local_subprocess_invocation(
-                exec_command, work_dir
+            shell_command = exec_command
+            # On POSIX and WSL, wrap commands with output fences so shell
+            # startup/exit chatter does not leak into the real command output.
+            popen_args, popen_platform_kwargs, shell_mode = build_local_subprocess_invocation(
+                shell_command, work_dir
             )
+            if shell_mode in {"posix", "wsl"}:
+                shell_command = (
+                    f"printf '{_OUTPUT_FENCE}';"
+                    f" {exec_command};"
+                    f" __hermes_rc=$?;"
+                    f" printf '{_OUTPUT_FENCE}';"
+                    f" exit $__hermes_rc"
+                )
+                popen_args, popen_platform_kwargs, shell_mode = build_local_subprocess_invocation(
+                    shell_command, work_dir
+                )
             proc = subprocess.Popen(
                 popen_args,
                 text=True,
@@ -120,7 +199,7 @@ class LocalEnvironment(BaseEnvironment):
                 time.sleep(0.2)
 
             reader.join(timeout=5)
-            output = _clean_shell_noise("".join(_output_chunks))
+            output = _extract_fenced_output("".join(_output_chunks))
             return {"output": output, "returncode": proc.returncode}
 
         except Exception as e:

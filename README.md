@@ -121,11 +121,14 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 
 | Provider | Setup |
 |----------|-------|
-| **Nous Portal** | `hermes login` (OAuth, subscription-based) |
+| **Nous Portal** | `hermes model` (OAuth, subscription-based) |
+| **OpenAI Codex** | `hermes model` (ChatGPT OAuth, uses Codex models) |
 | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
 | **Custom Endpoint** | `OPENAI_BASE_URL` + `OPENAI_API_KEY` in `~/.hermes/.env` |
 
-**Note:** Even when using Nous Portal or a custom endpoint, some tools (vision, web summarization, MoA) use OpenRouter independently. An `OPENROUTER_API_KEY` enables these tools.
+**Codex note:** The OpenAI Codex provider authenticates via device code (open a URL, enter a code). Credentials are stored at `~/.codex/auth.json` and auto-refresh. No Codex CLI installation required.
+
+**Note:** Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, web summarization, MoA) use OpenRouter independently. An `OPENROUTER_API_KEY` enables these tools.
 
 ---
 
@@ -143,7 +146,7 @@ All your settings are stored in `~/.hermes/` for easy access:
 ├── skills/         # Agent-created skills (managed via skill_manage tool)
 ├── cron/           # Scheduled jobs
 ├── sessions/       # Gateway sessions
-└── logs/           # Logs
+└── logs/           # Logs (errors.log, gateway.log — secrets auto-redacted)
 ```
 
 ### Managing Configuration
@@ -185,6 +188,24 @@ The `hermes config set` command automatically routes values to the right file �
 | OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
 | RL Training | [Tinker](https://tinker-console.thinkingmachines.ai/) + [WandB](https://wandb.ai/) | `TINKER_API_KEY`, `WANDB_API_KEY` |
 | Cross-session user modeling | [Honcho](https://honcho.dev/) | `HONCHO_API_KEY` |
+
+### OpenRouter Provider Routing
+
+When using OpenRouter, you can control how requests are routed across providers. Add a `provider_routing` section to `~/.hermes/config.yaml`:
+
+```yaml
+provider_routing:
+  sort: "throughput"          # "price" (default), "throughput", or "latency"
+  # only: ["anthropic"]      # Only use these providers
+  # ignore: ["deepinfra"]    # Skip these providers
+  # order: ["anthropic", "google"]  # Try providers in this order
+  # require_parameters: true  # Only use providers that support all request params
+  # data_collection: "deny"   # Exclude providers that may store/train on data
+```
+
+**Shortcuts:** Append `:nitro` to any model name for throughput sorting (e.g., `anthropic/claude-sonnet-4:nitro`), or `:floor` for price sorting.
+
+See [OpenRouter provider routing docs](https://openrouter.ai/docs/guides/routing/provider-selection) for all available options including quantization filtering, performance thresholds, and zero data retention.
 
 ---
 
@@ -250,22 +271,30 @@ SLACK_ALLOWED_USERS=U01234ABCDE    # Comma-separated Slack user IDs
 
 ### WhatsApp Setup
 
-WhatsApp doesn't have a simple bot API like Telegram or Discord. Hermes includes a built-in bridge using [Baileys](https://github.com/WhiskeySockets/Baileys) that connects via WhatsApp Web. The agent links to your WhatsApp account and responds to incoming messages.
+WhatsApp doesn't have a simple bot API like Telegram or Discord. Hermes includes a built-in bridge using [Baileys](https://github.com/WhiskeySockets/Baileys) that connects via WhatsApp Web.
 
-1. **Run the setup command:**
+**Two modes are supported:**
+
+| Mode | How it works | Best for |
+|------|-------------|----------|
+| **Separate bot number** (recommended) | Dedicate a phone number to the bot. People message that number directly. | Clean UX, multiple users |
+| **Personal self-chat** | Use your own WhatsApp. You message yourself to talk to the agent. | Quick setup, single user |
+
+**Setup:**
 
 ```bash
 hermes whatsapp
 ```
 
-This will:
-- Enable WhatsApp in your config
-- Ask for your phone number (for the allowlist)
-- Install bridge dependencies (Node.js required)
-- Display a QR code — scan it with your phone (WhatsApp → Settings → Linked Devices → Link a Device)
-- Exit automatically once paired
+The wizard will:
+1. Ask which mode you want
+2. For **bot mode**: guide you through getting a second number (WhatsApp Business app on a dual-SIM, Google Voice, or cheap prepaid SIM)
+3. Configure the allowlist
+4. Install bridge dependencies (Node.js required)
+5. Display a QR code — scan from WhatsApp (or WhatsApp Business) → Settings → Linked Devices → Link a Device
+6. Exit once paired
 
-2. **Start the gateway:**
+**Start the gateway:**
 
 ```bash
 hermes gateway            # Foreground
@@ -274,7 +303,7 @@ hermes gateway install    # Or install as a system service (Linux)
 
 The gateway starts the WhatsApp bridge automatically using the saved session.
 
-> **Note:** WhatsApp Web sessions can disconnect if WhatsApp updates their protocol. The gateway reconnects automatically. If you see persistent failures, re-pair with `hermes whatsapp`. Agent responses are prefixed with "⚕ Hermes Agent" so you can distinguish them from your own messages in self-chat.
+> **Note:** WhatsApp Web sessions can disconnect if WhatsApp updates their protocol. The gateway reconnects automatically. If you see persistent failures, re-pair with `hermes whatsapp`. Agent responses are prefixed with "⚕ Hermes Agent" for easy identification.
 
 See [docs/messaging.md](docs/messaging.md) for advanced WhatsApp configuration.
 
@@ -290,6 +319,8 @@ See [docs/messaging.md](docs/messaging.md) for advanced WhatsApp configuration.
 | `/status` | Show session info |
 | `/stop` | Stop the running agent |
 | `/sethome` | Set this chat as the home channel |
+| `/compress` | Manually compress conversation context |
+| `/usage` | Show token usage for this session |
 | `/help` | Show available commands |
 | `/<skill-name>` | Invoke any installed skill (e.g., `/axolotl`, `/gif-search`) |
 
@@ -368,7 +399,7 @@ hermes --resume <id>      # Resume a specific session (-r)
 
 # Provider & model management
 hermes model              # Switch provider and model interactively
-hermes login              # Authenticate with Nous Portal (OAuth)
+hermes model              # Select provider and model
 hermes logout             # Clear stored OAuth credentials
 
 # Configuration
@@ -421,6 +452,9 @@ Type `/` to see an autocomplete dropdown of all commands.
 | `/cron` | Manage scheduled tasks |
 | `/skills` | Search, install, inspect, or manage skills from registries |
 | `/platforms` | Show gateway/messaging platform status |
+| `/verbose` | Cycle tool progress display: off → new → all → verbose |
+| `/compress` | Manually compress conversation context |
+| `/usage` | Show token usage for this session |
 | `/quit` | Exit (also: `/exit`, `/q`) |
 | `/<skill-name>` | Invoke any installed skill (e.g., `/axolotl`, `/gif-search`) |
 
@@ -461,6 +495,23 @@ hermes tools
 ```
 
 **Available toolsets:** `web`, `terminal`, `file`, `browser`, `vision`, `image_gen`, `moa`, `skills`, `tts`, `todo`, `memory`, `session_search`, `cronjob`, `code_execution`, `delegation`, `clarify`, and more.
+
+### 🔌 MCP (Model Context Protocol)
+
+Connect to any MCP-compatible server to extend Hermes with external tools. Just add servers to your config:
+
+```yaml
+mcp_servers:
+  time:
+    command: uvx
+    args: ["mcp-server-time"]
+  notion:
+    url: https://mcp.notion.com/mcp
+```
+
+Supports stdio and HTTP transports, auto-reconnection, and env var filtering. See [docs/mcp.md](docs/mcp.md) for details.
+
+Install MCP support: `pip install hermes-agent[mcp]`
 
 ### 🖥️ Terminal & Process Management
 
@@ -687,12 +738,24 @@ sessions/
 Schedule tasks to run automatically:
 
 ```bash
-# In the CLI (/cron slash commands)
+# In Hermes messaging text commands
 /cron add 30m "Remind me to check the build"
 /cron add "every 2h" "Check server status"
+/cron add every 2h "Check server status"
 /cron add "0 9 * * *" "Morning briefing"
 /cron list
 /cron remove <job_id>
+# Run one job immediately
+/cron run <job_id>
+```
+
+For Discord, these are registered slash commands as a `/cron` group:
+
+```bash
+/cron add <schedule> <prompt>
+/cron list
+/cron remove <job_id>
+/cron run <job_id>
 ```
 
 The agent can also self-schedule using the `schedule_cronjob` tool from any platform (CLI, Telegram, Discord, etc.).
@@ -743,7 +806,7 @@ Hermes includes multiple layers of security beyond sandboxed terminals and exec 
 | **Write deny list with symlink resolution** | Protected paths (`~/.ssh/authorized_keys`, `/etc/shadow`, etc.) are resolved via `os.path.realpath()` before comparison, preventing symlink bypass |
 | **Recursive delete false-positive fix** | Dangerous command detection uses precise flag-matching to avoid blocking safe commands |
 | **Code execution sandbox** | `execute_code` scripts run in a child process with API keys and credentials stripped from the environment |
-| **Container hardening** | Docker containers run with read-only root, all capabilities dropped, no privilege escalation, PID limits |
+| **Container hardening** | Docker containers run with all capabilities dropped, no privilege escalation, PID limits, size-limited tmpfs |
 | **DM pairing** | Cryptographically random pairing codes with 1-hour expiry and rate limiting |
 | **User allowlists** | Default deny-all for messaging platforms; explicit allowlists or DM pairing required |
 
@@ -1011,7 +1074,7 @@ delegate_task(tasks=[
 Configure via `~/.hermes/config.yaml`:
 ```yaml
 delegation:
-  max_iterations: 25                        # Max turns per child (default: 25)
+  max_iterations: 50                        # Max turns per child (default: 50)
   default_toolsets: ["terminal", "file", "web"]  # Default toolsets
 ```
 
@@ -1313,8 +1376,12 @@ Your `~/.hermes/` directory should now look like:
 ├── skills/         # Agent-created skills (auto-created on first use)
 ├── cron/           # Scheduled job data
 ├── sessions/       # Messaging gateway sessions
-└── logs/           # Conversation logs
+└── logs/           # Logs
+    ├── gateway.log     # Gateway activity log
+    └── errors.log      # Errors from tool calls, API failures, etc.
 ```
+
+All log output is automatically redacted -- API keys, tokens, and credentials are masked before they reach disk.
 
 ---
 
@@ -1606,6 +1673,7 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 | `SLACK_ALLOWED_USERS` | Comma-separated Slack user IDs |
 | `SLACK_HOME_CHANNEL` | Default Slack channel for cron delivery |
 | `WHATSAPP_ENABLED` | Enable WhatsApp bridge (`true`/`false`) |
+| `WHATSAPP_MODE` | `bot` (separate number, recommended) or `self-chat` (message yourself) |
 | `WHATSAPP_ALLOWED_USERS` | Comma-separated phone numbers (with country code) |
 | `MESSAGING_CWD` | Working directory for terminal in messaging (default: ~) |
 | `GATEWAY_ALLOW_ALL_USERS` | Allow all users without allowlist (`true`/`false`, default: `false`) |
@@ -1627,12 +1695,24 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 | `HERMES_TOOL_PROGRESS` | Send progress messages when using tools (`true`/`false`) |
 | `HERMES_TOOL_PROGRESS_MODE` | `all` (every call, default) or `new` (only when tool changes) |
 
+**Provider Routing (config.yaml only — `provider_routing` section):**
+| Key | Description |
+|-----|-------------|
+| `sort` | Sort providers: `"price"` (default), `"throughput"`, or `"latency"` |
+| `only` | List of provider slugs to allow (e.g., `["anthropic", "google"]`) |
+| `ignore` | List of provider slugs to skip (e.g., `["deepinfra"]`) |
+| `order` | List of provider slugs to try in order |
+| `require_parameters` | Only use providers supporting all request params (`true`/`false`) |
+| `data_collection` | `"allow"` (default) or `"deny"` to exclude data-storing providers |
+
 **Context Compression:**
 | Variable | Description |
 |----------|-------------|
 | `CONTEXT_COMPRESSION_ENABLED` | Enable auto-compression (default: true) |
 | `CONTEXT_COMPRESSION_THRESHOLD` | Trigger at this % of limit (default: 0.85) |
+| `CONTEXT_COMPRESSION_PROVIDER` | Summary backend provider: `auto`, `openrouter`, `nous`, `custom`, `openai-codex` |
 | `CONTEXT_COMPRESSION_MODEL` | Model for summaries |
+| `CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS` | Approx summary target size in tokens (default: 2048) |
 
 ---
 
@@ -1642,7 +1722,9 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 |------|-------------|
 | `~/.hermes/config.yaml` | Your settings |
 | `~/.hermes/.env` | API keys and secrets |
-| `~/.hermes/auth.json` | OAuth provider credentials (managed by `hermes login`) |
+| `~/.hermes/auth.json` | OAuth provider credentials (managed by `hermes model`) |
+| `~/.hermes/logs/errors.log` | Tool errors, API failures (secrets auto-redacted) |
+| `~/.hermes/logs/gateway.log` | Gateway activity log (secrets auto-redacted) |
 | `~/.hermes/cron/` | Scheduled jobs data |
 | `~/.hermes/sessions/` | Gateway session data |
 | `~/.hermes/hermes-agent/` | Installation directory |
@@ -1670,7 +1752,7 @@ hermes config    # View current settings
 Common issues:
 - **"API key not set"**: Run `hermes setup` or `hermes config set OPENROUTER_API_KEY your_key`
 - **"hermes: command not found"**: Reload your shell (`source ~/.bashrc`) or check PATH
-- **"Run `hermes login` to re-authenticate"**: Your Nous Portal session expired. Run `hermes login` to refresh.
+- **"Run `hermes setup` to re-authenticate"**: Your Nous Portal session expired. Run `hermes setup` or `hermes model` to refresh.
 - **"No active paid subscription"**: Your Nous Portal account needs an active subscription for inference.
 - **Gateway won't start**: Check `hermes gateway status` and logs
 - **Missing config after update**: Run `hermes config check` to see what's new, then `hermes config migrate` to add missing options
@@ -1690,3 +1772,4 @@ Common issues:
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+

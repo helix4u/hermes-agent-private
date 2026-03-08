@@ -10,9 +10,11 @@ runs at a time if multiple processes overlap.
 
 import asyncio
 import logging
+import multiprocessing
 import os
 import sys
 import traceback
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output
+from agent.env_loader import load_dotenv_with_fallback
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
@@ -40,6 +43,126 @@ _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+_DEFAULT_MODEL = "google/gemini-2.0-flash-001:free"
+_DEFAULT_CRON_JOB_TIMEOUT_SECONDS = 1800
+
+
+def _resolve_cron_job_timeout_seconds() -> int:
+    """
+    Resolve per-job timeout used by the scheduler tick.
+
+    Set HERMES_CRON_JOB_TIMEOUT_SECONDS=0 to disable timeout enforcement.
+    """
+    raw = os.getenv("HERMES_CRON_JOB_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_CRON_JOB_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid HERMES_CRON_JOB_TIMEOUT_SECONDS='%s'; using default=%ss",
+            raw,
+            _DEFAULT_CRON_JOB_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_CRON_JOB_TIMEOUT_SECONDS
+    return max(0, value)
+
+
+def _build_job_failure_output(job: dict, error_msg: str, tb: Optional[str] = None) -> str:
+    """Build a markdown failure document consistent with run_job() output."""
+    trace_block = tb or "No traceback available."
+    return f"""# Cron Job: {job.get("name", job.get("id", "unknown"))} (FAILED)
+
+**Job ID:** {job.get("id", "unknown")}
+**Run Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+{job.get("prompt", "")}
+
+## Error
+
+```
+{error_msg}
+
+{trace_block}
+```
+"""
+
+
+def _run_job_worker(job: dict, conn) -> None:
+    """
+    Execute run_job() in a child process and send the result through a pipe.
+
+    Keeping job execution out-of-process lets the scheduler forcibly terminate
+    stuck jobs and release the tick lock.
+    """
+    try:
+        payload = run_job(job)
+    except BaseException as exc:  # pragma: no cover - defensive guard
+        payload = (
+            False,
+            _build_job_failure_output(job, f"{type(exc).__name__}: {exc}", traceback.format_exc()),
+            "",
+            f"{type(exc).__name__}: {exc}",
+        )
+    try:
+        conn.send(payload)
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _run_job_with_timeout(job: dict, timeout_seconds: int) -> tuple[bool, str, str, Optional[str]]:
+    """
+    Run a cron job with timeout protection.
+
+    If timeout_seconds <= 0, runs inline without timeout.
+    """
+    if timeout_seconds <= 0:
+        return run_job(job)
+
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_run_job_worker,
+        args=(job, child_conn),
+        daemon=True,
+        name=f"cron-job-{job.get('id', 'unknown')}",
+    )
+
+    proc.start()
+    child_conn.close()
+    try:
+        if parent_conn.poll(timeout_seconds):
+            result = parent_conn.recv()
+            proc.join(timeout=5)
+            return result
+
+        timeout_msg = (
+            f"TimeoutError: Cron job exceeded {timeout_seconds}s "
+            f"(job_id={job.get('id', 'unknown')})"
+        )
+        logger.error(timeout_msg)
+        proc.terminate()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            proc.join(timeout=2)
+        return False, _build_job_failure_output(job, timeout_msg), "", timeout_msg
+    finally:
+        try:
+            parent_conn.close()
+        except Exception:
+            pass
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -52,6 +175,34 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     if platform and chat_id:
         return origin
     return None
+
+
+def _resolve_cron_model(provider: Optional[str]) -> str:
+    """Resolve cron runtime model after provider selection."""
+    from hermes_cli.runtime_provider import normalize_model_for_runtime
+
+    model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL")
+    if model:
+        return normalize_model_for_runtime(model.strip(), provider, default_model=_DEFAULT_MODEL)
+
+    try:
+        import yaml
+
+        cfg_path = _hermes_home / "config.yaml"
+        if cfg_path.exists():
+            with open(cfg_path, encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            model_cfg = cfg.get("model", {})
+            if isinstance(model_cfg, str) and model_cfg.strip():
+                return normalize_model_for_runtime(model_cfg.strip(), provider, default_model=_DEFAULT_MODEL)
+            if isinstance(model_cfg, dict):
+                default_model = str(model_cfg.get("default") or "").strip()
+                if default_model:
+                    return normalize_model_for_runtime(default_model, provider, default_model=_DEFAULT_MODEL)
+    except Exception:
+        pass
+
+    return normalize_model_for_runtime(_DEFAULT_MODEL, provider, default_model=_DEFAULT_MODEL)
 
 
 def _deliver_result(job: dict, content: str) -> None:
@@ -139,7 +290,7 @@ def _deliver_result(job: dict, content: str) -> None:
             pass
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+def run_job(job: dict, tool_progress_callback=None) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
     
@@ -166,27 +317,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     try:
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart.
-        from dotenv import load_dotenv
-        try:
-            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="utf-8")
-        except UnicodeDecodeError:
-            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
-
-        model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
-
-        try:
-            import yaml
-            _cfg_path = str(_hermes_home / "config.yaml")
-            if os.path.exists(_cfg_path):
-                with open(_cfg_path, encoding="utf-8") as _f:
-                    _cfg = yaml.safe_load(_f) or {}
-                _model_cfg = _cfg.get("model", {})
-                if isinstance(_model_cfg, str):
-                    model = _model_cfg
-                elif isinstance(_model_cfg, dict):
-                    model = _model_cfg.get("default", model)
-        except Exception:
-            pass
+        load_dotenv_with_fallback(_hermes_home / ".env", override=True, logger=logger)
 
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
@@ -200,6 +331,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
+        model = _resolve_cron_model(runtime.get("provider"))
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -207,6 +340,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             provider=runtime.get("provider"),
             api_mode=runtime.get("api_mode"),
             quiet_mode=True,
+            tool_progress_callback=tool_progress_callback,
             session_id=f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
         
@@ -280,6 +414,7 @@ def tick(verbose: bool = True) -> int:
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
+    lock_fd = None
     try:
         lock_fd = open(_LOCK_FILE, "w", encoding="utf-8")
         if fcntl:
@@ -288,10 +423,13 @@ def tick(verbose: bool = True) -> int:
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
     except (OSError, IOError):
         logger.debug("Tick skipped — another instance holds the lock")
+        if lock_fd is not None:
+            lock_fd.close()
         return 0
 
     try:
         due_jobs = get_due_jobs()
+        job_timeout_seconds = _resolve_cron_job_timeout_seconds()
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", datetime.now().strftime('%H:%M:%S'))
@@ -303,7 +441,21 @@ def tick(verbose: bool = True) -> int:
         executed = 0
         for job in due_jobs:
             try:
-                success, output, final_response, error = run_job(job)
+                job_name = job.get("name", job["id"])
+                started_at_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _deliver_result(
+                    job,
+                    (
+                        f"⏳ Cron job starting\n"
+                        f"Name: {job_name}\n"
+                        f"ID: {job['id']}\n"
+                        f"Started: {started_at_human}"
+                    ),
+                )
+
+                started_at = time.monotonic()
+                success, output, final_response, error = _run_job_with_timeout(job, job_timeout_seconds)
+                elapsed_s = int(max(0, time.monotonic() - started_at))
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
@@ -316,6 +468,25 @@ def tick(verbose: bool = True) -> int:
                         _deliver_result(job, deliver_content)
                     except Exception as de:
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+                status_msg = (
+                    f"✅ Cron job completed\n"
+                    f"Name: {job_name}\n"
+                    f"ID: {job['id']}\n"
+                    f"Duration: {elapsed_s}s\n"
+                    f"Output: {output_file}"
+                ) if success else (
+                    f"❌ Cron job failed\n"
+                    f"Name: {job_name}\n"
+                    f"ID: {job['id']}\n"
+                    f"Duration: {elapsed_s}s\n"
+                    f"Error: {error}\n"
+                    f"Output: {output_file}"
+                )
+                try:
+                    _deliver_result(job, status_msg)
+                except Exception as de:
+                    logger.error("Status delivery failed for job %s: %s", job["id"], de)
 
                 mark_job_run(job["id"], success, error)
                 executed += 1

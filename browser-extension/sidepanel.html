@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hermes Sidecar</title>
+    <link rel="stylesheet" href="sidepanel.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <div class="hero-top">
+          <div>
+            <p class="eyebrow">Hermes Agent</p>
+            <h1>Hermes Sidecar</h1>
+          </div>
+          <button id="open-options-button" class="ghost-button" type="button">Options</button>
+        </div>
+        <p class="subhead">Chat beside the page you are on, and pull that page into the turn when it matters.</p>
+      </header>
+
+      <section class="card chat-card">
+        <div class="section-head">
+          <div>
+            <h2>Conversation</h2>
+            <p class="section-copy">This sidecar keeps its own Hermes session history.</p>
+            <div class="session-picker">
+              <label for="session-history-select">Session history</label>
+              <select id="session-history-select" class="session-history-select">
+                <option value="">Loading sessions...</option>
+              </select>
+              <button id="refresh-sessions-button" class="ghost-button small-button" type="button">Refresh</button>
+            </div>
+          </div>
+          <button id="reset-chat-button" class="ghost-button" type="button">New chat</button>
+        </div>
+        <div id="chat-messages" class="chat-messages">
+          <div class="empty-state">Loading Hermes sidecar history...</div>
+        </div>
+        <p id="status-text" class="status-inline">Waiting for input.</p>
+        <div class="domain-access-row">
+          <p id="domain-permission-status" class="domain-permission-status">Domain access: checking...</p>
+          <button id="domain-permission-button" class="ghost-button small-button" type="button">Allow domain</button>
+        </div>
+        <div class="composer">
+          <textarea
+            id="chat-input"
+            class="chat-input"
+            rows="4"
+            placeholder="Ask Hermes something, or leave this empty and just use the current page..."
+          ></textarea>
+          <label class="checkbox-row compact-row">
+            <input id="share-page" type="checkbox">
+            <span>Use the current page in this turn</span>
+          </label>
+          <label class="checkbox-row compact-row">
+            <input id="include-transcript" type="checkbox">
+            <span id="include-transcript-label">Include the YouTube transcript the first time this video is shared</span>
+          </label>
+          <div class="composer-actions">
+            <button id="send-button" class="primary-button" type="button">Send</button>
+          </div>
+        </div>
+      </section>
+
+      <details id="page-panel" class="card utility-panel">
+        <summary class="details-summary">
+          <div>
+            <h2>Current page</h2>
+            <p class="section-copy">Follows the active tab and refreshes automatically.</p>
+          </div>
+        </summary>
+        <div class="details-body">
+          <div class="section-head compact-head">
+            <div class="summary-chips">
+              <span id="content-kind" class="summary-chip">-</span>
+              <span id="selection-length" class="summary-chip">0 chars selected</span>
+              <span id="page-text-length" class="summary-chip">0 chars page text</span>
+              <span id="transcript-status" class="summary-chip">Checking transcript...</span>
+            </div>
+            <button id="refresh-button" class="ghost-button" type="button">Refresh now</button>
+          </div>
+          <p id="page-title" class="page-title">Loading page context...</p>
+          <p id="page-url" class="page-url"></p>
+        </div>
+      </details>
+
+    </main>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

@@ -17,13 +17,20 @@ import asyncio
 import logging
 import os
 import re
+import shlex
+import shutil
+import socket
 import sys
 import signal
+import tempfile
 import threading
+import time
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Callable
+from urllib.request import urlopen
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -95,7 +102,10 @@ if _config_path.exists():
             _compression_env_map = {
                 "enabled": "CONTEXT_COMPRESSION_ENABLED",
                 "threshold": "CONTEXT_COMPRESSION_THRESHOLD",
+                "summary_provider": "CONTEXT_COMPRESSION_PROVIDER",
                 "summary_model": "CONTEXT_COMPRESSION_MODEL",
+                "protect_last_n": "CONTEXT_COMPRESSION_PROTECT_LAST_N",
+                "summary_target_tokens": "CONTEXT_COMPRESSION_SUMMARY_TARGET_TOKENS",
             }
             for _cfg_key, _env_var in _compression_env_map.items():
                 if _cfg_key in _compression_cfg:
@@ -136,9 +146,18 @@ from gateway.session import (
     SessionContext,
     build_session_context,
     build_session_context_prompt,
+    build_session_key,
 )
 from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.browser_bridge import (
+    BrowserBridgeServer,
+    build_bridge_chat_id,
+    build_browser_chat_message,
+    build_browser_context_message,
+    get_bridge_session_key,
+    normalize_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +176,7 @@ def _resolve_gateway_model() -> str:
         return model.strip()
     try:
         import yaml as _yaml
-        cfg_path = Path.home() / ".hermes" / "config.yaml"
+        cfg_path = _hermes_home / "config.yaml"
         if cfg_path.exists():
             with open(cfg_path, encoding="utf-8") as _f:
                 cfg = _yaml.safe_load(_f) or {}
@@ -171,6 +190,13 @@ def _resolve_gateway_model() -> str:
     except Exception:
         pass
     return _DEFAULT_MODEL
+
+
+def _resolve_gateway_runtime_model(provider: Optional[str]) -> str:
+    """Resolve the gateway model after runtime provider selection."""
+    from hermes_cli.runtime_provider import normalize_model_for_runtime
+
+    return normalize_model_for_runtime(_resolve_gateway_model(), provider)
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -195,6 +221,240 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
+def _load_user_config() -> dict:
+    """Load ~/.hermes/config.yaml as a dictionary."""
+    import yaml
+
+    config_path = _hermes_home / "config.yaml"
+    if not config_path.exists():
+        return {}
+    with open(config_path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _save_user_config(config: dict) -> None:
+    """Persist ~/.hermes/config.yaml."""
+    import yaml
+
+    config_path = _hermes_home / "config.yaml"
+    with open(config_path, "w", encoding="utf-8", newline="") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+
+def _get_image_generation_defaults() -> Optional[dict]:
+    """Return persisted image-generation defaults, if any."""
+    try:
+        config = _load_user_config()
+    except Exception:
+        return None
+    image_cfg = config.get("image_generation", {})
+    if not isinstance(image_cfg, dict):
+        return None
+    defaults = image_cfg.get("defaults", {})
+    if not isinstance(defaults, dict):
+        return None
+    model = str(defaults.get("model") or "").strip()
+    if not model:
+        return None
+    raw_aspect_ratio = defaults.get("aspect_ratio")
+    sexagesimal_map = {
+        61: "1:1",
+        243: "4:3",
+        184: "3:4",
+        556: "9:16",
+        969: "16:9",
+    }
+    if isinstance(raw_aspect_ratio, int):
+        defaults["aspect_ratio"] = sexagesimal_map.get(raw_aspect_ratio, str(raw_aspect_ratio))
+    elif raw_aspect_ratio is not None:
+        defaults["aspect_ratio"] = str(raw_aspect_ratio).strip()
+    return defaults
+
+
+def _save_image_generation_defaults(
+    *,
+    model: str,
+    aspect_ratio: str,
+    width: int,
+    height: int,
+) -> None:
+    """Persist image-generation defaults into config.yaml."""
+    config = _load_user_config()
+    image_cfg = config.setdefault("image_generation", {})
+    if not isinstance(image_cfg, dict):
+        image_cfg = {}
+        config["image_generation"] = image_cfg
+    defaults = image_cfg.setdefault("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+        image_cfg["defaults"] = defaults
+
+    defaults.update({
+        "provider": "invokeai-local-api",
+        "model": model,
+        "aspect_ratio": aspect_ratio,
+        "width": int(width),
+        "height": int(height),
+    })
+    _save_user_config(config)
+
+
+def _format_image_defaults(defaults: dict) -> str:
+    """Human-readable summary of saved image defaults."""
+    model = defaults.get("model", "")
+    aspect_ratio = defaults.get("aspect_ratio", "1:1")
+    width = defaults.get("width")
+    height = defaults.get("height")
+    lines = [
+        "🖼️ **Current image defaults**",
+        f"- Model: `{model}`",
+        f"- Aspect ratio: `{aspect_ratio}`",
+    ]
+    if width and height:
+        lines.append(f"- Resolution: `{width}x{height}`")
+    return "\n".join(lines)
+
+
+def _get_wiki_source_root() -> Path:
+    """Return the on-disk source root that contains wiki content."""
+    return _hermes_home / "workspace" / "data"
+
+
+def _get_wiki_web_root_base() -> Path:
+    """Return the parent directory used for generated LAN wiki roots."""
+    return _get_wiki_source_root() / "wiki_serve"
+
+
+def _link_or_copy_path(source: Path, dest: Path) -> None:
+    """Create a symlink when possible, otherwise copy the source into place."""
+    try:
+        os.symlink(source, dest, target_is_directory=source.is_dir())
+        return
+    except OSError:
+        pass
+
+    if source.is_dir():
+        shutil.copytree(source, dest)
+    else:
+        shutil.copy2(source, dest)
+
+
+def _build_wiki_web_root() -> Path:
+    """Create an isolated web root that exposes only the wiki landing page and wiki tree."""
+    source_root = _get_wiki_source_root()
+    landing_page = source_root / "knowledge_wiki.html"
+    wiki_root = source_root / "wiki"
+    if not landing_page.exists():
+        raise FileNotFoundError(f"Wiki landing page not found: {landing_page}")
+    if not wiki_root.exists():
+        raise FileNotFoundError(f"Wiki content directory not found: {wiki_root}")
+
+    web_root_base = _get_wiki_web_root_base()
+    web_root_base.mkdir(parents=True, exist_ok=True)
+    web_root = Path(tempfile.mkdtemp(prefix="lan_wiki_", dir=web_root_base))
+
+    _link_or_copy_path(landing_page, web_root / "knowledge_wiki.html")
+    _link_or_copy_path(landing_page, web_root / "index.html")
+    _link_or_copy_path(wiki_root, web_root / "wiki")
+    return web_root
+
+
+def _cleanup_wiki_web_root(web_root: Optional[Path]) -> None:
+    """Remove a generated LAN wiki root without touching the source wiki content."""
+    if not web_root:
+        return
+    try:
+        shutil.rmtree(web_root, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _get_wiki_host_config() -> dict:
+    """Load persisted wiki-hosting configuration."""
+    try:
+        config = _load_user_config()
+    except Exception:
+        return {}
+    wiki_cfg = config.get("wiki_hosting", {})
+    return wiki_cfg if isinstance(wiki_cfg, dict) else {}
+
+
+def _save_wiki_host_config(*, enabled: bool, port: Optional[int]) -> None:
+    """Persist wiki-hosting configuration to config.yaml."""
+    config = _load_user_config()
+    wiki_cfg = config.setdefault("wiki_hosting", {})
+    if not isinstance(wiki_cfg, dict):
+        wiki_cfg = {}
+        config["wiki_hosting"] = wiki_cfg
+    wiki_cfg["enabled"] = bool(enabled)
+    if port is not None:
+        wiki_cfg["port"] = int(port)
+    _save_user_config(config)
+
+
+def _resolve_lan_ip() -> str:
+    """Best-effort LAN IPv4 for URLs shown to the user."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    candidates: list[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
+            candidate = info[4][0]
+            if candidate and not candidate.startswith("127.") and candidate not in candidates:
+                candidates.append(candidate)
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate.startswith("192.168.1."):
+            return candidate
+    for candidate in candidates:
+        if candidate.startswith(("192.168.", "10.", "172.")):
+            return candidate
+    return "127.0.0.1"
+
+
+class _QuietWikiRequestHandler(SimpleHTTPRequestHandler):
+    """Simple static-file handler with quieter logging."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path in {"/wiki/knowledge_wiki.html", "/wiki/"}:
+            self.send_response(302)
+            self.send_header("Location", "/knowledge_wiki.html")
+            self.end_headers()
+            return
+        super().do_GET()
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        logger.debug("wiki-host: " + format, *args)
+
+
+class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """HTTP server that requests exclusive port ownership when available."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -212,6 +472,7 @@ class GatewayRunner:
         self._prefill_messages = self._load_prefill_messages()
         self._ephemeral_system_prompt = self._load_ephemeral_system_prompt()
         self._reasoning_config = self._load_reasoning_config()
+        self._provider_routing = self._load_provider_routing()
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -232,6 +493,13 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str}
         self._pending_approvals: Dict[str, Dict[str, str]] = {}
+        self._wiki_server: ThreadingHTTPServer | None = None
+        self._wiki_server_thread: threading.Thread | None = None
+        self._wiki_host_port: int | None = None
+        self._wiki_web_root: Path | None = None
+        self._browser_bridge: BrowserBridgeServer | None = None
+        self._browser_bridge_tasks: Dict[str, asyncio.Task] = {}
+        self._browser_bridge_progress: Dict[str, Dict[str, Any]] = {}
         
         # Initialize session database for session_search tool support
         self._session_db = None
@@ -248,6 +516,176 @@ class GatewayRunner:
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
+
+    def _set_browser_bridge_progress(
+        self,
+        session_key: str,
+        *,
+        running: Optional[bool] = None,
+        phase: Optional[str] = None,
+        detail: Optional[str] = None,
+        tool_calls: Optional[int] = None,
+        updates: Optional[int] = None,
+        recent_events: Optional[List[str]] = None,
+        started_at: Optional[float] = None,
+        completed_at: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Store a browser-session progress snapshot for sidebar polling."""
+        if not session_key:
+            return
+        state = self._browser_bridge_progress.get(session_key, {}).copy()
+        if running is not None:
+            state["running"] = bool(running)
+        if phase is not None:
+            state["phase"] = phase
+        if detail is not None:
+            state["detail"] = detail
+        if tool_calls is not None:
+            state["tool_calls"] = int(tool_calls)
+        if updates is not None:
+            state["updates"] = int(updates)
+        if recent_events is not None:
+            state["recent_events"] = list(recent_events)
+        if started_at is not None:
+            state["started_at"] = started_at
+        if completed_at is not None:
+            state["completed_at"] = completed_at
+        if error is not None:
+            state["error"] = error
+        self._browser_bridge_progress[session_key] = state
+
+    def _get_browser_bridge_progress_snapshot(self, session_key: str) -> Dict[str, Any]:
+        """Return sidebar-friendly progress state for a browser session."""
+        state = dict(self._browser_bridge_progress.get(session_key, {}))
+        if not state:
+            return {
+                "running": False,
+                "phase": "idle",
+                "detail": "",
+                "tool_calls": 0,
+                "updates": 0,
+                "recent_events": [],
+                "elapsed_seconds": 0,
+                "error": "",
+            }
+
+        # Self-heal stale "running" progress if no async task is actually active.
+        # This prevents sidecar sessions from getting stuck in a busy state after
+        # failures/restarts/cancellations where progress may outlive task handles.
+        task = self._browser_bridge_tasks.get(session_key)
+        if task and task.done():
+            self._browser_bridge_tasks.pop(session_key, None)
+            task = None
+        if bool(state.get("running")) and task is None:
+            state["running"] = False
+            state["phase"] = state.get("phase") or "done"
+            if not state.get("detail"):
+                state["detail"] = "Reply ready."
+            state["completed_at"] = state.get("completed_at") or datetime.now().isoformat()
+            self._browser_bridge_progress[session_key] = state
+
+        started_at = state.get("started_at")
+        elapsed_seconds = 0
+        if isinstance(started_at, (int, float)):
+            elapsed_seconds = int(max(0, time.monotonic() - started_at))
+
+        return {
+            "running": bool(state.get("running")),
+            "phase": state.get("phase") or "idle",
+            "detail": state.get("detail") or "",
+            "tool_calls": int(state.get("tool_calls") or 0),
+            "updates": int(state.get("updates") or 0),
+            "recent_events": list(state.get("recent_events") or []),
+            "elapsed_seconds": elapsed_seconds,
+            "completed_at": state.get("completed_at") or "",
+            "error": state.get("error") or "",
+        }
+
+    def _wiki_host_status_message(self) -> str:
+        """Human-readable current wiki hosting state."""
+        if not self._wiki_server or not self._wiki_host_port:
+            return (
+                "📚 Wiki hosting is currently disabled.\n\n"
+                "Use `/wiki-host enable <port>` to expose the local wiki on your LAN."
+            )
+
+        lan_ip = _resolve_lan_ip()
+        url = f"http://{lan_ip}:{self._wiki_host_port}/knowledge_wiki.html"
+        web_root = self._wiki_web_root or _get_wiki_web_root_base()
+        return (
+            "📚 Wiki hosting is enabled.\n"
+            f"- Root: `{web_root}`\n"
+            f"- Port: `{self._wiki_host_port}`\n"
+            f"- URL: {url}"
+        )
+
+    def _start_wiki_host(self, port: int) -> str:
+        """Start or restart the local LAN wiki host."""
+        if self._wiki_server and self._wiki_host_port == port:
+            return self._wiki_host_status_message()
+
+        self._stop_wiki_host()
+        web_root = _build_wiki_web_root()
+
+        handler = lambda *args, **kwargs: _QuietWikiRequestHandler(  # noqa: E731
+            *args,
+            directory=str(web_root),
+            **kwargs,
+        )
+        server = _ExclusiveThreadingHTTPServer(("0.0.0.0", int(port)), handler)
+        server.daemon_threads = True
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name=f"wiki-host-{port}",
+            daemon=True,
+        )
+        thread.start()
+
+        self._wiki_server = server
+        self._wiki_server_thread = thread
+        self._wiki_host_port = int(port)
+        self._wiki_web_root = web_root
+        probe_url = f"http://127.0.0.1:{port}/knowledge_wiki.html"
+        deadline = time.time() + 3
+        last_error: Exception | None = None
+        while time.time() < deadline:
+            try:
+                with urlopen(probe_url, timeout=1) as resp:
+                    if getattr(resp, "status", 200) == 200:
+                        last_error = None
+                        break
+            except Exception as e:
+                last_error = e
+                time.sleep(0.1)
+        if last_error is not None:
+            self._stop_wiki_host()
+            raise RuntimeError(f"Wiki host started but self-probe failed for {probe_url}: {last_error}")
+        _save_wiki_host_config(enabled=True, port=port)
+        return self._wiki_host_status_message()
+
+    def _stop_wiki_host(self) -> None:
+        """Stop the local wiki host if it is running."""
+        server = self._wiki_server
+        thread = self._wiki_server_thread
+        web_root = self._wiki_web_root
+        self._wiki_server = None
+        self._wiki_server_thread = None
+        self._wiki_host_port = None
+        self._wiki_web_root = None
+
+        if server:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        if thread and thread.is_alive():
+            thread.join(timeout=2)
+        _cleanup_wiki_web_root(web_root)
     
     def _flush_memories_before_reset(self, old_entry):
         """Prompt the agent to save memories/skills before an auto-reset.
@@ -262,17 +700,12 @@ class GatewayRunner:
                 return
 
             from run_agent import AIAgent
-            _flush_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
-            _flush_base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-            _flush_model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL", "anthropic/claude-opus-4.6")
-
-            if not _flush_api_key:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if not runtime_kwargs.get("api_key"):
                 return
 
             tmp_agent = AIAgent(
-                model=_flush_model,
-                api_key=_flush_api_key,
-                base_url=_flush_base_url,
+                **runtime_kwargs,
                 max_iterations=8,
                 quiet_mode=True,
                 enabled_toolsets=["memory", "skills"],
@@ -399,6 +832,20 @@ class GatewayRunner:
         logger.warning("Unknown reasoning_effort '%s', using default (xhigh)", effort)
         return None
 
+    @staticmethod
+    def _load_provider_routing() -> dict:
+        """Load OpenRouter provider routing preferences from config.yaml."""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path) as _f:
+                    cfg = _y.safe_load(_f) or {}
+                return cfg.get("provider_routing", {}) or {}
+        except Exception:
+            pass
+        return {}
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -406,6 +853,7 @@ class GatewayRunner:
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        logger.info("Python process: executable=%s prefix=%s (venv=%s)", sys.executable, sys.prefix, sys.prefix != getattr(sys, "base_prefix", sys.prefix))
         logger.info("Session storage: %s", self.config.sessions_dir)
         
         # Warn if no user allowlists are configured and open access is not opted in
@@ -491,6 +939,24 @@ class GatewayRunner:
             logger.info("Channel directory built: %d target(s)", ch_count)
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
+
+        wiki_cfg = _get_wiki_host_config()
+        if wiki_cfg.get("enabled"):
+            try:
+                wiki_port = int(wiki_cfg.get("port") or 8008)
+                logger.info("Restoring wiki host on port %s", wiki_port)
+                self._start_wiki_host(wiki_port)
+            except Exception as e:
+                logger.warning("Failed to restore wiki host: %s", e)
+
+        try:
+            self._browser_bridge = BrowserBridgeServer(
+                loop=asyncio.get_running_loop(),
+                handle_payload=self._handle_browser_bridge_request,
+            )
+            self._browser_bridge.start()
+        except Exception as e:
+            logger.warning("Failed to start browser bridge: %s", e)
         
         logger.info("Press Ctrl+C to stop")
         
@@ -500,6 +966,10 @@ class GatewayRunner:
         """Stop the gateway and disconnect all adapters."""
         logger.info("Stopping gateway...")
         self._running = False
+        self._stop_wiki_host()
+        if self._browser_bridge:
+            self._browser_bridge.stop()
+            self._browser_bridge = None
         
         for platform, adapter in self.adapters.items():
             try:
@@ -568,6 +1038,8 @@ class GatewayRunner:
         5. Default: deny
         """
         user_id = source.user_id
+        if source.platform == Platform.LOCAL:
+            return True
         if not user_id:
             return False
 
@@ -674,15 +1146,55 @@ class GatewayRunner:
                         )
             return None
         
-        # PRIORITY: If an agent is already running for this session, interrupt it
-        # immediately. This is before command parsing to minimize latency -- the
-        # user's "stop" message reaches the agent as fast as possible.
-        _quick_key = (
-            f"agent:main:{source.platform.value}:{source.chat_type}:{source.chat_id}"
-            if source.chat_type != "dm"
-            else f"agent:main:{source.platform.value}:dm"
-        )
+        command = event.get_command()
+        command_args = (event.get_command_args() or "").strip()
+        if not command:
+            raw_text = (event.text or "").strip()
+            if raw_text.startswith("/"):
+                command_parts = raw_text.split(maxsplit=1)
+                command = command_parts[0][1:].lower() if command_parts else ""
+                command_args = command_parts[1].strip() if len(command_parts) > 1 else ""
+
+        if command:
+            logger.info("Gateway command detected: /%s from user_id=%s", command, source.user_id)
+        # Emit command:* hook for any recognized slash command
+        _known_commands = {
+            "new", "reset", "help", "status", "stop", "model",
+            "personality", "retry", "undo", "sethome", "set-home",
+            "terminal", "shell", "compress", "usage", "reload-mcp",
+            "cron", "invokeai-defaults", "invokeai_defaults",
+            "wiki-host", "wiki_host"
+        }
+        if command and command in _known_commands:
+            await self.hooks.emit(f"command:{command}", {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "command": command,
+                "args": command_args,
+            })
+
+        # If an agent is already running, allow a small set of local commands
+        # to return immediately without interrupting or entering agent logic.
+        # This keeps status/help/cron lookups "out of band" while preserving
+        # normal message interruption and explicit /stop behavior.
+        _quick_key = build_session_key(source)
         if _quick_key in self._running_agents:
+            if command == "stop":
+                return await self._handle_stop_command(event)
+            if command in {"help", "status", "usage", "cron"}:
+                logger.debug(
+                    "Handling out-of-band command /%s for active session %s",
+                    command,
+                    _quick_key[:20],
+                )
+                if command == "help":
+                    return await self._handle_help_command(event)
+                if command == "status":
+                    return await self._handle_status_command(event)
+                if command == "usage":
+                    return await self._handle_usage_command(event)
+                return await self._handle_cron_command(event)
+
             running_agent = self._running_agents[_quick_key]
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
@@ -691,21 +1203,6 @@ class GatewayRunner:
             else:
                 self._pending_messages[_quick_key] = event.text
             return None
-        
-        # Check for commands
-        command = event.get_command()
-        if command:
-            logger.info("Gateway command detected: /%s from user_id=%s", command, source.user_id)
-        # Emit command:* hook for any recognized slash command
-        _known_commands = {"new", "reset", "help", "status", "stop", "model",
-                          "personality", "retry", "undo", "sethome", "set-home", "terminal", "shell"}
-        if command and command in _known_commands:
-            await self.hooks.emit(f"command:{command}", {
-                "platform": source.platform.value if source.platform else "",
-                "user_id": source.user_id,
-                "command": command,
-                "args": event.get_command_args().strip(),
-            })
 
         if command in ["new", "reset"]:
             return await self._handle_reset_command(event)
@@ -721,6 +1218,12 @@ class GatewayRunner:
         
         if command == "model":
             return await self._handle_model_command(event)
+
+        if command in ["invokeai-defaults", "invokeai_defaults"]:
+            return await self._handle_image_defaults_command(event)
+
+        if command in ["wiki-host", "wiki_host"]:
+            return await self._handle_wiki_host_command(event)
         
         if command == "personality":
             return await self._handle_personality_command(event)
@@ -736,6 +1239,18 @@ class GatewayRunner:
         
         if command in ["sethome", "set-home"]:
             return await self._handle_set_home_command(event)
+
+        if command == "compress":
+            return await self._handle_compress_command(event)
+
+        if command == "usage":
+            return await self._handle_usage_command(event)
+
+        if command == "reload-mcp":
+            return await self._handle_reload_mcp_command(event)
+
+        if command == "cron":
+            return await self._handle_cron_command(event)
         
         # Skill slash commands: /skill-name loads the skill and sends to agent
         if command:
@@ -753,12 +1268,7 @@ class GatewayRunner:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         
         # Check for pending exec approval responses
-        if source.chat_type != "dm":
-            session_key_preview = f"agent:main:{source.platform.value}:{source.chat_type}:{source.chat_id}"
-        elif source.platform and source.platform.value == "whatsapp" and source.chat_id:
-            session_key_preview = f"agent:main:{source.platform.value}:dm:{source.chat_id}"
-        else:
-            session_key_preview = f"agent:main:{source.platform.value}:dm"
+        session_key_preview = build_session_key(source)
         if session_key_preview in self._pending_approvals:
             user_text = event.text.strip().lower()
             if user_text in ("yes", "y", "approve", "ok", "go", "do it"):
@@ -937,7 +1447,24 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key
             )
-            
+            returned_session_id = str(agent_result.get("session_id") or "").strip()
+            if returned_session_id and returned_session_id != session_entry.session_id:
+                if self.session_store.update_session_id(session_entry.session_key, returned_session_id):
+                    logger.info(
+                        "Session handoff: %s -> %s (key=%s)",
+                        session_entry.session_id,
+                        returned_session_id,
+                        session_entry.session_key,
+                    )
+                    session_entry.session_id = returned_session_id
+                    hook_ctx["session_id"] = returned_session_id
+                else:
+                    logger.warning(
+                        "Agent returned new session_id=%s but session mapping update failed for key=%s",
+                        returned_session_id,
+                        session_entry.session_key,
+                    )
+
             response = agent_result.get("final_response", "")
             agent_messages = agent_result.get("messages", [])
             
@@ -986,10 +1513,55 @@ class GatewayRunner:
                         "timestamp": ts,
                     }
                 )
+
+            def _strip_ts(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                normalized: List[Dict[str, Any]] = []
+                for m in msgs or []:
+                    if not isinstance(m, dict):
+                        continue
+                    if m.get("role") == "system":
+                        continue
+                    normalized.append({k: v for k, v in m.items() if k != "timestamp"})
+                return normalized
+
+            normalized_history = _strip_ts(history)
+            normalized_agent = _strip_ts(agent_messages)
+            history_prefix_matches = (
+                len(normalized_agent) >= len(normalized_history)
+                and normalized_agent[: len(normalized_history)] == normalized_history
+            )
+            history_was_rewritten = bool(normalized_history) and not history_prefix_matches
+
+            # If agent history was compressed/rewritten, replace transcript with
+            # the returned message list so future turns stay compact.
+            if history_was_rewritten:
+                rewritten: List[Dict[str, Any]] = []
+
+                # Preserve an existing session_meta entry if present.
+                existing_meta = next(
+                    (m for m in (history or []) if isinstance(m, dict) and m.get("role") == "session_meta"),
+                    None,
+                )
+                if existing_meta:
+                    meta_entry = dict(existing_meta)
+                    meta_entry.setdefault("timestamp", ts)
+                    rewritten.append(meta_entry)
+
+                for msg in normalized_agent:
+                    entry = dict(msg)
+                    entry.setdefault("timestamp", ts)
+                    rewritten.append(entry)
+
+                self.session_store.rewrite_transcript(session_entry.session_id, rewritten)
+                self.session_store.update_session(session_entry.session_key)
+                return response
             
-            # Find only the NEW messages from this turn (skip history we loaded)
-            history_len = len(history)
-            new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else agent_messages
+            # Find only the NEW messages from this turn (skip history we loaded).
+            # Use the filtered history length (history_offset) that was actually
+            # passed to the agent, not len(history) which includes session_meta
+            # entries that were stripped before the agent saw them.
+            history_len = agent_result.get("history_offset", len(history))
+            new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
             
             # If no new messages found (edge case), fall back to simple user/assistant
             if not new_messages:
@@ -1028,30 +1600,435 @@ class GatewayRunner:
         finally:
             # Clear session env
             self._clear_session_env()
+
+    def _build_browser_bridge_source(
+        self,
+        *,
+        browser_label: str,
+        client_session_id: str = "",
+        page_payload: Optional[Dict[str, Any]] = None,
+    ) -> SessionSource:
+        """Create a stable local source for the browser sidebar session."""
+        if page_payload:
+            try:
+                chat_id = get_bridge_session_key(page_payload)
+            except Exception:
+                chat_id = build_bridge_chat_id(browser_label, client_session_id)
+        else:
+            chat_id = build_bridge_chat_id(browser_label, client_session_id)
+
+        source = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id=chat_id,
+            chat_name=browser_label,
+            chat_type="channel",
+            user_id="local-browser",
+            user_name=browser_label,
+        )
+        return source
+
+    @staticmethod
+    def _is_browser_bridge_source(source: Optional[SessionSource]) -> bool:
+        if not source:
+            return False
+        if source.platform != Platform.LOCAL:
+            return False
+        chat_id = str(source.chat_id or "")
+        return chat_id.startswith("browser-bridge:")
+
+    @staticmethod
+    def _normalize_bridge_client_session_id(client_session_id: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_-]+", "-", (client_session_id or "").strip()).strip("-")[:64]
+
+    def _resolve_browser_bridge_source(
+        self,
+        *,
+        browser_label: str,
+        client_session_id: str = "",
+        session_key: str = "",
+        page_payload: Optional[Dict[str, Any]] = None,
+    ) -> SessionSource:
+        normalized_session_key = (session_key or "").strip()
+        if normalized_session_key:
+            self.session_store._ensure_loaded()
+            entry = self.session_store._entries.get(normalized_session_key)
+            if not entry or not self._is_browser_bridge_source(entry.origin):
+                raise ValueError("Unknown browser sidecar session.")
+            return entry.origin
+
+        return self._build_browser_bridge_source(
+            browser_label=browser_label,
+            client_session_id=client_session_id,
+            page_payload=page_payload,
+        )
+
+    def _list_browser_bridge_sessions(
+        self,
+        *,
+        client_session_id: str = "",
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        normalized_client_session_id = self._normalize_bridge_client_session_id(client_session_id)
+        limit = max(1, min(int(limit), 100))
+        entries = self.session_store.list_sessions()
+        sessions: List[Dict[str, Any]] = []
+
+        for entry in entries:
+            source = entry.origin
+            if not self._is_browser_bridge_source(source):
+                continue
+
+            chat_id = str(source.chat_id or "")
+            if normalized_client_session_id:
+                marker = f":{normalized_client_session_id}"
+                if not chat_id.endswith(marker):
+                    continue
+
+            progress = self._get_browser_bridge_progress_snapshot(entry.session_key)
+            history = self.session_store.load_transcript(entry.session_id)
+            serialized_history = self._serialize_browser_bridge_history(history)
+            last_message = serialized_history[-1] if serialized_history else {}
+            preview = str(
+                last_message.get("display_content")
+                or last_message.get("content")
+                or ""
+            ).strip()
+            if len(preview) > 160:
+                preview = preview[:160].rstrip() + "..."
+
+            sessions.append(
+                {
+                    "session_key": entry.session_key,
+                    "session_id": entry.session_id,
+                    "browser_label": source.chat_name or source.user_name or entry.display_name or "Browser Sidecar",
+                    "chat_id": chat_id,
+                    "updated_at": entry.updated_at.isoformat(),
+                    "created_at": entry.created_at.isoformat(),
+                    "message_count": len(serialized_history),
+                    "last_message_role": last_message.get("role") or "",
+                    "last_message_preview": preview,
+                    "running": bool(progress.get("running")),
+                }
+            )
+            if len(sessions) >= limit:
+                break
+
+        return sessions
+
+    @staticmethod
+    def _extract_browser_bridge_content(content: Any) -> str:
+        """Flatten transcript content into sidebar-friendly text."""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for item in content:
+                if isinstance(item, str) and item.strip():
+                    chunks.append(item.strip())
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("content") or ""
+                    if text:
+                        chunks.append(str(text).strip())
+            return "\n".join(chunk for chunk in chunks if chunk).strip()
+        if isinstance(content, dict):
+            text = content.get("text") or content.get("content") or ""
+            return str(text).strip()
+        if content is None:
+            return ""
+        return str(content).strip()
+
+    @staticmethod
+    def _extract_browser_bridge_label(message: str, prefix: str) -> str:
+        for line in (message or "").splitlines():
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
+        return ""
+
+    def _serialize_browser_bridge_history(
+        self,
+        history: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Convert transcript history into sidebar-friendly chat messages."""
+        serialized: List[Dict[str, Any]] = []
+        for message in history or []:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            content = self._extract_browser_bridge_content(message.get("content"))
+            if not content:
+                continue
+
+            entry: Dict[str, Any] = {
+                "role": role,
+                "content": content,
+                "timestamp": message.get("timestamp") or "",
+                "kind": "chat",
+            }
+
+            if role == "user" and content.startswith("[Injected browser context from the local Chrome extension]"):
+                title = self._extract_browser_bridge_label(content, "- Title:")
+                url = self._extract_browser_bridge_label(content, "- URL:")
+                request_text = ""
+                request_marker = "User request:\n"
+                if request_marker in content:
+                    request_text = content.split(request_marker, 1)[1].split("\n\nPage details:", 1)[0].strip()
+                entry.update(
+                    {
+                        "kind": "page_context",
+                        "display_content": request_text or "Shared current browser page context.",
+                        "page_title": title,
+                        "page_url": url,
+                    }
+                )
+            else:
+                entry["display_content"] = content
+
+            serialized.append(entry)
+
+        return serialized
+
+    def _get_browser_bridge_session_snapshot(self, source: SessionSource) -> Dict[str, Any]:
+        """Return session metadata and a sidebar-safe transcript snapshot."""
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        progress = self._get_browser_bridge_progress_snapshot(session_entry.session_key)
+        return {
+            "session_key": session_entry.session_key,
+            "session_id": session_entry.session_id,
+            "messages": self._serialize_browser_bridge_history(history),
+            "progress": progress,
+            "running": bool(progress.get("running")),
+        }
+
+    async def _handle_browser_bridge_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle browser bridge API requests."""
+        route = (payload or {}).pop("_bridge_route", "/inject")
+        if route == "/session":
+            return await self._handle_browser_bridge_session(payload)
+        return await self._handle_browser_bridge_payload(payload)
+
+    async def _handle_browser_bridge_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert a browser bridge payload into a local gateway message."""
+        normalized = normalize_payload(payload)
+        browser_label = normalized.get("browser_label") or "Chrome Extension"
+        source = self._build_browser_bridge_source(
+            browser_label=browser_label,
+            client_session_id=normalized.get("client_session_id") or "",
+            page_payload=normalized,
+        )
+        event = MessageEvent(
+            text=build_browser_context_message(normalized),
+            source=source,
+            message_type=MessageType.TEXT,
+            raw_message=normalized,
+        )
+        response = await self._handle_message(event)
+        snapshot = self._get_browser_bridge_session_snapshot(source)
+        transcript = normalized.get("transcript") or {}
+        return {
+            "response": response or "",
+            "session_key": snapshot["session_key"],
+            "session_id": snapshot["session_id"],
+            "messages": snapshot["messages"],
+            "title": normalized.get("title") or "",
+            "url": normalized.get("url") or "",
+            "transcript_shared": bool(transcript.get("shared") and transcript.get("text")),
+            "transcript_shared_previously": bool(transcript.get("shared_previously")),
+        }
+
+    async def _handle_browser_bridge_session(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Serve transcript-aware browser sidebar chat actions."""
+        action = str((payload or {}).get("action") or "state").strip().lower()
+        browser_label = str(payload.get("browserLabel") or payload.get("browser_label") or "Chrome Extension").strip() or "Chrome Extension"
+        client_session_id = str(payload.get("clientSessionId") or payload.get("client_session_id") or "").strip()
+        selected_session_key = str(payload.get("sessionKey") or payload.get("session_key") or "").strip()
+
+        if action == "list":
+            raw_limit = payload.get("limit", 20)
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                limit = 20
+            try:
+                source = self._resolve_browser_bridge_source(
+                    browser_label=browser_label,
+                    client_session_id=client_session_id,
+                    session_key=selected_session_key,
+                )
+            except ValueError:
+                source = self._build_browser_bridge_source(
+                    browser_label=browser_label,
+                    client_session_id=client_session_id,
+                )
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            sessions = self._list_browser_bridge_sessions(
+                client_session_id=client_session_id,
+                limit=limit,
+            )
+            return {
+                "ok": True,
+                "sessions": sessions,
+                "active_session_key": snapshot.get("session_key") or "",
+                **snapshot,
+            }
+
+        source = self._resolve_browser_bridge_source(
+            browser_label=browser_label,
+            client_session_id=client_session_id,
+            session_key=selected_session_key,
+        )
+
+        if action == "reset":
+            session_key = build_session_key(source)
+            self.session_store.reset_session(session_key)
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            return {
+                "ok": True,
+                "reset": True,
+                **snapshot,
+            }
+
+        if action == "state":
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            return {
+                "ok": True,
+                **snapshot,
+            }
+
+        if action not in {"send", "send_async"}:
+            raise ValueError(f"Unsupported browser bridge action: {action}")
+
+        page_payload = payload.get("pageContext")
+        normalized_page_payload = None
+        if isinstance(page_payload, dict) and page_payload:
+            normalized_page_payload = normalize_payload(page_payload)
+
+        message_text = build_browser_chat_message(
+            payload.get("message") or payload.get("text") or "",
+            normalized_page_payload,
+        )
+
+        source = self._resolve_browser_bridge_source(
+            browser_label=browser_label,
+            client_session_id=client_session_id,
+            session_key=selected_session_key,
+            page_payload=normalized_page_payload,
+        )
+        event = MessageEvent(
+            text=message_text,
+            source=source,
+            message_type=MessageType.TEXT,
+            raw_message=payload,
+        )
+        transcript = (normalized_page_payload or {}).get("transcript") or {}
+
+        if action == "send_async":
+            session_entry = self.session_store.get_or_create_session(source)
+            session_key = session_entry.session_key
+            existing_task = self._browser_bridge_tasks.get(session_key)
+            if existing_task and existing_task.done():
+                self._browser_bridge_tasks.pop(session_key, None)
+                existing_task = None
+            if existing_task and not existing_task.done():
+                snapshot = self._get_browser_bridge_session_snapshot(source)
+                return {
+                    "ok": True,
+                    "accepted": False,
+                    "busy": True,
+                    "detail": "Hermes is already working on this browser session.",
+                    "transcript_shared": False,
+                    "transcript_shared_previously": bool(transcript.get("shared_previously")),
+                    **snapshot,
+                }
+
+            self._set_browser_bridge_progress(
+                session_key,
+                running=True,
+                phase="starting",
+                detail="Preparing browser chat turn...",
+                tool_calls=0,
+                updates=1,
+                recent_events=["Preparing browser chat turn..."],
+                started_at=time.monotonic(),
+                completed_at="",
+                error="",
+            )
+
+            async def _run_browser_turn() -> None:
+                try:
+                    await self._handle_message(event)
+                    current = self._browser_bridge_progress.get(session_key, {})
+                    self._set_browser_bridge_progress(
+                        session_key,
+                        running=False,
+                        phase="done",
+                        detail="Reply ready.",
+                        tool_calls=int(current.get("tool_calls") or 0),
+                        updates=max(1, int(current.get("updates") or 0)),
+                        recent_events=list(current.get("recent_events") or ["Reply ready."]),
+                        completed_at=datetime.now().isoformat(),
+                        error="",
+                    )
+                except Exception as exc:
+                    logger.exception("Browser bridge async session failed")
+                    current = self._browser_bridge_progress.get(session_key, {})
+                    self._set_browser_bridge_progress(
+                        session_key,
+                        running=False,
+                        phase="error",
+                        detail=str(exc),
+                        tool_calls=int(current.get("tool_calls") or 0),
+                        updates=max(1, int(current.get("updates") or 0)),
+                        recent_events=list(current.get("recent_events") or [str(exc)]),
+                        completed_at=datetime.now().isoformat(),
+                        error=str(exc),
+                    )
+                finally:
+                    self._browser_bridge_tasks.pop(session_key, None)
+
+            task = asyncio.create_task(_run_browser_turn(), name=f"browser-bridge-{session_key}")
+            self._browser_bridge_tasks[session_key] = task
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            return {
+                "ok": True,
+                "accepted": True,
+                "transcript_shared": bool(transcript.get("shared") and transcript.get("text")),
+                "transcript_shared_previously": bool(transcript.get("shared_previously")),
+                **snapshot,
+            }
+
+        response = await self._handle_message(event)
+        snapshot = self._get_browser_bridge_session_snapshot(source)
+        return {
+            "ok": True,
+            "response": response or "",
+            "transcript_shared": bool(transcript.get("shared") and transcript.get("text")),
+            "transcript_shared_previously": bool(transcript.get("shared_previously")),
+            **snapshot,
+        }
     
     async def _handle_reset_command(self, event: MessageEvent) -> str:
         """Handle /new or /reset command."""
         source = event.source
         
         # Get existing session key
-        session_key = f"agent:main:{source.platform.value}:" + \
-                      (f"dm" if source.chat_type == "dm" else f"{source.chat_type}:{source.chat_id}")
+        session_key = self.session_store._generate_session_key(source)
         
         # Memory flush before reset: load the old transcript and let a
         # temporary agent save memories before the session is wiped.
         try:
-            old_entry = self.session_store._sessions.get(session_key)
+            old_entry = self.session_store._entries.get(session_key)
             if old_entry:
                 old_history = self.session_store.load_transcript(old_entry.session_id)
                 if old_history:
                     from run_agent import AIAgent
                     loop = asyncio.get_event_loop()
-                    # Resolve credentials so the flush agent can reach the LLM
-                    _flush_model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+                    _flush_kwargs = _resolve_runtime_agent_kwargs()
                     def _do_flush():
                         tmp_agent = AIAgent(
-                            model=_flush_model,
-                            **_resolve_runtime_agent_kwargs(),
+                            **_flush_kwargs,
                             max_iterations=5,
                             quiet_mode=True,
                             enabled_toolsets=["memory"],
@@ -1133,10 +2110,16 @@ class GatewayRunner:
             "`/status` — Show session info",
             "`/stop` — Interrupt the running agent",
             "`/model [name]` — Show or change the model",
+            "`/invokeai-defaults [model] [aspect]` — Show or change default InvokeAI image settings",
+            "`/wiki-host [enable|disable|status] [port]` — Toggle LAN hosting for the local wiki",
             "`/personality [name]` — Set a personality",
             "`/retry` — Retry your last message",
             "`/undo` — Remove the last exchange",
             "`/sethome` — Set this chat as the home channel",
+            "`/compress` — Compress conversation context",
+            "`/usage` — Show token usage for this session",
+            "`/reload-mcp` — Reload MCP servers from config",
+            "`/cron` — Manage scheduled jobs (`list`, `add`, `remove`, `run`)",
             "`/help` — Show this message",
         ]
         try:
@@ -1149,6 +2132,426 @@ class GatewayRunner:
         except Exception:
             pass
         return "\n".join(lines)
+
+    async def _handle_cron_command(self, event: MessageEvent) -> str:
+        """Handle /cron command for scheduled jobs."""
+        args = event.get_command_args().strip()
+
+        if not args:
+            # Show quick help + current jobs
+            return await self._handle_cron_list_command()
+
+        parts = args.split(maxsplit=1)
+        subcommand = parts[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if subcommand in ("list", "ls"):
+            return await self._handle_cron_list_command()
+
+        if subcommand == "add":
+            if not rest:
+                return (
+                    "(._.) Usage: `/cron add <schedule> <prompt>`\n"
+                    "Accepted schedules:\n"
+                    "• `30m`, `2h`, `1d` (one-shot delay)\n"
+                    "• `every 30m`, `every 2h` (recurring)\n"
+                    "• `0 9 * * *` (cron expression)\n"
+                    "• `2026-03-03T14:00:00` (one-shot timestamp)\n"
+                    'Example: `/cron add 30m Remind me to take a break`\n'
+                    'Example: `/cron add "every 2h" Check server health`\n'
+                    'Example: `/cron add "0 9 * * *" Morning briefing`'
+                )
+            try:
+                schedule, prompt = self._parse_cron_add_args(rest)
+            except ValueError as e:
+                return str(e)
+            return await self._handle_cron_add_command(event, schedule=schedule, prompt=prompt)
+
+        if subcommand in ("remove", "rm", "delete"):
+            if not rest:
+                return "(._.) Usage: `/cron remove <job_id>`"
+            job_id = rest.split()[0]
+            return await self._handle_cron_remove_command(job_id)
+
+        if subcommand in ("run", "run_now", "run-now", "now"):
+            if not rest:
+                return "(._.) Usage: `/cron run <job_id>`"
+            if subcommand == "run" and rest.lower().startswith("now "):
+                rest = rest[4:].strip()
+            job_id = rest.split()[0]
+            return await self._handle_cron_run_command(event, job_id)
+
+        if subcommand in ("help", "?"):
+            return (
+                "📖 **Cron Commands**\n"
+                "`/cron list` — List jobs\n"
+                "`/cron add <schedule> <prompt>` — Add job\n"
+                "`/cron remove <job_id>` — Remove job\n"
+                "`/cron run <job_id>` — Run one job immediately\n\n"
+                "**Accepted schedules for `/cron add`:**\n"
+                "• `30m`, `2h`, `1d` (one-shot delay)\n"
+                "• `every 30m`, `every 2h` (recurring)\n"
+                "• `0 9 * * *` (cron expression)\n"
+                "• `2026-03-03T14:00:00` (one-shot timestamp)"
+            )
+
+        return (
+            f"(._.) Unknown cron command: `{subcommand}`\n"
+            "Available: list, add, remove, run"
+        )
+
+    def _parse_cron_add_args(self, args: str) -> tuple[str, str]:
+        """Parse `/cron add` args into (schedule, prompt)."""
+        rest = args.strip()
+        if not rest:
+            raise ValueError(
+                "(._.) Usage: `/cron add <schedule> <prompt>`\n"
+                "Accepted schedule examples: `30m`, `every 2h`, `0 9 * * *`, `2026-03-03T14:00:00`"
+            )
+
+        # Support quoted schedule like "every 2h" for spaces.
+        if rest.startswith('"'):
+            close_quote = rest.find('"', 1)
+            if close_quote == -1:
+                raise ValueError(
+                    '(._.) Unmatched quote in schedule. Use `"every 2h"` or `30m`.\n'
+                    "Accepted schedule examples: `30m`, `every 2h`, `0 9 * * *`, `2026-03-03T14:00:00`"
+                )
+            schedule = rest[1:close_quote].strip()
+            prompt = rest[close_quote + 1 :].strip()
+            if not prompt:
+                raise ValueError("(._.) Please provide a prompt for the job.")
+            return schedule, prompt
+
+        # Support "every 2h" / "every 1d" without requiring quotes.
+        lower_rest = rest.lower()
+        if lower_rest.startswith("every "):
+            parts = rest.split(maxsplit=2)
+            if len(parts) < 3:
+                raise ValueError(
+                    "(._.) Usage: `/cron add <schedule> <prompt>`\n"
+                    "For recurring jobs, use: `every 30m` or `every 2h`"
+                )
+            schedule = f"{parts[0]} {parts[1]}"
+            prompt = parts[2].strip()
+            if not prompt:
+                raise ValueError("(._.) Please provide a prompt for the job.")
+            return schedule, prompt
+
+        # Support cron expressions without quoting when enough fields are present.
+        parts = rest.split()
+        if len(parts) >= 6 and all(
+            re.match(r'^[\d\*\-,/]+$', p) for p in parts[:5]
+        ):
+            schedule = " ".join(parts[:5])
+            prompt = " ".join(parts[5:]).strip()
+            if not prompt:
+                raise ValueError("(._.) Please provide a prompt for the job.")
+            return schedule, prompt
+
+        parts = rest.split(maxsplit=1)
+        schedule = parts[0].strip()
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+        if not schedule:
+            raise ValueError(
+                "(._.) Usage: `/cron add <schedule> <prompt>`\n"
+                "Accepted schedule examples: `30m`, `every 2h`, `0 9 * * *`, `2026-03-03T14:00:00`"
+            )
+        if not prompt:
+            raise ValueError("(._.) Please provide a prompt for the job.")
+        return schedule, prompt
+
+    async def _handle_cron_list_command(self) -> str:
+        """List all active cron jobs for `/cron list`."""
+        from cron.jobs import list_jobs
+
+        jobs = list_jobs()
+        if not jobs:
+            return "No scheduled jobs. Use `/cron add <schedule> <prompt>` to create one."
+
+        lines = ["Scheduled Jobs:\n"]
+        for job in jobs:
+            times = job["repeat"].get("times")
+            completed = job["repeat"].get("completed", 0)
+            repeat_str = "forever" if times is None else f"{completed}/{times}"
+            prompt_preview = job["prompt"][:90] + ("..." if len(job["prompt"]) > 90 else "")
+            lines.extend([
+                f"ID: `{job['id']}`",
+                f"Name: {job['name']}",
+                f"Schedule: {job['schedule_display']} ({repeat_str})",
+                f"Next run: {job.get('next_run_at', 'N/A')}",
+                f"Prompt: {prompt_preview}",
+                "",
+            ])
+
+        return "\n".join(lines)
+
+    async def _handle_cron_add_command(
+        self,
+        event: MessageEvent,
+        schedule: str,
+        prompt: str,
+    ) -> str:
+        """Handle `/cron add` by creating a job from current chat context."""
+        from cron.jobs import create_job
+
+        origin = {
+            "platform": event.source.platform.value if event.source.platform else "unknown",
+            "chat_id": event.source.chat_id,
+            "chat_name": event.source.chat_name,
+        }
+
+        try:
+            job = create_job(prompt=prompt, schedule=schedule, origin=origin)
+        except Exception as e:
+            return f"⚠️ Failed to create cron job: {e}"
+
+        return (
+            f"Created cron job `{job['id']}`.\n"
+            f"Name: {job['name']}\n"
+            f"Schedule: {job['schedule_display']}\n"
+            f"Next run: {job['next_run_at']}"
+        )
+
+    async def _handle_cron_remove_command(self, job_id: str) -> str:
+        """Handle `/cron remove <job_id>`."""
+        from cron.jobs import get_job, remove_job
+
+        job = get_job(job_id)
+        if not job:
+            return f"(._.) Job not found: `{job_id}`"
+        removed_name = job["name"]
+        if remove_job(job_id):
+            return f"Removed job `{removed_name}` (`{job_id}`)."
+        return f"⚠️ Failed to remove job `{job_id}`"
+
+    async def _handle_cron_run_command(self, event: MessageEvent, job_id: str) -> str:
+        """Handle `/cron run <job_id>` for one-off immediate execution."""
+        from cron.jobs import get_job
+        import queue as _queue
+        import time as _time
+
+        job = get_job(job_id)
+        if not job:
+            return f"(._.) Job not found: `{job_id}`"
+
+        source = event.source
+        adapter = self.adapters.get(source.platform) if source else None
+        job_name = job.get("name", job["id"])
+        progress_queue: "_queue.Queue[str]" = _queue.Queue()
+        progress_state = {
+            "started_at": _time.monotonic(),
+            "last_detail": "Calling model...",
+            "tool_calls": 0,
+            "updates": 0,
+            "done": False,
+        }
+        heartbeat_faces = {
+            "thinking": [
+                "(·_·)",
+                "(•‿•)",
+                "(^‿^)",
+                "(•ᴗ•)",
+                "(ᵔ◡ᵔ)",
+                "(^-^*)",
+            ],
+            "tool": [
+                "(⌐■_■)",
+                "(^_^)b",
+                "(•̀ᴗ•́)و",
+                "(｡•̀ᴗ-)✧",
+                "(ง •_•)ง",
+                "(๑•̀ㅂ•́)و",
+            ],
+            "steady": [
+                "(o^▽^o)",
+                "(≧◡≦)",
+                "(¬‿¬)",
+                "(づ｡◕‿‿◕｡)づ",
+                "(づ￣ ³￣)づ",
+                "(ﾉ◕ヮ◕)ﾉ",
+                "(^o^)/",
+            ],
+        }
+        progress_message_id: str | None = None
+
+        def _set_progress_detail(detail: str, tool_call: bool = False) -> None:
+            progress_state["last_detail"] = (detail or "Working...").strip()
+            if tool_call:
+                progress_state["tool_calls"] += 1
+            progress_state["updates"] += 1
+            progress_queue.put("__tick__")
+
+        def _build_progress_message() -> str:
+            elapsed = int(max(0, _time.monotonic() - progress_state["started_at"]))
+            detail = (progress_state.get("last_detail") or "Working...").strip()
+            if len(detail) > 180:
+                detail = detail[:177] + "..."
+            if str(detail).lower().startswith("💡"):
+                pool = heartbeat_faces["thinking"]
+            elif progress_state.get("tool_calls", 0) > 0:
+                pool = heartbeat_faces["tool"]
+            else:
+                pool = heartbeat_faces["steady"]
+            face = pool[elapsed % len(pool)]
+            return (
+                f"🛠️ {face} Cron job is running... ({elapsed}s)\n"
+                f"Name: {job_name}\n"
+                f"ID: {job['id']}\n"
+                f"{detail}\n"
+                f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+            )
+
+        def progress_callback(tool_name: str, preview: str = None, args: dict = None):
+            if tool_name == "_thinking":
+                _set_progress_detail(f"💡 thinking: {preview or 'working...'}", tool_call=False)
+                return
+            if preview:
+                if len(preview) > 80:
+                    preview = preview[:77] + "..."
+                _set_progress_detail(f"⚙️ {tool_name}: \"{preview}\"", tool_call=True)
+                return
+            _set_progress_detail(f"⚙️ {tool_name}...", tool_call=True)
+
+        async def _manual_cron_progress_loop():
+            nonlocal progress_message_id
+            if not adapter or not source:
+                return
+            while True:
+                try:
+                    while True:
+                        try:
+                            progress_queue.get_nowait()
+                        except _queue.Empty:
+                            break
+                    msg = _build_progress_message()
+                    if progress_message_id is None:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=msg,
+                            include_listen_button=False,
+                        )
+                        if result and result.success and result.message_id:
+                            progress_message_id = result.message_id
+                    else:
+                        await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=progress_message_id,
+                            content=msg,
+                            include_listen_button=False,
+                        )
+                    if progress_state.get("done"):
+                        return
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    await asyncio.sleep(1.0)
+
+        if adapter and source:
+            try:
+                initial = await adapter.send(
+                    chat_id=source.chat_id,
+                    content=(
+                        f"⏳ Cron job starting\n"
+                        f"Name: {job_name}\n"
+                        f"ID: {job['id']}\n"
+                        f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    ),
+                    include_listen_button=False,
+                )
+                if initial and initial.success and initial.message_id:
+                    progress_message_id = initial.message_id
+            except Exception:
+                pass
+
+        progress_task = asyncio.create_task(_manual_cron_progress_loop())
+        result = await asyncio.to_thread(self._run_cron_job_once, job, event, progress_callback)
+        progress_state["done"] = True
+        try:
+            await progress_task
+        except Exception:
+            pass
+
+        if adapter and source:
+            try:
+                status_msg = (
+                    f"✅ Cron job completed\n"
+                    f"Name: {result['job_name']}\n"
+                    f"ID: {result['job_id']}\n"
+                    f"Output: {result['output_file']}"
+                ) if result.get("success") else (
+                    f"❌ Cron job failed\n"
+                    f"Name: {result['job_name']}\n"
+                    f"ID: {result['job_id']}\n"
+                    f"Error: {result.get('error')}\n"
+                    f"Output: {result['output_file']}"
+                )
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=status_msg,
+                    include_listen_button=False,
+                )
+            except Exception:
+                pass
+
+        if not result.get("success"):
+            return (
+                f"⚠️ Cron job `{result['job_id']}` failed while running now.\n"
+                f"Error: `{result.get('error')}`\n"
+                f"Output saved to: `{result['output_file']}`"
+            )
+
+        preview = (result.get("final_response") or "(No response)").strip()
+        if len(preview) > 2800:
+            preview = preview[:2775] + "..."
+        return (
+            f"Ran `{result['job_id']}` now.\n"
+            f"Output saved to: `{result['output_file']}`\n\n"
+            f"**Response:**\n{preview}"
+        )
+
+    def _run_cron_job_once(
+        self,
+        job: dict,
+        event: MessageEvent,
+        tool_progress_callback: Optional[Callable[..., None]] = None,
+    ) -> Dict[str, Any]:
+        """Execute one job in a blocking thread context."""
+        from cron.jobs import mark_job_run
+        from cron.scheduler import run_job, save_job_output
+
+        job_ctx = dict(job)
+        # If the job has no origin stored, pin run output to this chat.
+        if not job_ctx.get("origin") and event.source:
+            job_ctx["origin"] = {
+                "platform": event.source.platform.value if event.source.platform else "unknown",
+                "chat_id": event.source.chat_id,
+                "chat_name": event.source.chat_name,
+            }
+
+        success, output, final_response, error = run_job(
+            job_ctx,
+            tool_progress_callback=tool_progress_callback,
+        )
+
+        output_file = "unknown"
+        try:
+            saved = save_job_output(job_ctx["id"], output)
+            output_file = str(saved)
+        except Exception:
+            pass
+
+        mark_job_run(job_ctx["id"], success, error)
+
+        return {
+            "success": success,
+            "job_id": job_ctx["id"],
+            "job_name": job_ctx.get("name", job_ctx["id"]),
+            "output_file": output_file,
+            "error": error,
+            "final_response": final_response,
+        }
     
     async def _handle_model_command(self, event: MessageEvent) -> str:
         """Handle /model command - show or change the current model."""
@@ -1156,21 +2559,7 @@ class GatewayRunner:
 
         args = event.get_command_args().strip()
         config_path = _hermes_home / 'config.yaml'
-
-        # Resolve current model the same way the agent init does:
-        # env vars first, then config.yaml always overrides.
-        current = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
-        try:
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-                model_cfg = cfg.get("model", {})
-                if isinstance(model_cfg, str):
-                    current = model_cfg
-                elif isinstance(model_cfg, dict):
-                    current = model_cfg.get("default", current)
-        except Exception:
-            pass
+        current = _resolve_gateway_model()
 
         if not args:
             return f"🤖 **Current model:** `{current}`\n\nTo change: `/model provider/model-name`"
@@ -1188,12 +2577,12 @@ class GatewayRunner:
         try:
             user_config = {}
             if config_path.exists():
-                with open(config_path) as f:
+                with open(config_path, encoding="utf-8") as f:
                     user_config = yaml.safe_load(f) or {}
             if "model" not in user_config or not isinstance(user_config["model"], dict):
                 user_config["model"] = {}
             user_config["model"]["default"] = args
-            with open(config_path, 'w') as f:
+            with open(config_path, "w", encoding="utf-8", newline="") as f:
                 yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
         except Exception as e:
             return f"⚠️ Failed to save model change: {e}"
@@ -1202,6 +2591,147 @@ class GatewayRunner:
         os.environ["HERMES_MODEL"] = args
 
         return f"🤖 Model changed to `{args}`\n_(takes effect on next message)_"
+
+    async def _handle_image_defaults_command(self, event: MessageEvent) -> str:
+        """Handle /invokeai-defaults command - show or change InvokeAI image defaults."""
+        aspect_presets = {
+            "1:1": (1024, 1024),
+            "16:9": (1344, 768),
+            "9:16": (768, 1344),
+            "4:3": (1152, 896),
+            "3:4": (896, 1152),
+        }
+
+        args = event.get_command_args().strip()
+        current = _get_image_generation_defaults()
+
+        if not args:
+            if current:
+                return (
+                    f"{_format_image_defaults(current)}\n"
+                    "\nTo change these, use `/invokeai-defaults <model> <aspect_ratio>`."
+                )
+            return (
+                "🖼️ No image defaults saved yet.\n\n"
+                "Use `/invokeai-defaults <model> <aspect_ratio>`.\n"
+                "Supported aspect ratios: `1:1`, `16:9`, `9:16`, `4:3`, `3:4`."
+            )
+
+        try:
+            tokens = shlex.split(args)
+        except ValueError as e:
+            return f"⚠️ Could not parse image defaults: {e}"
+
+        if len(tokens) > 2:
+            return (
+                "⚠️ Too many arguments for `/invokeai-defaults`.\n\n"
+                "Usage: `/invokeai-defaults <model> <aspect_ratio>`\n"
+                "Example: `/invokeai-defaults \"Z-Image Turbo (quantized)\" 1:1`"
+            )
+
+        model = current.get("model") if current else None
+        aspect_ratio = current.get("aspect_ratio") if current else None
+
+        if len(tokens) == 1:
+            token = tokens[0]
+            if token in aspect_presets:
+                aspect_ratio = token
+            else:
+                model = token
+        elif len(tokens) == 2:
+            model, aspect_ratio = tokens
+
+        if not model:
+            return (
+                "⚠️ Please pick a model.\n\n"
+                "The command can update just the aspect ratio if a model is already saved."
+            )
+
+        if not aspect_ratio:
+            aspect_ratio = "1:1"
+
+        if aspect_ratio not in aspect_presets:
+            valid = ", ".join(f"`{key}`" for key in aspect_presets)
+            return (
+                f"⚠️ Unknown aspect ratio: `{aspect_ratio}`\n\n"
+                f"Valid options: {valid}"
+            )
+
+        width, height = aspect_presets[aspect_ratio]
+
+        try:
+            _save_image_generation_defaults(
+                model=model,
+                aspect_ratio=aspect_ratio,
+                width=width,
+                height=height,
+            )
+        except Exception as e:
+            return f"⚠️ Failed to save image defaults: {e}"
+
+        os.environ["HERMES_IMAGE_DEFAULT_MODEL"] = model
+        os.environ["HERMES_IMAGE_DEFAULT_ASPECT_RATIO"] = aspect_ratio
+        os.environ["HERMES_IMAGE_DEFAULT_WIDTH"] = str(width)
+        os.environ["HERMES_IMAGE_DEFAULT_HEIGHT"] = str(height)
+
+        saved = {
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "width": width,
+            "height": height,
+        }
+        return (
+            f"✅ Saved image defaults.\n\n"
+            f"{_format_image_defaults(saved)}\n"
+            "\nThese will be used as the starting image settings after your next message unless you override them."
+        )
+
+    async def _handle_wiki_host_command(self, event: MessageEvent) -> str:
+        """Handle /wiki-host command for LAN wiki hosting."""
+        args = event.get_command_args().strip()
+        if not args:
+            return self._wiki_host_status_message()
+
+        try:
+            tokens = shlex.split(args)
+        except ValueError as e:
+            return f"⚠️ Could not parse wiki-host command: {e}"
+
+        action = (tokens[0] or "").strip().lower()
+        port_token = tokens[1].strip() if len(tokens) > 1 else ""
+
+        if action in {"status", "show"}:
+            return self._wiki_host_status_message()
+
+        if action in {"disable", "off", "stop"}:
+            self._stop_wiki_host()
+            _save_wiki_host_config(enabled=False, port=None)
+            return "📚 Wiki hosting disabled."
+
+        if action in {"enable", "on", "start"}:
+            port = self._wiki_host_port or int((_get_wiki_host_config().get("port") or 8008))
+            if port_token:
+                try:
+                    port = int(port_token)
+                except ValueError:
+                    return f"⚠️ Invalid port: `{port_token}`"
+            if not (1 <= int(port) <= 65535):
+                return f"⚠️ Invalid port: `{port}`"
+
+            try:
+                return self._start_wiki_host(int(port))
+            except OSError as e:
+                return f"⚠️ Could not start wiki host on port `{port}`: {e}"
+            except Exception as e:
+                return f"⚠️ Failed to start wiki host: {e}"
+
+        return (
+            f"⚠️ Unknown wiki-host action: `{action}`\n\n"
+            "Usage:\n"
+            "- `/wiki-host status`\n"
+            "- `/wiki-host enable 8008`\n"
+            "- `/wiki-host disable`"
+        )
     
     async def _handle_personality_command(self, event: MessageEvent) -> str:
         """Handle /personality command - list or set a personality."""
@@ -1367,9 +2897,9 @@ class GatewayRunner:
         if not last_user_msg:
             return "No previous message to retry."
         
-        # Truncate history to before the last user message
+        # Truncate history to before the last user message and persist
         truncated = history[:last_user_idx]
-        session_entry.conversation_history = truncated
+        self.session_store.rewrite_transcript(session_entry.session_id, truncated)
         
         # Re-send by creating a fake text event with the old message
         retry_event = MessageEvent(
@@ -1401,7 +2931,7 @@ class GatewayRunner:
         
         removed_msg = history[last_user_idx].get("content", "")
         removed_count = len(history) - last_user_idx
-        session_entry.conversation_history = history[:last_user_idx]
+        self.session_store.rewrite_transcript(session_entry.session_id, history[:last_user_idx])
         
         preview = removed_msg[:40] + "..." if len(removed_msg) > 40 else removed_msg
         return f"↩️ Undid {removed_count} message(s).\nRemoved: \"{preview}\""
@@ -1436,6 +2966,164 @@ class GatewayRunner:
             f"Cron jobs and cross-platform messages will be delivered here."
         )
     
+    async def _handle_compress_command(self, event: MessageEvent) -> str:
+        """Handle /compress command -- manually compress conversation context."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+
+        if not history or len(history) < 4:
+            return "Not enough conversation to compress (need at least 4 messages)."
+
+        try:
+            from run_agent import AIAgent
+            from agent.model_metadata import estimate_messages_tokens_rough
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if not runtime_kwargs.get("api_key"):
+                return "No provider configured -- cannot compress."
+
+            msgs = [
+                {"role": m.get("role"), "content": m.get("content")}
+                for m in history
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ]
+            original_count = len(msgs)
+            approx_tokens = estimate_messages_tokens_rough(msgs)
+
+            tmp_agent = AIAgent(
+                **runtime_kwargs,
+                max_iterations=4,
+                quiet_mode=True,
+                enabled_toolsets=["memory"],
+                session_id=session_entry.session_id,
+            )
+
+            loop = asyncio.get_event_loop()
+            compressed, _ = await loop.run_in_executor(
+                None,
+                lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens),
+            )
+
+            self.session_store.rewrite_transcript(session_entry.session_id, compressed)
+            new_count = len(compressed)
+            new_tokens = estimate_messages_tokens_rough(compressed)
+
+            return (
+                f"🗜️ Compressed: {original_count} → {new_count} messages\n"
+                f"~{approx_tokens:,} → ~{new_tokens:,} tokens"
+            )
+        except Exception as e:
+            logger.warning("Manual compress failed: %s", e)
+            return f"Compression failed: {e}"
+
+    async def _handle_usage_command(self, event: MessageEvent) -> str:
+        """Handle /usage command -- show token usage for the session's last agent run."""
+        source = event.source
+        session_key = build_session_key(source)
+
+        agent = self._running_agents.get(session_key)
+        if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
+            lines = [
+                "📊 **Session Token Usage**",
+                f"Prompt (input): {agent.session_prompt_tokens:,}",
+                f"Completion (output): {agent.session_completion_tokens:,}",
+                f"Total: {agent.session_total_tokens:,}",
+                f"API calls: {agent.session_api_calls}",
+            ]
+            ctx = agent.context_compressor
+            if ctx.last_prompt_tokens:
+                pct = ctx.last_prompt_tokens / ctx.context_length * 100 if ctx.context_length else 0
+                lines.append(f"Context: {ctx.last_prompt_tokens:,} / {ctx.context_length:,} ({pct:.0f}%)")
+            if ctx.compression_count:
+                lines.append(f"Compressions: {ctx.compression_count}")
+            return "\n".join(lines)
+
+        # No running agent -- check session history for a rough count
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        if history:
+            from agent.model_metadata import estimate_messages_tokens_rough
+            msgs = [m for m in history if m.get("role") in ("user", "assistant") and m.get("content")]
+            approx = estimate_messages_tokens_rough(msgs)
+            return (
+                f"📊 **Session Info**\n"
+                f"Messages: {len(msgs)}\n"
+                f"Estimated context: ~{approx:,} tokens\n"
+                f"_(Detailed usage available during active conversations)_"
+            )
+        return "No usage data available for this session."
+
+    async def _handle_reload_mcp_command(self, event: MessageEvent) -> str:
+        """Handle /reload-mcp command -- disconnect and reconnect all MCP servers."""
+        loop = asyncio.get_event_loop()
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _load_mcp_config, _servers, _lock
+
+            # Capture old server names before shutdown
+            with _lock:
+                old_servers = set(_servers.keys())
+
+            # Read new config before shutting down, so we know what will be added/removed
+            new_config = _load_mcp_config()
+            new_server_names = set(new_config.keys())
+
+            # Shutdown existing connections
+            await loop.run_in_executor(None, shutdown_mcp_servers)
+
+            # Reconnect by discovering tools (reads config.yaml fresh)
+            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+
+            # Compute what changed
+            with _lock:
+                connected_servers = set(_servers.keys())
+
+            added = connected_servers - old_servers
+            removed = old_servers - connected_servers
+            reconnected = connected_servers & old_servers
+
+            lines = ["🔄 **MCP Servers Reloaded**\n"]
+            if reconnected:
+                lines.append(f"♻️ Reconnected: {', '.join(sorted(reconnected))}")
+            if added:
+                lines.append(f"➕ Added: {', '.join(sorted(added))}")
+            if removed:
+                lines.append(f"➖ Removed: {', '.join(sorted(removed))}")
+            if not connected_servers:
+                lines.append("No MCP servers connected.")
+            else:
+                lines.append(f"\n🔧 {len(new_tools)} tool(s) available from {len(connected_servers)} server(s)")
+
+            # Inject a message at the END of the session history so the
+            # model knows tools changed on its next turn.  Appended after
+            # all existing messages to preserve prompt-cache for the prefix.
+            change_parts = []
+            if added:
+                change_parts.append(f"Added servers: {', '.join(sorted(added))}")
+            if removed:
+                change_parts.append(f"Removed servers: {', '.join(sorted(removed))}")
+            if reconnected:
+                change_parts.append(f"Reconnected servers: {', '.join(sorted(reconnected))}")
+            tool_summary = f"{len(new_tools)} MCP tool(s) now available" if new_tools else "No MCP tools available"
+            change_detail = ". ".join(change_parts) + ". " if change_parts else ""
+            reload_msg = {
+                "role": "user",
+                "content": f"[SYSTEM: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
+            }
+            try:
+                session_entry = self.session_store.get_or_create_session(event.source)
+                self.session_store.append_to_transcript(
+                    session_entry.session_id, reload_msg
+                )
+            except Exception:
+                pass  # Best-effort; don't fail the reload over a transcript write
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning("MCP reload failed: %s", e)
+            return f"❌ MCP reload failed: {e}"
+
     def _set_session_env(self, context: SessionContext) -> None:
         """Set environment variables for the current session."""
         os.environ["HERMES_SESSION_PLATFORM"] = context.source.platform.value
@@ -1705,41 +3393,285 @@ class GatewayRunner:
         else:
             default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
             enabled_toolsets = [default_toolset]
+
+        # Browser sidecar turns should use injected page context directly.
+        # Disable Browserbase automation so we don't navigate/snapshot a
+        # separate remote browser session that is not logged in as the user.
+        if self._is_browser_bridge_source(source):
+            enabled_toolsets = ["hermes-sidecar"]
         
-        # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
-        # Falls back to env vars for backward compatibility
+        # Tool progress and log configuration
         _progress_cfg = {}
         try:
             _tp_cfg_path = _hermes_home / "config.yaml"
             if _tp_cfg_path.exists():
                 import yaml as _tp_yaml
-                with open(_tp_cfg_path) as _tp_f:
+                with open(_tp_cfg_path, encoding="utf-8") as _tp_f:
                     _tp_data = _tp_yaml.safe_load(_tp_f) or {}
                 _progress_cfg = _tp_data.get("display", {})
         except Exception:
             pass
+
+        def _as_bool(val: Any, default: bool = False) -> bool:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in {"1", "true", "yes", "on"}:
+                    return True
+                if v in {"0", "false", "no", "off"}:
+                    return False
+            return default
+
         progress_mode = (
             _progress_cfg.get("tool_progress")
             or os.getenv("HERMES_TOOL_PROGRESS_MODE")
             or "all"
         )
+        progress_style = (
+            _progress_cfg.get("tool_progress_style")
+            or os.getenv("HERMES_TOOL_PROGRESS_STYLE")
+            or "single"
+        ).strip().lower()
+        if progress_style not in {"feed", "single"}:
+            progress_style = "single"
         tool_progress_enabled = progress_mode != "off"
-        
-        # Queue for progress messages (thread-safe)
+        try:
+            progress_rolling_entries = int(
+                _progress_cfg.get("tool_progress_rolling_entries")
+                or os.getenv("HERMES_TOOL_PROGRESS_ROLLING_ENTRIES", "3")
+            )
+        except Exception:
+            progress_rolling_entries = 3
+        progress_rolling_entries = max(1, min(progress_rolling_entries, 8))
+        try:
+            progress_embed_max_chars = int(
+                os.getenv("HERMES_TOOL_PROGRESS_EMBED_MAX_CHARS", "3800")
+            )
+        except Exception:
+            progress_embed_max_chars = 3800
+        progress_embed_max_chars = max(1200, min(progress_embed_max_chars, 3900))
+
+        thread_logs_enabled = _as_bool(
+            _progress_cfg.get("tool_thread_logs", os.getenv("HERMES_TOOL_THREAD_LOGS", "true")),
+            default=True,
+        )
+        artifact_logs_enabled = _as_bool(
+            _progress_cfg.get("tool_log_artifacts", os.getenv("HERMES_TOOL_LOG_ARTIFACTS", "true")),
+            default=True,
+        )
+
+        # Discord only supports threads in server channels, not DMs.
+        thread_logs_enabled = bool(
+            thread_logs_enabled
+            and source.platform == Platform.DISCORD
+            and source.chat_type != "dm"
+        )
+
+        tool_log_path: Optional[Path] = None
+        if artifact_logs_enabled:
+            try:
+                tool_log_dir = _hermes_home / "logs" / "tool_runs"
+                tool_log_dir.mkdir(parents=True, exist_ok=True)
+                tool_log_path = tool_log_dir / f"{session_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+                tool_log_path.write_text(
+                    f"session_id={session_id}\n"
+                    f"session_key={session_key or ''}\n"
+                    f"platform={source.platform.value if source.platform else ''}\n"
+                    f"chat_id={source.chat_id}\n"
+                    f"started_at={datetime.now().isoformat()}\n"
+                    f"user_message={message}\n"
+                    "----\n",
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                logger.debug("Could not create tool log artifact file: %s", e)
+                tool_log_path = None
+
+        def _append_artifact(line: str) -> None:
+            if not tool_log_path:
+                return
+            try:
+                with tool_log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line.rstrip() + "\n")
+            except Exception as e:
+                logger.debug("Tool log artifact append failed: %s", e)
+
+        # Queue for progress/status ticks and detailed log entries (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
-        last_tool = [None]  # Mutable container for tracking in closure
-        
-        def progress_callback(tool_name: str, preview: str = None):
-            """Callback invoked by agent when a tool is called."""
+        detail_queue = queue.Queue() if tool_progress_enabled else None
+        detail_backlog_max = max(
+            50,
+            int(os.getenv("HERMES_TOOL_DETAIL_BACKLOG_MAX", "400")),
+        )
+        thread_create_max_attempts = max(
+            1,
+            int(os.getenv("HERMES_TOOL_THREAD_CREATE_MAX_ATTEMPTS", "3")),
+        )
+        last_tool = [None]
+        progress_state = {
+            "started_at": time.monotonic(),
+            "phase": "thinking",
+            "last_detail": "Queued request...",
+            "tool_calls": 0,
+            "updates": 0,
+            "recent_events": [],
+        }
+        heartbeat_faces_by_phase = {
+            "starting": ["(^_^)/", "(^o^)/", "(o^▽^o)"],
+            "thinking": ["(·_·)", "(•‿•)", "(^‿^)", "(ᵔ◡ᵔ)", "(^-^*)"],
+            "tool": ["(⌐■_■)", "(^_^)b", "(•̀ᴗ•́)و", "(｡•̀ᴗ-)✧", "(ง •_•)ง"],
+            "finalizing": ["(•ᴗ•)", "(≧◡≦)", "(¬‿¬)", "(づ｡◕‿‿◕｡)づ"],
+            "default": ["(•‿•)", "(^_^)/", "(^‿^)"],
+        }
+        phase_labels = {
+            "starting": "starting",
+            "thinking": "thinking",
+            "tool": "using tools",
+            "finalizing": "finalizing",
+        }
+        phase_emojis = {
+            "starting": "🚀",
+            "thinking": "💡",
+            "tool": "🛠️",
+            "finalizing": "🧾",
+        }
+
+        def _push_recent_event(detail: str) -> None:
+            text = (detail or "").strip()
+            if not text:
+                return
+            ts = datetime.now().strftime("%H:%M:%S")
+            event_line = f"`{ts}` {text}"
+            recent_events = progress_state.setdefault("recent_events", [])
+            if recent_events and recent_events[-1] == event_line:
+                return
+            recent_events.append(event_line)
+            while len(recent_events) > progress_rolling_entries:
+                recent_events.pop(0)
+
+        def _set_progress_state(*, phase: str | None = None, detail: str | None = None, tool_call: bool = False):
+            if phase:
+                progress_state["phase"] = phase
+            if detail:
+                progress_state["last_detail"] = detail
+                _push_recent_event(detail)
+            if tool_call:
+                progress_state["tool_calls"] += 1
+            progress_state["updates"] += 1
+            if session_key:
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=True,
+                    phase=progress_state.get("phase", "thinking"),
+                    detail=progress_state.get("last_detail") or "Working...",
+                    tool_calls=progress_state.get("tool_calls", 0),
+                    updates=progress_state.get("updates", 0),
+                    recent_events=list(progress_state.get("recent_events") or []),
+                    started_at=progress_state.get("started_at"),
+                    error="",
+                )
+            if progress_queue:
+                progress_queue.put("__tick__")
+
+        def _build_progress_message() -> str:
+            elapsed = int(max(0, time.monotonic() - progress_state["started_at"]))
+            phase = progress_state.get("phase", "thinking")
+            pool = heartbeat_faces_by_phase.get(phase, heartbeat_faces_by_phase["default"])
+            face = pool[elapsed % len(pool)]
+            phase_text = phase_labels.get(phase, "working")
+            phase_emoji = phase_emojis.get(phase, "⚙️")
+            header = f"{phase_emoji} {face} Hermes is {phase_text}... ({elapsed}s)"
+            footer = f"Tools: {progress_state['tool_calls']} | Updates: {progress_state['updates']}"
+
+            events = list(progress_state.get("recent_events") or [])
+            if not events:
+                fallback = (progress_state.get("last_detail") or "Working...").strip()
+                events = [f"`{datetime.now().strftime('%H:%M:%S')}` {fallback}"]
+
+            def _render(lines: list[str]) -> str:
+                body = "\n".join(f"• {line}" for line in lines)
+                return f"{header}\n{body}\n{footer}"
+
+            msg = _render(events[-progress_rolling_entries:])
+            if len(msg) <= progress_embed_max_chars:
+                return msg
+
+            lines = events[-progress_rolling_entries:]
+            while len(lines) > 1:
+                lines = lines[1:]
+                msg = _render(lines)
+                if len(msg) <= progress_embed_max_chars:
+                    return msg
+
+            lone = lines[0] if lines else ""
+            overhead = len(f"{header}\n• \n{footer}")
+            available = max(80, progress_embed_max_chars - overhead)
+            if len(lone) > available:
+                lone = lone[: max(0, available - 24)] + "... [trimmed for embed]"
+            return _render([lone])
+
+        def _summarize_result_for_status(result_text: str, is_error: bool) -> str:
+            text = (result_text or "").strip()
+            if not text:
+                return ""
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return text if is_error else ""
+
+            if isinstance(parsed, dict):
+                parts: list[str] = []
+                if "exit_code" in parsed:
+                    parts.append(f"exit={parsed.get('exit_code')}")
+                err = parsed.get("error")
+                if err:
+                    parts.append(f"error={err}")
+                stderr = parsed.get("stderr")
+                if not err and is_error and isinstance(stderr, str) and stderr.strip():
+                    parts.append(f"stderr={stderr.strip()}")
+                if not parts and is_error:
+                    message_text = parsed.get("message")
+                    if isinstance(message_text, str) and message_text.strip():
+                        parts.append(message_text.strip())
+                return " | ".join(parts)
+            return text if is_error else ""
+
+        def progress_callback(tool_name: str, preview: str = None, args: dict = None):
             if not progress_queue:
                 return
-            
-            # "new" mode: only report when tool changes
+
+            # Tool completion event (emitted after each tool finishes).
+            if tool_name == "_tool_result":
+                payload = args or {}
+                completed_tool = str(payload.get("tool") or preview or "tool")
+                duration = payload.get("duration_seconds")
+                is_error = bool(payload.get("is_error"))
+                result_text = str(payload.get("result") or "").strip()
+                status_emoji = "❌" if is_error else "✅"
+                if isinstance(duration, (int, float)):
+                    duration_text = f" in {float(duration):.2f}s"
+                else:
+                    duration_text = ""
+                summary_suffix = _summarize_result_for_status(result_text, is_error)
+                done_msg = f"{status_emoji} {completed_tool} finished{duration_text}"
+                if summary_suffix:
+                    done_msg = f"{done_msg} | {summary_suffix}"
+                _set_progress_state(phase="tool", detail=done_msg, tool_call=False)
+
+                detail_payload = f"{status_emoji} RESULT {completed_tool}{duration_text}"
+                if result_text:
+                    detail_payload = f"{detail_payload}\n{result_text}"
+                ts = datetime.now().strftime("%H:%M:%S")
+                if detail_queue:
+                    detail_queue.put((ts, detail_payload))
+                _append_artifact(f"[{datetime.now().isoformat()}] {detail_payload}")
+                return
+
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
+
             tool_emojis = {
                 "terminal": "💻",
                 "process": "⚙️",
@@ -1749,6 +3681,7 @@ class GatewayRunner:
                 "write_file": "✍️",
                 "patch": "🔧",
                 "search": "🔎",
+                "search_files": "🔎",
                 "list_directory": "📂",
                 "image_generate": "🎨",
                 "text_to_speech": "🔊",
@@ -1774,72 +3707,191 @@ class GatewayRunner:
                 "schedule_cronjob": "⏰",
                 "list_cronjobs": "⏰",
                 "remove_cronjob": "⏰",
+                "execute_code": "🐍",
+                "delegate_task": "🔀",
+                "clarify": "❓",
+                "skill_manage": "📝",
+                "_thinking": "💡",
             }
             emoji = tool_emojis.get(tool_name, "⚙️")
-            
+
+            args_text = ""
+            if args:
+                try:
+                    args_text = json.dumps(args, ensure_ascii=False, default=str)
+                except Exception:
+                    args_text = str(args)
+
             if preview:
-                # Truncate preview to keep messages clean
-                if len(preview) > 40:
-                    preview = preview[:37] + "..."
-                msg = f"{emoji} {tool_name}... \"{preview}\""
+                msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
-            
-            progress_queue.put(msg)
-        
-        # Background task to send progress messages
+
+            live_detail = msg
+            if args_text and tool_name != "_thinking":
+                live_detail = f"{emoji} CALL {tool_name}\n{args_text}"
+
+            if tool_name == "_thinking":
+                _set_progress_state(phase="thinking", detail=f"💡 thinking: {preview or 'working...'}")
+            else:
+                _set_progress_state(phase="tool", detail=live_detail, tool_call=True)
+
+            detail_payload = msg
+            if args_text:
+                detail_payload = f"{emoji} CALL {tool_name}\n{args_text}"
+
+            if detail_queue:
+                ts = datetime.now().strftime("%H:%M:%S")
+                detail_queue.put((ts, detail_payload))
+            _append_artifact(f"[{datetime.now().isoformat()}] {detail_payload}")
+
         async def send_progress_messages():
             if not progress_queue:
                 return
-            
+
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
 
-            # Keep track of a single in-flight progress message so we can edit
-            # it in place instead of spamming the channel with many updates.
             progress_message_id: str | None = None
+            progress_thread_chat_id: str | None = None
+            thread_announced = False
+            thread_log_failed = False
+            thread_create_attempts = 0
+            detail_backlog: list[tuple[str, str]] = []
+            dropped_detail_entries = 0
+            last_heartbeat_at = 0.0
+            last_rendered = ""
 
             while True:
+                while True:
+                    try:
+                        progress_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                while detail_queue:
+                    try:
+                        entry = detail_queue.get_nowait()
+                        if isinstance(entry, tuple) and len(entry) == 2:
+                            ts, text = entry
+                        else:
+                            ts, text = datetime.now().strftime("%H:%M:%S"), str(entry)
+                        if len(detail_backlog) >= detail_backlog_max:
+                            dropped_detail_entries += 1
+                            continue
+                        detail_backlog.append((str(ts), str(text)))
+                    except queue.Empty:
+                        break
+                if dropped_detail_entries:
+                    note = (
+                        f"[{datetime.now().isoformat()}] "
+                        f"dropped_detail_entries={dropped_detail_entries} "
+                        f"(backlog_limit={detail_backlog_max})"
+                    )
+                    _append_artifact(note)
+                    dropped_detail_entries = 0
+
                 try:
-                    # Non-blocking check with small timeout
-                    msg = progress_queue.get_nowait()
-                    # For platforms that support edits (Discord/Telegram/etc.),
-                    # send the first progress message and then edit it in place
-                    # for subsequent updates. Fallback platforms will simply
-                    # get multiple messages.
-                    if progress_message_id is None:
-                        # First progress message: send normally
-                        result = await adapter.send(chat_id=source.chat_id, content=msg)
-                        if result and result.success and result.message_id:
-                            progress_message_id = result.message_id
-                    else:
-                        # Subsequent updates: try to edit the existing message
-                        try:
-                            await adapter.edit_message(
+                    now = time.monotonic()
+                    heartbeat_due = (now - last_heartbeat_at) >= 1.0
+
+                    msg = _build_progress_message()
+
+                    if heartbeat_due or msg != last_rendered:
+                        if progress_style == "single" and progress_message_id and hasattr(adapter, "edit_message"):
+                            try:
+                                await adapter.edit_message(
+                                    chat_id=source.chat_id,
+                                    message_id=progress_message_id,
+                                    content=msg,
+                                    include_listen_button=False,
+                                )
+                            except Exception:
+                                result = await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content=msg,
+                                    include_listen_button=False,
+                                )
+                                if result and result.success and result.message_id:
+                                    progress_message_id = result.message_id
+                        else:
+                            result = await adapter.send(
                                 chat_id=source.chat_id,
-                                message_id=progress_message_id,
                                 content=msg,
+                                include_listen_button=False,
                             )
-                        except Exception:
-                            # If edit fails (platform limitation or message gone),
-                            # fall back to a fresh message and track its ID.
-                            result = await adapter.send(chat_id=source.chat_id, content=msg)
-                            if result and result.success and result.message_id:
+                            if result and result.success and result.message_id and progress_style == "single":
                                 progress_message_id = result.message_id
-                    # Restore typing indicator after sending progress message
-                    await asyncio.sleep(0.3)
-                    await adapter.send_typing(source.chat_id)
-                except queue.Empty:
-                    await asyncio.sleep(0.3)  # Check again soon
+
+                        last_rendered = msg
+                        last_heartbeat_at = now
+                        await adapter.send_typing(source.chat_id)
+
+                    # Server-channel detailed logs: create thread from live status msg.
+                    if (
+                        thread_logs_enabled
+                        and not thread_log_failed
+                        and progress_thread_chat_id is None
+                        and progress_message_id
+                        and hasattr(adapter, "create_tool_log_thread")
+                    ):
+                        thread_create_attempts += 1
+                        title = f"Hermes Tool Log {datetime.now().strftime('%H:%M:%S')}"
+                        progress_thread_chat_id = await adapter.create_tool_log_thread(
+                            chat_id=source.chat_id,
+                            seed_message_id=progress_message_id,
+                            title=title,
+                        )
+                        if progress_thread_chat_id and not thread_announced:
+                            try:
+                                await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content=f"🧵 Detailed tool log: <#{progress_thread_chat_id}>",
+                                    include_listen_button=False,
+                                )
+                            except Exception:
+                                pass
+                            thread_announced = True
+                            _append_artifact(
+                                f"[{datetime.now().isoformat()}] thread_created={progress_thread_chat_id}"
+                            )
+                        elif (
+                            not progress_thread_chat_id
+                            and thread_create_attempts >= thread_create_max_attempts
+                        ):
+                            thread_log_failed = True
+                            _append_artifact(
+                                f"[{datetime.now().isoformat()}] "
+                                f"thread_create_failed attempts={thread_create_attempts}"
+                            )
+                            detail_backlog.clear()
+                            try:
+                                await adapter.send(
+                                    chat_id=source.chat_id,
+                                    content="⚠️ Detailed tool log thread unavailable for this run. "
+                                    "Progress is still shown here.",
+                                    include_listen_button=False,
+                                )
+                            except Exception:
+                                pass
+
+                    if detail_backlog:
+                        if progress_thread_chat_id:
+                                while detail_backlog:
+                                    ts, entry = detail_backlog.pop(0)
+                                    await adapter.send(
+                                        chat_id=progress_thread_chat_id,
+                                        content=f"`{ts}` {entry}",
+                                        include_listen_button=False,
+                                    )
+                        elif not thread_logs_enabled or thread_log_failed:
+                            detail_backlog.clear()
+
+                    await asyncio.sleep(0.2)
                 except asyncio.CancelledError:
-                    # Drain remaining messages
-                    while not progress_queue.empty():
-                        try:
-                            msg = progress_queue.get_nowait()
-                            await adapter.send(chat_id=source.chat_id, content=msg)
-                        except Exception:
-                            break
+                    if tool_log_path:
+                        _append_artifact(f"[{datetime.now().isoformat()}] finished")
+                        _append_artifact(f"log_file={tool_log_path}")
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -1870,6 +3922,9 @@ class GatewayRunner:
                 logger.debug("agent:step hook error: %s", _e)
 
         def run_sync():
+            if tool_progress_enabled:
+                _set_progress_state(phase="starting", detail="Preparing gateway session...")
+
             # Do NOT overwrite mode from config on every turn.
             # /terminal updates os.environ immediately; config is only persistence for restarts.
             if os.name == "nt":
@@ -1912,15 +3967,13 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
-            # keys may change without restart).
+            # keys may change without restart). Use encoding-safe loader.
             try:
-                load_dotenv(_env_path, override=True, encoding="utf-8")
-            except UnicodeDecodeError:
-                load_dotenv(_env_path, override=True, encoding="latin-1")
+                load_dotenv_with_fallback(_env_path, override=True, logger=logging.getLogger(__name__))
             except Exception:
                 pass
 
-            model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+            model = _resolve_gateway_model()
 
             try:
                 import yaml as _y
@@ -1928,11 +3981,6 @@ class GatewayRunner:
                 if _cfg_path.exists():
                     with open(_cfg_path, encoding="utf-8") as _f:
                         _cfg = _y.safe_load(_f) or {}
-                    _model_cfg = _cfg.get("model", {})
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
                     # Apply persisted terminal mode so /terminal choice wins over .env.
                     # Otherwise load_dotenv(override=True) can overwrite in-memory wsl with .env's value.
                     _shell = _cfg.get("HERMES_WINDOWS_SHELL")
@@ -1944,13 +3992,23 @@ class GatewayRunner:
             try:
                 runtime_kwargs = _resolve_runtime_agent_kwargs()
             except Exception as exc:
+                if tool_progress_enabled:
+                    _set_progress_state(
+                        phase="finalizing",
+                        detail=f"❌ provider auth/config error: {exc}",
+                        tool_call=False,
+                    )
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "session_id": session_id,
                 }
 
+            model = _resolve_gateway_runtime_model(runtime_kwargs.get("provider"))
+
+            pr = self._provider_routing
             agent = AIAgent(
                 model=model,
                 **runtime_kwargs,
@@ -1962,6 +4020,12 @@ class GatewayRunner:
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._prefill_messages or None,
                 reasoning_config=self._reasoning_config,
+                providers_allowed=pr.get("only"),
+                providers_ignored=pr.get("ignore"),
+                providers_order=pr.get("order"),
+                provider_sort=pr.get("sort"),
+                provider_require_parameters=pr.get("require_parameters", False),
+                provider_data_collection=pr.get("data_collection"),
                 session_id=session_id,
                 tool_progress_callback=progress_callback if tool_progress_enabled else None,
                 step_callback=_step_callback_sync if _hooks_ref.loaded_hooks else None,
@@ -2030,8 +4094,12 @@ class GatewayRunner:
                             if _p:
                                 _history_media_paths.add(_p)
             
+            if tool_progress_enabled:
+                _set_progress_state(phase="thinking", detail="Calling model...")
             result = agent.run_conversation(message, conversation_history=agent_history)
             result_holder[0] = result
+            if tool_progress_enabled:
+                _set_progress_state(phase="finalizing", detail="Preparing final response...")
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
@@ -2042,6 +4110,7 @@ class GatewayRunner:
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "tools": tools_holder[0] or [],
+                    "session_id": result.get("session_id") or getattr(agent, "session_id", session_id),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -2122,11 +4191,18 @@ class GatewayRunner:
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
+                "session_id": (
+                    result_holder[0].get("session_id")
+                    if isinstance(result_holder[0], dict)
+                    else getattr(agent, "session_id", session_id)
+                ),
+                "history_offset": len(agent_history),
             }
         
         # Start progress message sender if enabled
         progress_task = None
         if tool_progress_enabled:
+            _set_progress_state(phase="thinking", detail="Hermes is thinking...")
             progress_task = asyncio.create_task(send_progress_messages())
         
         # Track this agent as running for this session (for interrupt support)
@@ -2207,6 +4283,21 @@ class GatewayRunner:
             if progress_task:
                 progress_task.cancel()
             interrupt_monitor.cancel()
+
+            if session_key and session_key in self._browser_bridge_progress:
+                current = self._browser_bridge_progress.get(session_key, {})
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=False,
+                    phase=current.get("phase") or "done",
+                    detail=current.get("detail") or "Reply ready.",
+                    tool_calls=int(current.get("tool_calls") or 0),
+                    updates=max(1, int(current.get("updates") or 0)),
+                    recent_events=list(current.get("recent_events") or []),
+                    started_at=current.get("started_at"),
+                    completed_at=datetime.now().isoformat(),
+                    error=current.get("error") or "",
+                )
             
             # Clean up tracking
             tracking_task.cancel()
@@ -2298,9 +4389,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
         backupCount=3,
         encoding='utf-8',
     )
-    file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    from agent.redact import RedactingFormatter
+    file_handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
     logging.getLogger().addHandler(file_handler)
     logging.getLogger().setLevel(logging.INFO)
+
+    # Separate errors-only log for easy debugging
+    error_handler = RotatingFileHandler(
+        log_dir / 'errors.log',
+        maxBytes=2 * 1024 * 1024,
+        backupCount=2,
+    )
+    error_handler.setLevel(logging.WARNING)
+    error_handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    logging.getLogger().addHandler(error_handler)
 
     runner = GatewayRunner(config)
     
@@ -2349,7 +4451,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
     # Stop cron ticker cleanly
     cron_stop.set()
     cron_thread.join(timeout=5)
-    
+
+    # Close MCP server connections
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+        shutdown_mcp_servers()
+    except Exception:
+        pass
+
     return True
 
 

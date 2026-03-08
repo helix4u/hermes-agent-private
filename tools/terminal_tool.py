@@ -371,7 +371,9 @@ Do NOT use sed/awk to edit files — use patch instead.
 Do NOT use echo/cat heredoc to create files — use write_file instead.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 
-Background processes: Set background=true to get a session_id, then use the 'process' tool to poll/wait/kill/write.
+Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for everything that finishes.
+Background: ONLY for long-running servers, watchers, or processes that never exit. Set background=true to get a session_id, then use process(action="wait") to block until done — it returns instantly on completion, same as foreground. Use process(action="poll") only when you need a progress check without blocking.
+Do NOT use background for scripts, builds, or installs — foreground with a generous timeout is always better (fewer tool calls, instant results).
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
@@ -464,7 +466,7 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "cwd": cwd,
-        "timeout": int(os.getenv("TERMINAL_TIMEOUT", "60")),
+        "timeout": int(os.getenv("TERMINAL_TIMEOUT", "180")),
         "lifetime_seconds": int(os.getenv("TERMINAL_LIFETIME_SECONDS", "300")),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
@@ -665,19 +667,18 @@ def get_active_environments_info() -> Dict[str, Any]:
         "workdirs": {},
     }
     
-    # Calculate total disk usage
+    # Calculate total disk usage (per-task to avoid double-counting)
     total_size = 0
     for task_id in _active_environments.keys():
-        # Check sandbox and workdir sizes
         scratch_dir = _get_scratch_dir()
-        for pattern in [f"hermes-*{task_id[:8]}*"]:
-            import glob
-            for path in glob.glob(str(scratch_dir / "hermes-*")):
-                try:
-                    size = sum(f.stat().st_size for f in Path(path).rglob('*') if f.is_file())
-                    total_size += size
-                except OSError:
-                    pass
+        pattern = f"hermes-*{task_id[:8]}*"
+        import glob
+        for path in glob.glob(str(scratch_dir / pattern)):
+            try:
+                size = sum(f.stat().st_size for f in Path(path).rglob('*') if f.is_file())
+                total_size += size
+            except OSError:
+                pass
     
     info["total_disk_usage_mb"] = round(total_size / (1024 * 1024), 2)
     return info
@@ -1085,8 +1086,12 @@ def terminal_tool(
                 )
                 output = output[:head_chars] + truncated_notice + output[-tail_chars:]
 
+            # Redact secrets from command output (catches env/printenv leaking keys)
+            from agent.redact import redact_sensitive_text
+            output = redact_sensitive_text(output.strip()) if output else ""
+
             return json.dumps({
-                "output": output.strip() if output else "",
+                "output": output,
                 "exit_code": returncode,
                 "error": None
             }, ensure_ascii=False)
@@ -1199,12 +1204,12 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Whether to run the command in the background (default: false)",
+                "description": "ONLY for servers/watchers that never exit. For scripts, builds, installs — use foreground with timeout instead (it returns instantly when done).",
                 "default": False
             },
             "timeout": {
                 "type": "integer",
-                "description": "Command timeout in seconds (optional)",
+                "description": "Max seconds to wait (default: 180). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily.",
                 "minimum": 1
             },
             "workdir": {

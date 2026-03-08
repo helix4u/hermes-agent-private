@@ -8,9 +8,9 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 import json
 import logging
 import os
+from typing import List
 
 logger = logging.getLogger(__name__)
-
 
 SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
@@ -197,11 +197,18 @@ async def _send_discord(token, chat_id, message):
     try:
         url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-        chunks = [message[i:i+2000] for i in range(0, len(message), 2000)]
+        # Keep payloads aligned with gateway/platforms/discord.py behavior by
+        # sending embeds instead of plain content.
+        max_embed_description = 3800
+        chunks: List[str] = [
+            message[i:i + max_embed_description]
+            for i in range(0, len(message), max_embed_description)
+        ]
         message_ids = []
         async with aiohttp.ClientSession() as session:
             for chunk in chunks:
-                async with session.post(url, headers=headers, json={"content": chunk}) as resp:
+                payload = {"embeds": [{"description": chunk}]}
+                async with session.post(url, headers=headers, json=payload) as resp:
                     if resp.status not in (200, 201):
                         body = await resp.text()
                         return {"error": f"Discord API error ({resp.status}): {body}"}

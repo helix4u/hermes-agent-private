@@ -1,0 +1,1089 @@
+const DEFAULT_BRIDGE_URL = "http://127.0.0.1:8765/inject";
+const BRIDGE_TIMEOUT_MS = 12000;
+const TRANSCRIPT_STATE_KEY = "sharedTranscriptKeys";
+const CLIENT_SESSION_ID_KEY = "clientSessionId";
+const PRIMARY_BROWSER_LABEL = "Hermes Sidecar";
+const LEGACY_BROWSER_LABEL = "Chrome Extension";
+const ACTIVE_LABEL_KEY = "activeBrowserLabel";
+const PAGE_CONTEXT_CACHE_TTL_MS = 90000;
+const REQUIRED_HOST_ORIGINS = new Set([
+  "http://127.0.0.1/*",
+  "http://localhost/*",
+  "https://x.com/*",
+  "https://www.x.com/*",
+  "https://twitter.com/*",
+  "https://www.twitter.com/*",
+  "https://www.youtube.com/*",
+  "https://youtube.com/*"
+]);
+const pageContextCache = new Map();
+
+function cloneContext(value) {
+  try {
+    return JSON.parse(JSON.stringify(value || {}));
+  } catch (_error) {
+    return { ...(value || {}) };
+  }
+}
+
+function getTextLength(value) {
+  return String(value || "").length;
+}
+
+function withPageTextSource(context, sourceLabel) {
+  return {
+    ...context,
+    metadata: {
+      ...(context.metadata || {}),
+      pageTextSource: sourceLabel
+    }
+  };
+}
+
+function applySelectionFallback(context, sourceLabel = "selection-fallback-background") {
+  const pageTextLength = getTextLength(context?.pageText);
+  const selectionLength = getTextLength(context?.selection);
+  if (pageTextLength < 500 && selectionLength > pageTextLength + 300) {
+    return withPageTextSource(
+      {
+        ...context,
+        pageText: context.selection || ""
+      },
+      sourceLabel
+    );
+  }
+  return context;
+}
+
+function applyRenderedTextFallback(context, fallbackText, sourceLabel = "dom-fallback-background") {
+  const currentLength = getTextLength(context?.pageText);
+  const fallbackLength = getTextLength(fallbackText);
+  if (fallbackLength > currentLength) {
+    return withPageTextSource(
+      {
+        ...context,
+        pageText: String(fallbackText || "")
+      },
+      sourceLabel
+    );
+  }
+  return context;
+}
+
+function applyCachedContextFallback(context, cachedContext, sourceLabel = "preview-cache-fallback-background") {
+  if (!cachedContext) {
+    return context;
+  }
+
+  const currentPageTextLength = getTextLength(context?.pageText);
+  const cachedPageTextLength = getTextLength(cachedContext?.pageText);
+  let nextContext = context;
+
+  if (cachedPageTextLength > currentPageTextLength + 180) {
+    nextContext = withPageTextSource(
+      {
+        ...nextContext,
+        pageText: String(cachedContext.pageText || "")
+      },
+      sourceLabel
+    );
+  }
+
+  const currentSelectionLength = getTextLength(nextContext?.selection);
+  const cachedSelectionLength = getTextLength(cachedContext?.selection);
+  if (cachedSelectionLength > currentSelectionLength + 180) {
+    nextContext = {
+      ...nextContext,
+      selection: String(cachedContext.selection || "")
+    };
+  }
+
+  return nextContext;
+}
+
+function rememberPageContext(tabId, context) {
+  if (!tabId || !context) {
+    return;
+  }
+  const url = String(context.url || "").trim();
+  if (!url) {
+    return;
+  }
+  pageContextCache.set(String(tabId), {
+    capturedAt: Date.now(),
+    url,
+    context: cloneContext(context)
+  });
+}
+
+function readCachedPageContext(tabId, expectedUrl = "") {
+  if (!tabId) {
+    return null;
+  }
+  const cacheKey = String(tabId);
+  const entry = pageContextCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+  if (Date.now() - Number(entry.capturedAt || 0) > PAGE_CONTEXT_CACHE_TTL_MS) {
+    pageContextCache.delete(cacheKey);
+    return null;
+  }
+  if (expectedUrl && String(entry.url || "").trim() && String(entry.url || "").trim() !== String(expectedUrl || "").trim()) {
+    return null;
+  }
+  return cloneContext(entry.context || {});
+}
+
+function isRestrictedPageUrl(rawUrl) {
+  const value = String(rawUrl || "").trim().toLowerCase();
+  if (!value) {
+    return true;
+  }
+  return (
+    value.startsWith("chrome://") ||
+    value.startsWith("chrome-extension://") ||
+    value.startsWith("edge://") ||
+    value.startsWith("about:") ||
+    value.startsWith("devtools://") ||
+    value.startsWith("view-source:") ||
+    value.startsWith("chrome-search://") ||
+    value.startsWith("brave://") ||
+    value.startsWith("opera://") ||
+    value.startsWith("vivaldi://")
+  );
+}
+
+async function getTabSnapshot(tabId) {
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function resolveDomainAccessTarget(tab) {
+  const rawUrl = String(tab?.url || "");
+  if (!rawUrl) {
+    return {
+      supported: false,
+      reason: "No active tab URL is available yet."
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch (_error) {
+    return {
+      supported: false,
+      reason: "Current tab URL is not valid for permission checks."
+    };
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    return {
+      supported: false,
+      reason: "Only http/https pages can be granted or removed."
+    };
+  }
+
+  return {
+    supported: true,
+    tabTitle: tab?.title || "",
+    tabUrl: rawUrl,
+    hostname: parsed.hostname || "",
+    originPattern: `${parsed.origin}/*`
+  };
+}
+
+async function getDomainPermissionStatus(tabId) {
+  const tab = await getTabSnapshot(tabId);
+  const target = resolveDomainAccessTarget(tab);
+  if (!target.supported) {
+    return {
+      supported: false,
+      granted: false,
+      removable: false,
+      builtin: false,
+      hostname: "",
+      originPattern: "",
+      detail: target.reason
+    };
+  }
+
+  const granted = await chrome.permissions.contains({ origins: [target.originPattern] });
+  const builtin = REQUIRED_HOST_ORIGINS.has(target.originPattern);
+  const removable = Boolean(granted && !builtin);
+  let detail = "";
+  if (!granted) {
+    detail = `Not granted for ${target.hostname}`;
+  } else if (builtin) {
+    detail = `Built-in access for ${target.hostname}`;
+  } else {
+    detail = `Granted for ${target.hostname}`;
+  }
+
+  return {
+    supported: true,
+    granted,
+    removable,
+    builtin,
+    hostname: target.hostname,
+    originPattern: target.originPattern,
+    detail
+  };
+}
+
+async function setDomainPermission(tabId, grant) {
+  const tab = await getTabSnapshot(tabId);
+  const target = resolveDomainAccessTarget(tab);
+  if (!target.supported) {
+    throw new Error(target.reason || "Domain permission is not available on this tab.");
+  }
+
+  if (grant) {
+    const allowed = await chrome.permissions.request({ origins: [target.originPattern] });
+    if (!allowed) {
+      throw new Error("Domain permission request was not granted.");
+    }
+  } else {
+    const builtin = REQUIRED_HOST_ORIGINS.has(target.originPattern);
+    if (builtin) {
+      throw new Error("This domain is part of required extension access and cannot be removed.");
+    }
+    await chrome.permissions.remove({ origins: [target.originPattern] });
+  }
+
+  return getDomainPermissionStatus(tabId);
+}
+
+async function configureSidePanelBehavior() {
+  if (!chrome.sidePanel?.setPanelBehavior) {
+    return;
+  }
+  await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+}
+
+async function getSettings() {
+  return chrome.storage.sync.get({
+    bridgeUrl: DEFAULT_BRIDGE_URL,
+    bridgeToken: "",
+    includeTranscriptByDefault: true,
+    sharePageByDefault: true
+  });
+}
+
+async function setSettings(settings) {
+  await chrome.storage.sync.set(settings);
+}
+
+async function getClientSessionId() {
+  const stored = await chrome.storage.local.get({ [CLIENT_SESSION_ID_KEY]: "" });
+  let sessionId = stored[CLIENT_SESSION_ID_KEY] || "";
+  if (!sessionId) {
+    sessionId = crypto.randomUUID();
+    await chrome.storage.local.set({ [CLIENT_SESSION_ID_KEY]: sessionId });
+  }
+  return sessionId;
+}
+
+async function rotateClientSessionId() {
+  const sessionId = crypto.randomUUID();
+  await chrome.storage.local.set({ [CLIENT_SESSION_ID_KEY]: sessionId });
+  return sessionId;
+}
+
+async function getActiveBrowserLabel() {
+  const stored = await chrome.storage.local.get({ [ACTIVE_LABEL_KEY]: PRIMARY_BROWSER_LABEL });
+  const label = String(stored[ACTIVE_LABEL_KEY] || "").trim();
+  if (label) {
+    return label;
+  }
+  await chrome.storage.local.set({ [ACTIVE_LABEL_KEY]: PRIMARY_BROWSER_LABEL });
+  return PRIMARY_BROWSER_LABEL;
+}
+
+async function setActiveBrowserLabel(label) {
+  await chrome.storage.local.set({ [ACTIVE_LABEL_KEY]: label });
+}
+
+function resolveBridgeEndpoint(pathname, bridgeUrl) {
+  const url = new URL((bridgeUrl || DEFAULT_BRIDGE_URL).trim() || DEFAULT_BRIDGE_URL);
+  url.pathname = pathname;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+async function callBridge(pathname, { method = "POST", token = "", body } = {}) {
+  const settings = await getSettings();
+  const headers = {};
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), BRIDGE_TIMEOUT_MS);
+
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  let response;
+  try {
+    response = await fetch(resolveBridgeEndpoint(pathname, settings.bridgeUrl), {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`Bridge request timed out after ${BRIDGE_TIMEOUT_MS / 1000}s.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.ok === false) {
+    const message = data.error || `Bridge request failed with status ${response.status}.`;
+    throw new Error(message);
+  }
+  return data;
+}
+
+async function getTranscriptState() {
+  const stored = await chrome.storage.session.get({ [TRANSCRIPT_STATE_KEY]: {} });
+  return stored[TRANSCRIPT_STATE_KEY] || {};
+}
+
+async function markTranscriptShared(key) {
+  if (!key) {
+    return;
+  }
+  const state = await getTranscriptState();
+  state[key] = true;
+  await chrome.storage.session.set({ [TRANSCRIPT_STATE_KEY]: state });
+}
+
+function canRetryContentScript(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("receiving end does not exist") ||
+    message.includes("could not establish connection") ||
+    message.includes("extension context invalidated")
+  );
+}
+
+async function ensureContentScript(tabId) {
+  if (!chrome.scripting?.executeScript) {
+    return;
+  }
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content.js"]
+  });
+}
+
+async function captureRenderedPageTextFallback(tabId) {
+  if (!chrome.scripting?.executeScript) {
+    return "";
+  }
+
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const collapse = (text) => (text || "")
+          .replace(/\u00a0/g, " ")
+          .replace(/[ \t]+\n/g, "\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+        const clamp = (text, maxLength) => {
+          const value = collapse(text);
+          if (!value) {
+            return "";
+          }
+          if (value.length <= maxLength) {
+            return value;
+          }
+          return value.slice(0, maxLength).trim();
+        };
+
+        let host = "";
+        try {
+          host = new URL(window.location.href).hostname.toLowerCase();
+        } catch (_error) {
+          host = "";
+        }
+        const isX = host === "x.com" || host.endsWith(".x.com") || host === "twitter.com" || host.endsWith(".twitter.com");
+
+        const parts = [];
+        const seen = new Set();
+
+        if (isX) {
+          const tweetSelectors = [
+            "article[data-testid='tweet'] div[data-testid='tweetText']",
+            "article [data-testid='tweetText']",
+            "[data-testid='tweet'] [data-testid='tweetText']",
+            "article [lang]",
+            "[data-testid='tweet'] [lang]",
+            "article[data-testid='tweet']",
+            "[data-testid='tweet']"
+          ];
+          for (const sel of tweetSelectors) {
+            const nodes = document.querySelectorAll(sel);
+            for (const node of nodes) {
+              const text = clamp(node?.innerText || node?.textContent || "", 800);
+              if (!text || text.length < 25 || seen.has(text)) {
+                continue;
+              }
+              seen.add(text);
+              parts.push(text);
+              if (parts.length >= 20) {
+                break;
+              }
+            }
+            if (parts.length >= 20) {
+              break;
+            }
+          }
+        }
+
+        if (!parts.length) {
+          const roots = [
+            document.querySelector("[data-testid='primaryColumn']"),
+            document.querySelector("main"),
+            document.querySelector("[role='main']"),
+            document.body
+          ].filter(Boolean);
+          for (const root of roots) {
+            const text = clamp(root?.innerText || "", 14000);
+            if (!text) {
+              continue;
+            }
+            parts.push(text);
+            break;
+          }
+        }
+
+        return clamp(parts.join("\n\n"), 14000);
+      }
+    });
+    return String(result || "").trim();
+  } catch (_error) {
+    return "";
+  }
+}
+
+async function collectPageContextFallback(tabId) {
+  if (!chrome.scripting?.executeScript) {
+    throw new Error("Page context fallback is unavailable in this browser.");
+  }
+
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const collapse = (text) => (text || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/[ \t]+\n/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      const clamp = (text, maxLength) => {
+        const value = collapse(text);
+        if (!value) {
+          return "";
+        }
+        if (value.length <= maxLength) {
+          return value;
+        }
+        return value.slice(0, maxLength).trim();
+      };
+      const getMeta = (selectors) => {
+        for (const selector of selectors) {
+          const element = document.querySelector(selector);
+          const value = element?.content || element?.getAttribute?.("content") || "";
+          if (value && String(value).trim()) {
+            return String(value).trim();
+          }
+        }
+        return "";
+      };
+      let host = "";
+      let url = window.location.href;
+      let contentKind = "web-page";
+      try {
+        host = new URL(url).hostname.toLowerCase();
+      } catch (_error) {
+        host = "";
+      }
+      const isX = host === "x.com" || host.endsWith(".x.com") || host === "twitter.com" || host.endsWith(".twitter.com");
+      const isYoutubeWatch = /(^|\.)youtube\.com$/i.test(host) && window.location.pathname === "/watch";
+      if (isX) {
+        contentKind = "x-feed";
+      } else if (isYoutubeWatch) {
+        contentKind = "youtube-watch";
+      }
+
+      const selection = clamp(window.getSelection?.().toString() || "", 8000);
+      const parts = [];
+      const seen = new Set();
+
+      if (isX) {
+        const tweetSelectors = [
+          "article[data-testid='tweet'] div[data-testid='tweetText']",
+          "article [data-testid='tweetText']",
+          "[data-testid='tweet'] [data-testid='tweetText']",
+          "article [lang]",
+          "[data-testid='tweet'] [lang]",
+          "article[data-testid='tweet']",
+          "[data-testid='tweet']"
+        ];
+        for (const sel of tweetSelectors) {
+          const nodes = document.querySelectorAll(sel);
+          for (const node of nodes) {
+            const text = clamp(node?.innerText || node?.textContent || "", 800);
+            if (!text || text.length < 25 || seen.has(text)) {
+              continue;
+            }
+            seen.add(text);
+            parts.push(text);
+            if (parts.length >= 20) {
+              break;
+            }
+          }
+          if (parts.length >= 20) {
+            break;
+          }
+        }
+      }
+
+      if (!parts.length) {
+        const root =
+          document.querySelector("[data-testid='primaryColumn']") ||
+          document.querySelector("article") ||
+          document.querySelector("main") ||
+          document.querySelector("[role='main']") ||
+          document.body;
+        const rootText = clamp(root?.innerText || "", 14000);
+        if (rootText) {
+          parts.push(rootText);
+        }
+      }
+
+      return {
+        url,
+        title: clamp(document.title || "", 512),
+        description: clamp(getMeta([
+          "meta[name='description']",
+          "meta[property='og:description']",
+          "meta[name='twitter:description']"
+        ]), 2000),
+        canonicalUrl: String(document.querySelector("link[rel='canonical']")?.href || "").trim(),
+        siteName: getMeta([
+          "meta[property='og:site_name']",
+          "meta[name='application-name']"
+        ]),
+        selection,
+        pageText: clamp(parts.join("\n\n"), 14000),
+        contentKind,
+        metadata: {
+          author: getMeta([
+            "meta[name='author']",
+            "meta[property='article:author']",
+            "meta[itemprop='author']"
+          ]),
+          timelineItems: isX ? document.querySelectorAll("article").length : undefined
+        },
+        transcript: {
+          available: false,
+          shared: false,
+          sharedPreviously: false,
+          source: "",
+          key: ""
+        }
+      };
+    }
+  });
+
+  return result || {
+    url: "",
+    title: "",
+    description: "",
+    canonicalUrl: "",
+    siteName: "",
+    selection: "",
+    pageText: "",
+    contentKind: "web-page",
+    metadata: {},
+    transcript: {
+      available: false,
+      shared: false,
+      sharedPreviously: false,
+      source: "",
+      key: ""
+    }
+  };
+}
+
+async function requestPageContext(tabId, includeTranscriptText, waitForHydration = false) {
+  return chrome.tabs.sendMessage(tabId, {
+    type: "hermes:collect-page-context",
+    includeTranscriptText: Boolean(includeTranscriptText),
+    waitForHydration: Boolean(waitForHydration)
+  });
+}
+
+async function collectPageContext(tabId, includeTranscriptText, waitForHydration = false) {
+  try {
+    const result = await requestPageContext(tabId, includeTranscriptText, waitForHydration);
+    if (result?.error) {
+      throw new Error(result.error);
+    }
+    return result;
+  } catch (error) {
+    if (canRetryContentScript(error)) {
+      try {
+        await ensureContentScript(tabId);
+        const retried = await requestPageContext(tabId, includeTranscriptText, waitForHydration);
+        if (retried?.error) {
+          throw new Error(retried.error);
+        }
+        return retried;
+      } catch (_retryError) {
+        return collectPageContextFallback(tabId);
+      }
+    }
+    return collectPageContextFallback(tabId);
+  }
+}
+
+async function previewPageContext(tabId) {
+  const tab = await getTabSnapshot(tabId);
+  const tabUrl = String(tab?.url || "");
+  if (isRestrictedPageUrl(tab?.url || "")) {
+    pageContextCache.delete(String(tabId || ""));
+    return {
+      title: tab?.title || "Internal browser page",
+      url: tab?.url || "",
+      contentKind: "restricted-page",
+      selectionLength: 0,
+      pageTextLength: 0,
+      transcriptAvailable: false,
+      transcriptAlreadyShared: false,
+      transcriptLanguage: "",
+      transcriptKey: "",
+      unavailableReason: "This tab is a browser internal page and cannot be shared."
+    };
+  }
+
+  let context = await collectPageContext(tabId, false, false);
+  if ((context.pageText || "").length < 300) {
+    const retried = await collectPageContext(tabId, false, true);
+    if ((retried.pageText || "").length > (context.pageText || "").length) {
+      context = retried;
+    }
+  }
+  context = applySelectionFallback(context, "selection-fallback-background");
+  if ((context.pageText || "").length < 300) {
+    const fallbackText = await captureRenderedPageTextFallback(tabId);
+    context = applyRenderedTextFallback(context, fallbackText, "dom-fallback-preview");
+  }
+  const cachedContext = readCachedPageContext(tabId, tabUrl || context.url || "");
+  context = applyCachedContextFallback(context, cachedContext, "preview-cache-fallback-background");
+  rememberPageContext(tabId, context);
+
+  const transcript = context.transcript || {};
+  const state = await getTranscriptState();
+  const transcriptKey = transcript.key || "";
+  return {
+    title: context.title || "",
+    url: context.url || "",
+    contentKind: context.contentKind || "",
+    selectionLength: (context.selection || "").length,
+    pageTextLength: (context.pageText || "").length,
+    transcriptAvailable: Boolean(transcript.available),
+    transcriptAlreadyShared: Boolean(transcriptKey && state[transcriptKey]),
+    transcriptLanguage: transcript.language || "",
+    transcriptKey
+  };
+}
+
+async function buildPageContextPayload(tabId, message, includeTranscript, browserLabel) {
+  const tab = await getTabSnapshot(tabId);
+  const tabUrl = String(tab?.url || "");
+  if (isRestrictedPageUrl(tab?.url || "")) {
+    throw new Error(
+      "Cannot use current page context on this browser-internal tab. " +
+      "Switch to a normal webpage or turn off \"Use the current page in this turn\"."
+    );
+  }
+
+  const preview = await previewPageContext(tabId);
+  const cachedPreviewContext = readCachedPageContext(tabId, tabUrl || preview.url || "");
+  const shouldIncludeTranscript =
+    Boolean(includeTranscript) &&
+    preview.transcriptAvailable &&
+    !preview.transcriptAlreadyShared;
+
+  let context = await collectPageContext(tabId, shouldIncludeTranscript, true);
+  context = applySelectionFallback(context, "selection-fallback-background");
+  if ((context.pageText || "").length < 220) {
+    const retried = await collectPageContext(tabId, shouldIncludeTranscript, true);
+    const promotedRetried = applySelectionFallback(retried, "selection-fallback-background");
+    if ((promotedRetried.pageText || "").length > (context.pageText || "").length) {
+      context = promotedRetried;
+    } else if ((retried.pageText || "").length > (context.pageText || "").length) {
+      context = retried;
+    }
+  }
+  if ((context.pageText || "").length < 220) {
+    const fallbackText = await captureRenderedPageTextFallback(tabId);
+    context = applyRenderedTextFallback(context, fallbackText, "dom-fallback-background");
+  }
+  context = applyCachedContextFallback(context, cachedPreviewContext, "preview-cache-fallback-background");
+
+  const previewPageTextLength = Number(preview.pageTextLength || 0);
+  const preparedPageTextLength = getTextLength(context.pageText);
+  if (previewPageTextLength > 900 && preparedPageTextLength + 300 < previewPageTextLength) {
+    const fallbackText = await captureRenderedPageTextFallback(tabId);
+    context = applyRenderedTextFallback(context, fallbackText, "dom-fallback-send");
+    context = applyCachedContextFallback(context, cachedPreviewContext, "preview-cache-fallback-background");
+  }
+
+  const finalPreparedPageTextLength = getTextLength(context.pageText);
+  if (previewPageTextLength > 900 && finalPreparedPageTextLength + 300 < previewPageTextLength) {
+    throw new Error(
+      `Prepared ${finalPreparedPageTextLength} chars of page text, but preview showed ${previewPageTextLength}. ` +
+      "Refresh page context and send again."
+    );
+  }
+  rememberPageContext(tabId, context);
+
+  const contextKind = String(context.contentKind || "");
+  const selectionLength = (context.selection || "").length;
+  const pageTextLength = (context.pageText || "").length;
+  if (contextKind === "x-feed" && pageTextLength < 300 && selectionLength < 300) {
+    throw new Error(
+      "Could not capture enough rendered X timeline text yet. " +
+      "Scroll briefly to let the feed hydrate, then send again."
+    );
+  }
+
+  const transcript = context.transcript || {};
+  return {
+    preview,
+    payload: {
+      ...context,
+      note: message || "",
+      browserLabel: browserLabel || PRIMARY_BROWSER_LABEL,
+      clientSessionId: await getClientSessionId(),
+      transcript: {
+        ...transcript,
+        shared: Boolean(shouldIncludeTranscript && transcript.text),
+        sharedPreviously: Boolean(preview.transcriptAlreadyShared)
+      }
+    }
+  };
+}
+
+async function getBridgeToken() {
+  const settings = await getSettings();
+  const token = (settings.bridgeToken || "").trim();
+  if (!token) {
+    throw new Error("Add your browser bridge token in the extension settings before sending.");
+  }
+  return token;
+}
+
+async function loadChatSession(sessionKey = "") {
+  const token = await getBridgeToken();
+  const clientSessionId = await getClientSessionId();
+  const normalizedSessionKey = String(sessionKey || "").trim();
+
+  const requestState = async (label) => callBridge("/session", {
+    token,
+    body: {
+      action: "state",
+      browserLabel: label,
+      clientSessionId,
+      sessionKey: normalizedSessionKey || undefined
+    }
+  });
+
+  if (normalizedSessionKey) {
+    return requestState(await getActiveBrowserLabel());
+  }
+
+  const hasActivity = (result) =>
+    (Array.isArray(result?.messages) && result.messages.length > 0) ||
+    Boolean(result?.progress?.running) ||
+    Boolean(result?.progress?.error);
+
+  const activeLabel = await getActiveBrowserLabel();
+  const primaryResult = await requestState(activeLabel);
+  if (hasActivity(primaryResult)) {
+    return primaryResult;
+  }
+
+  const fallbackLabel = activeLabel === PRIMARY_BROWSER_LABEL ? LEGACY_BROWSER_LABEL : PRIMARY_BROWSER_LABEL;
+  const fallbackResult = await requestState(fallbackLabel);
+  if (hasActivity(fallbackResult)) {
+    await setActiveBrowserLabel(fallbackLabel);
+    return fallbackResult;
+  }
+
+  return primaryResult;
+}
+
+async function listChatSessions(limit = 25, sessionKey = "") {
+  const token = await getBridgeToken();
+  const clientSessionId = await getClientSessionId();
+  const browserLabel = await getActiveBrowserLabel();
+  try {
+    return await callBridge("/session", {
+      token,
+      body: {
+        action: "list",
+        browserLabel,
+        clientSessionId,
+        sessionKey: String(sessionKey || "").trim() || undefined,
+        limit
+      }
+    });
+  } catch (error) {
+    const message = String(error?.message || error || "");
+    if (!message.includes("Unsupported browser bridge action: list")) {
+      throw error;
+    }
+    const state = await loadChatSession(String(sessionKey || "").trim());
+    return {
+      ...state,
+      active_session_key: state.session_key || "",
+      sessions: state.session_key
+        ? [{
+            session_key: state.session_key,
+            session_id: state.session_id || "",
+            browser_label: browserLabel,
+            updated_at: new Date().toISOString(),
+            created_at: "",
+            message_count: Array.isArray(state.messages) ? state.messages.length : 0,
+            last_message_role: "",
+            last_message_preview: "",
+            running: Boolean(state.progress?.running)
+          }]
+        : []
+    };
+  }
+}
+
+async function resetChatSession(sessionKey = "", createNew = false) {
+  const token = await getBridgeToken();
+  let clientSessionId = await getClientSessionId();
+  const normalizedSessionKey = createNew ? "" : String(sessionKey || "").trim();
+  if (createNew) {
+    clientSessionId = await rotateClientSessionId();
+  }
+  if (!normalizedSessionKey) {
+    await setActiveBrowserLabel(PRIMARY_BROWSER_LABEL);
+  }
+  return callBridge("/session", {
+    token,
+    body: {
+      action: "reset",
+      browserLabel: PRIMARY_BROWSER_LABEL,
+      clientSessionId,
+      sessionKey: normalizedSessionKey || undefined
+    }
+  });
+}
+
+async function startChatMessage(tabId, message, sharePage, includeTranscript, sessionKey = "") {
+  const token = await getBridgeToken();
+  const clientSessionId = await getClientSessionId();
+  const browserLabel = await getActiveBrowserLabel();
+  const normalizedSessionKey = String(sessionKey || "").trim();
+  const body = {
+    action: "send_async",
+    browserLabel,
+    clientSessionId,
+    message: message || "",
+    sessionKey: normalizedSessionKey || undefined
+  };
+
+  let preview = null;
+  let sentSelectionLength = 0;
+  let sentPageTextLength = 0;
+  if (sharePage) {
+    const pageContext = await buildPageContextPayload(tabId, message, includeTranscript, browserLabel);
+    body.pageContext = pageContext.payload;
+    preview = pageContext.preview;
+    sentSelectionLength = String(pageContext.payload.selection || "").length;
+    sentPageTextLength = String(pageContext.payload.pageText || "").length;
+    console.debug(
+      "[Hermes] Sending page context: pageText=" + sentPageTextLength + " chars, selection=" + sentSelectionLength + " chars, url=" + (pageContext.payload.url || "")
+    );
+  }
+
+  const data = await callBridge("/session", {
+    token,
+    body
+  });
+
+  const transcript = body.pageContext?.transcript || {};
+  if (transcript.shared && transcript.key) {
+    await markTranscriptShared(transcript.key);
+  }
+
+  return {
+    ...data,
+    preview,
+    sent_selection_length: sentSelectionLength,
+    sent_page_text_length: sentPageTextLength
+  };
+}
+
+async function injectPageContext(tabId, note, includeTranscript) {
+  const token = await getBridgeToken();
+  const browserLabel = await getActiveBrowserLabel();
+  const pageContext = await buildPageContextPayload(tabId, note, includeTranscript, browserLabel);
+  const data = await callBridge("/inject", {
+    token,
+    body: pageContext.payload
+  });
+
+  const transcript = pageContext.payload.transcript || {};
+  if (transcript.shared && transcript.key) {
+    await markTranscriptShared(transcript.key);
+  }
+
+  return {
+    ...data,
+    preview: pageContext.preview
+  };
+}
+
+async function checkBridgeHealth() {
+  const settings = await getSettings();
+  const response = await fetch(resolveBridgeEndpoint("/health", settings.bridgeUrl), { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`Health check failed with status ${response.status}.`);
+  }
+  return response.json();
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  configureSidePanelBehavior().catch((error) => {
+    console.debug("Hermes extension: failed to configure side panel behavior", error);
+  });
+});
+
+chrome.runtime.onStartup?.addListener(() => {
+  configureSidePanelBehavior().catch((error) => {
+    console.debug("Hermes extension: failed to restore side panel behavior", error);
+  });
+});
+
+chrome.action.onClicked.addListener(async (tab) => {
+  if (!chrome.sidePanel?.open || !tab?.windowId) {
+    return;
+  }
+  try {
+    await chrome.sidePanel.open({ windowId: tab.windowId });
+  } catch (error) {
+    console.debug("Hermes extension: failed to open side panel", error);
+  }
+});
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  (async () => {
+    if (message.type === "hermes:get-settings") {
+      sendResponse({ ok: true, settings: await getSettings() });
+      return;
+    }
+
+    if (message.type === "hermes:save-settings") {
+      await setSettings(message.settings || {});
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "hermes:preview-page-context") {
+      const result = await previewPageContext(message.tabId);
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:get-domain-permission-status") {
+      const result = await getDomainPermissionStatus(message.tabId);
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:set-domain-permission") {
+      const result = await setDomainPermission(message.tabId, Boolean(message.grant));
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:inject-page-context") {
+      const result = await injectPageContext(
+        message.tabId,
+        message.note || "",
+        message.includeTranscript
+      );
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:get-chat-session") {
+      const result = await loadChatSession(message.sessionKey || "");
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:list-chat-sessions") {
+      const result = await listChatSessions(message.limit || 25, message.sessionKey || "");
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:start-chat-message" || message.type === "hermes:send-chat-message") {
+      const result = await startChatMessage(
+        message.tabId,
+        message.message || "",
+        message.sharePage,
+        message.includeTranscript,
+        message.sessionKey || ""
+      );
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:reset-chat-session") {
+      const result = await resetChatSession(
+        message.sessionKey || "",
+        Boolean(message.createNew)
+      );
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:check-bridge-health") {
+      const result = await checkBridgeHealth();
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    sendResponse({ ok: false, error: "Unknown message type." });
+  })().catch((error) => {
+    sendResponse({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+
+  return true;
+});

@@ -2,17 +2,8 @@
 """
 Session Search Tool - Long-Term Conversation Recall
 
-Searches past session transcripts in SQLite via FTS5, then summarizes the top
-matching sessions using a cheap/fast model (same pattern as web_extract).
-Returns focused summaries of past conversations rather than raw transcripts,
-keeping the main model's context window clean.
-
-Flow:
-  1. FTS5 search finds matching messages ranked by relevance
-  2. Groups by session, takes the top N unique sessions (default 3)
-  3. Loads each session's conversation, truncates to ~100k chars centered on matches
-  4. Sends to Gemini Flash with a focused summarization prompt
-  5. Returns per-session summaries with metadata
+Searches past session transcripts in SQLite via FTS5, then returns either raw
+conversation transcripts or concise session summaries, depending on caller intent.
 """
 
 import asyncio
@@ -20,34 +11,29 @@ import concurrent.futures
 import json
 import os
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 
 from openai import AsyncOpenAI, OpenAI
 
-from agent.auxiliary_client import get_text_auxiliary_client
+from agent.auxiliary_client import get_async_text_auxiliary_client
 
-# Resolve the auxiliary client at import time so we have the model slug.
-# We build an AsyncOpenAI from the same credentials for async summarization.
-_aux_client, _SUMMARIZER_MODEL = get_text_auxiliary_client()
-_async_aux_client: AsyncOpenAI | None = None
-if _aux_client is not None:
-    _async_kwargs = {
-        "api_key": _aux_client.api_key,
-        "base_url": str(_aux_client.base_url),
-    }
-    if "openrouter" in str(_aux_client.base_url).lower():
-        _async_kwargs["default_headers"] = {
-            "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
-            "X-OpenRouter-Title": "Hermes Agent",
-                "X-OpenRouter-Categories": "productivity,cli-agent",
-        }
-    _async_aux_client = AsyncOpenAI(**_async_kwargs)
+# Resolve the async auxiliary client at import time so we have the model slug.
+# Handles Codex Responses API adapter transparently.
+_async_aux_client, _SUMMARIZER_MODEL = get_async_text_auxiliary_client()
 MAX_SESSION_CHARS = 100_000
-MAX_SUMMARY_TOKENS = 2000
+MAX_SUMMARY_TOKENS = 10000
 
 
-def _format_timestamp(ts) -> str:
-    """Convert a Unix timestamp (float/int) or ISO string to a human-readable date."""
+def _format_timestamp(ts: Optional[Any]) -> str:
+    """
+    Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
+    
+    Args:
+        ts: Unix timestamp (int/float), ISO string, or None
+        
+    Returns:
+        Human-readable date string or "unknown" if conversion fails
+    """
     if ts is None:
         return "unknown"
     try:
@@ -61,8 +47,11 @@ def _format_timestamp(ts) -> str:
                 dt = datetime.fromtimestamp(float(ts))
                 return dt.strftime("%B %d, %Y at %I:%M %p")
             return ts
-    except Exception:
-        pass
+    except (ValueError, OSError, OverflowError) as e:
+        # Log specific errors for debugging while gracefully handling edge cases
+        logging.debug("Failed to format timestamp %s: %s", ts, e)
+    except Exception as e:
+        logging.debug("Unexpected error formatting timestamp %s: %s", ts, e)
     return str(ts)
 
 
@@ -98,6 +87,25 @@ def _format_conversation(messages: List[Dict[str, Any]]) -> str:
             parts.append(f"[{role}]: {content}")
 
     return "\n\n".join(parts)
+
+
+def _serialize_raw_conversation(messages: List[Dict[str, Any]]) -> str:
+    """Return an unmangled transcript payload for direct review."""
+    try:
+        return json.dumps(messages, ensure_ascii=False)
+    except TypeError:
+        # Fallback for unexpected payload types in legacy transcript rows.
+        sanitized = []
+        for msg in messages:
+            sanitized_msg = {}
+            if isinstance(msg, dict):
+                for key, value in msg.items():
+                    if isinstance(value, (bytes, bytearray)):
+                        sanitized_msg[key] = value.decode("utf-8", errors="replace")
+                    else:
+                        sanitized_msg[key] = value
+            sanitized.append(sanitized_msg)
+        return json.dumps(sanitized, ensure_ascii=False, default=str)
 
 
 def _truncate_around_matches(
@@ -195,12 +203,15 @@ def session_search(
     query: str,
     role_filter: str = None,
     limit: int = 3,
+    return_raw: bool = True,
     db=None,
+    current_session_id: str = None,
 ) -> str:
     """
-    Search past sessions and return focused summaries of matching conversations.
+    Search past sessions and return focused summaries or raw transcripts.
 
-    Uses FTS5 to find matches, then summarizes the top sessions with Gemini Flash.
+    The current session is excluded from results since the agent already
+    has that context.
     """
     if db is None:
         return json.dumps({"success": False, "error": "Session database not available."}, ensure_ascii=False)
@@ -236,26 +247,44 @@ def session_search(
 
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
-        def _resolve_to_parent(session_id):
+        def _resolve_to_parent(session_id: str) -> Optional[str]:
+            """
+            Resolve a session ID to its parent session ID, handling delegation chains.
+            
+            Args:
+                session_id: The session ID to resolve
+                
+            Returns:
+                Parent session ID or None if resolution fails
+            """
             visited = set()
             sid = session_id
             while sid and sid not in visited:
                 visited.add(sid)
-                session = db.get_session(sid)
-                if not session:
-                    break
-                parent = session.get("parent_session_id")
-                if parent:
-                    sid = parent
-                else:
+                try:
+                    session = db.get_session(sid)
+                    if not session:
+                        break
+                    parent = session.get("parent_session_id")
+                    if parent:
+                        sid = parent
+                    else:
+                        break
+                except Exception as e:
+                    logging.debug("Error resolving parent for session %s: %s", sid, e)
                     break
             return sid
 
-        # Group by resolved (parent) session_id, dedup
+        # Group by resolved (parent) session_id, dedup, skip current session
         seen_sessions = {}
         for result in raw_results:
             raw_sid = result["session_id"]
             resolved_sid = _resolve_to_parent(raw_sid)
+            # Skip the current session — the agent already has that context
+            if current_session_id and resolved_sid == current_session_id:
+                continue
+            if current_session_id and raw_sid == current_session_id:
+                continue
             if resolved_sid not in seen_sessions:
                 result = dict(result)
                 result["session_id"] = resolved_sid
@@ -263,22 +292,55 @@ def session_search(
             if len(seen_sessions) >= limit:
                 break
 
-        # Prepare all sessions for parallel summarization
+        # Prepare session payloads. Raw mode returns original-like transcript JSON.
         tasks = []
+        results = []
         for session_id, match_info in seen_sessions.items():
             try:
                 messages = db.get_messages_as_conversation(session_id)
                 if not messages:
                     continue
                 session_meta = db.get_session(session_id) or {}
+                if return_raw:
+                    raw_payload = _serialize_raw_conversation(messages)
+                    raw_payload = _truncate_around_matches(raw_payload, query)
+                    results.append({
+                        "session_id": session_id,
+                        "when": _format_timestamp(match_info.get("session_started")),
+                        "source": match_info.get("source", "unknown"),
+                        "model": match_info.get("model"),
+                        "raw_transcript": raw_payload,
+                    })
+                    continue
+
                 conversation_text = _format_conversation(messages)
                 conversation_text = _truncate_around_matches(conversation_text, query)
                 tasks.append((session_id, match_info, conversation_text, session_meta))
             except Exception as e:
                 logging.warning(f"Failed to prepare session {session_id}: {e}")
 
+        if return_raw:
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "results": results,
+                "count": len(results),
+                "sessions_searched": len(seen_sessions),
+            }, ensure_ascii=False)
+
+        if _async_aux_client is None or _SUMMARIZER_MODEL is None:
+            return json.dumps({
+                "success": False,
+                "query": query,
+                "error": "No auxiliary model available for session summarization.",
+                "results": [],
+                "count": 0,
+                "sessions_searched": len(seen_sessions),
+            }, ensure_ascii=False)
+
         # Summarize all sessions in parallel
-        async def _summarize_all():
+        async def _summarize_all() -> List[Union[str, Exception]]:
+            """Summarize all sessions in parallel."""
             coros = [
                 _summarize_session(text, query, meta)
                 for _, _, text, meta in tasks
@@ -290,7 +352,14 @@ def session_search(
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 results = pool.submit(lambda: asyncio.run(_summarize_all())).result(timeout=60)
         except RuntimeError:
+            # No event loop running, create a new one
             results = asyncio.run(_summarize_all())
+        except concurrent.futures.TimeoutError:
+            logging.warning("Session summarization timed out after 60 seconds")
+            return json.dumps({
+                "success": False,
+                "error": "Session summarization timed out. Try a more specific query or reduce the limit.",
+            }, ensure_ascii=False)
 
         summaries = []
         for (session_id, match_info, _, _), result in zip(tasks, results):
@@ -319,9 +388,7 @@ def session_search(
 
 
 def check_session_search_requirements() -> bool:
-    """Requires SQLite state database and an auxiliary text model."""
-    if _async_aux_client is None:
-        return False
+    """Requires a local conversation database."""
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()
@@ -333,7 +400,8 @@ SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
         "Search your long-term memory of past conversations. This is your recall -- "
-        "every past session is searchable, and this tool summarizes what happened.\n\n"
+        "every past session is searchable, and this tool can return either raw "
+        "transcripts or concise summaries.\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
@@ -346,7 +414,8 @@ SESSION_SEARCH_SCHEMA = {
         "phrases for exact match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
         "IMPORTANT: Use OR between keywords for best results — FTS5 defaults to AND which misses "
         "sessions that only mention some terms. If a broad OR query returns nothing, try individual "
-        "keyword searches in parallel. Returns summaries of the top matching sessions."
+        "keyword searches in parallel. By default it returns raw, unprocessed "
+        "transcripts for review."
     ),
     "parameters": {
         "type": "object",
@@ -361,8 +430,16 @@ SESSION_SEARCH_SCHEMA = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Max sessions to summarize (default: 3, max: 5).",
+                "description": "Max sessions to return (default: 3, max: 5).",
                 "default": 3,
+            },
+            "return_raw": {
+                "type": "boolean",
+                "description": (
+                    "If true (default), return raw transcript JSON with no LLM "
+                    "summarization so the review context remains intact."
+                ),
+                "default": True,
             },
         },
         "required": ["query"],
@@ -381,6 +458,8 @@ registry.register(
         query=args.get("query", ""),
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
-        db=kw.get("db")),
+        return_raw=args.get("return_raw", True),
+        db=kw.get("db"),
+        current_session_id=kw.get("current_session_id")),
     check_fn=check_session_search_requirements,
 )
