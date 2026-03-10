@@ -171,6 +171,16 @@ def test_resolve_provider_explicit_codex_does_not_fallback(monkeypatch):
     assert resolve_provider("openai-codex") == "openai-codex"
 
 
+def test_resolve_provider_auto_keeps_active_codex_selection_even_if_status_looks_bad(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-should-not-win")
+    monkeypatch.setattr("hermes_cli.auth.get_auth_status", lambda provider_id=None: {"logged_in": False})
+
+    assert resolve_provider("auto") == "openai-codex"
+
+
 def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)

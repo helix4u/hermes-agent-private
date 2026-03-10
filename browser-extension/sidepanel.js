@@ -65,6 +65,7 @@ let sidebarSettings = {
 };
 let sessionHistoryByKey = new Map();
 let selectedSessionCanSend = true;
+let extensionContextInvalidated = false;
 
 function compactStatusText(
   message,
@@ -425,8 +426,8 @@ function renderPromptControls() {
     String(sidebarSettings.challengeModePrompt || "").trim().length > 0;
 
   if (quickPromptsLabel) {
-    quickPromptsLabel.hidden = !(showQuickPrompts || showChallengeMode);
-    quickPromptsLabel.style.display = showQuickPrompts || showChallengeMode ? "" : "none";
+    quickPromptsLabel.hidden = !showQuickPrompts;
+    quickPromptsLabel.style.display = showQuickPrompts ? "" : "none";
   }
 
   if (challengeModeButton) {
@@ -632,6 +633,57 @@ function stopPolling() {
   }
 }
 
+function stopPreviewLoop() {
+  if (previewTimer) {
+    clearInterval(previewTimer);
+    previewTimer = null;
+  }
+}
+
+function isExtensionContextInvalidated(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("extension context invalidated") ||
+    message.includes("context invalidated") ||
+    message.includes("message port closed before a response was received")
+  );
+}
+
+function getExtensionContextInvalidatedMessage() {
+  return (
+    "Hermes Sidecar was reloaded or updated. Reload the side panel to reconnect."
+  );
+}
+
+function handleExtensionContextInvalidated(error, { openActivity = true } = {}) {
+  const message = getExtensionContextInvalidatedMessage(error);
+  extensionContextInvalidated = true;
+  stopPolling();
+  stopPreviewLoop();
+  previewInFlight = false;
+  pendingUserMessage = null;
+  isBusy = false;
+  selectedSessionCanSend = false;
+  updateComposerAvailability();
+  renderUnavailablePreview(message);
+  renderChatNotice("Reload the Hermes side panel to resume this browser-side session.");
+  if (sessionHistorySelect) {
+    sessionHistorySelect.disabled = true;
+  }
+  if (refreshSessionsButton) {
+    refreshSessionsButton.disabled = true;
+  }
+  if (resetChatButton) {
+    resetChatButton.disabled = true;
+  }
+  renderDomainPermissionStatus({
+    supported: false,
+    detail: message
+  });
+  setStatus(message, { openActivity });
+  return message;
+}
+
 function schedulePolling() {
   stopPolling();
   pollTimer = setTimeout(() => {
@@ -644,20 +696,42 @@ function schedulePolling() {
 }
 
 function startPreviewLoop() {
-  if (previewTimer) {
-    clearInterval(previewTimer);
+  if (extensionContextInvalidated) {
+    stopPreviewLoop();
+    return;
   }
+  stopPreviewLoop();
   previewTimer = setInterval(() => {
     refreshPreview({ quiet: true }).catch((error) => {
-      setStatus(error.message || String(error), { openActivity: true });
+      const message = isExtensionContextInvalidated(error)
+        ? handleExtensionContextInvalidated(error)
+        : explainBackgroundMismatch(error);
+      setStatus(message, { openActivity: true });
     });
   }, AUTO_REFRESH_MS);
 }
 
 async function sendRuntimeMessage(payload) {
-  const response = await chrome.runtime.sendMessage(payload);
+  if (extensionContextInvalidated) {
+    throw new Error(getExtensionContextInvalidatedMessage());
+  }
+
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage(payload);
+  } catch (error) {
+    if (isExtensionContextInvalidated(error)) {
+      throw new Error(handleExtensionContextInvalidated(error));
+    }
+    throw error;
+  }
+
   if (!response?.ok) {
-    throw new Error(response?.error || "Unknown extension error.");
+    const responseError = response?.error || "Unknown extension error.";
+    if (isExtensionContextInvalidated(responseError)) {
+      throw new Error(handleExtensionContextInvalidated(responseError));
+    }
+    throw new Error(responseError);
   }
   return response;
 }
@@ -665,6 +739,9 @@ async function sendRuntimeMessage(payload) {
 function explainBackgroundMismatch(error) {
   const message = String(error?.message || error || "");
   const lower = message.toLowerCase();
+  if (isExtensionContextInvalidated(error)) {
+    return getExtensionContextInvalidatedMessage();
+  }
   if (message.includes("Unknown message type")) {
     return (
       "This side panel is talking to an older Hermes extension worker. " +
@@ -1452,12 +1529,18 @@ async function resetChatSession() {
 }
 
 function scheduleRefresh() {
+  if (extensionContextInvalidated) {
+    return;
+  }
   if (refreshDebounceTimer) {
     clearTimeout(refreshDebounceTimer);
   }
   refreshDebounceTimer = setTimeout(() => {
     refreshPreview({ quiet: true }).catch((error) => {
-      setStatus(error.message || String(error), { openActivity: true });
+      const message = isExtensionContextInvalidated(error)
+        ? handleExtensionContextInvalidated(error)
+        : explainBackgroundMismatch(error);
+      setStatus(message, { openActivity: true });
     });
   }, 250);
 }
@@ -1638,6 +1721,22 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   loadSettings().catch((error) => {
     setStatus(explainBackgroundMismatch(error), { openActivity: true });
   });
+});
+
+window.addEventListener("error", (event) => {
+  if (!isExtensionContextInvalidated(event?.error || event?.message)) {
+    return;
+  }
+  handleExtensionContextInvalidated(event.error || event.message);
+  event.preventDefault();
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  if (!isExtensionContextInvalidated(event?.reason)) {
+    return;
+  }
+  handleExtensionContextInvalidated(event.reason);
+  event.preventDefault();
 });
 
 (async () => {

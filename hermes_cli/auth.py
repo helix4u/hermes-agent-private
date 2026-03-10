@@ -373,14 +373,14 @@ def resolve_provider(
     if explicit_api_key or explicit_base_url:
         return "openrouter"
 
-    # Check auth store for an active OAuth provider
+    # If the user has an active OAuth provider selected, keep routing to it.
+    # Runtime credential resolution will surface auth failures directly instead
+    # of silently dropping to OpenRouter and billing a different account.
     try:
         auth_store = _load_auth_store()
         active = auth_store.get("active_provider")
         if active and active in PROVIDER_REGISTRY:
-            status = get_auth_status(active)
-            if status.get("logged_in"):
-                return active
+            return active
     except Exception as e:
         logger.debug("Could not detect active auth provider: %s", e)
 
@@ -639,6 +639,39 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+def _recover_codex_tokens_from_cli(
+    *,
+    reason: str,
+    refresh_skew_seconds: int,
+) -> Optional[Dict[str, Any]]:
+    """Import valid tokens from ~/.codex/auth.json into Hermes auth store."""
+    cli_tokens = _import_codex_cli_tokens()
+    if not cli_tokens:
+        return None
+
+    cli_access_token = str(cli_tokens.get("access_token", "") or "").strip()
+    if not cli_access_token:
+        return None
+    if _codex_access_token_is_expiring(cli_access_token, refresh_skew_seconds):
+        logger.warning(
+            "Codex CLI tokens were present but expiring; cannot recover Hermes auth "
+            "(reason=%s)",
+            reason,
+        )
+        return None
+
+    logger.warning(
+        "Recovering Codex credentials from ~/.codex/ to Hermes auth store "
+        "(reason=%s)",
+        reason,
+    )
+    print("WARNING: Recovering Codex credentials from ~/.codex/auth.json.")
+    print("         Hermes will use your system Codex session for this runtime.")
+    print("         Run `hermes login` to create a fully independent session.\n")
+    _save_codex_tokens(cli_tokens)
+    return _read_codex_tokens()
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -660,21 +693,13 @@ def resolve_codex_runtime_credentials(
         if orig_err.code not in recoverable_codes:
             raise
 
-        # Migration/recovery: user may have valid Codex CLI tokens in ~/.codex/.
-        cli_tokens = _import_codex_cli_tokens()
-        if cli_tokens:
-            logger.info(
-                "Recovering Codex credentials from ~/.codex/ to Hermes auth store "
-                "(reason=%s)",
-                orig_err.code,
-            )
-            print("WARNING: Migrating Codex credentials to Hermes auth store.")
-            print("         This avoids conflicts with Codex CLI and VS Code.")
-            print("         Run `hermes login` to create a fully independent session.\n")
-            _save_codex_tokens(cli_tokens)
-            data = _read_codex_tokens()
-        else:
+        recovered = _recover_codex_tokens_from_cli(
+            reason=orig_err.code or "codex_auth_missing",
+            refresh_skew_seconds=refresh_skew_seconds,
+        )
+        if recovered is None:
             raise
+        data = recovered
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = float(os.getenv("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", "20"))
@@ -694,8 +719,19 @@ def resolve_codex_runtime_credentials(
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
 
             if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
-                access_token = str(tokens.get("access_token", "") or "").strip()
+                try:
+                    tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                    access_token = str(tokens.get("access_token", "") or "").strip()
+                except AuthError as refresh_err:
+                    recovered = _recover_codex_tokens_from_cli(
+                        reason=refresh_err.code or "codex_refresh_failed",
+                        refresh_skew_seconds=refresh_skew_seconds,
+                    )
+                    if recovered is None:
+                        raise
+                    data = recovered
+                    tokens = dict(data["tokens"])
+                    access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")

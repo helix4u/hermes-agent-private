@@ -21,6 +21,22 @@ function setBridgeStatus(message) {
   bridgeStatusText.textContent = message;
 }
 
+function isExtensionContextInvalidated(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("extension context invalidated") ||
+    message.includes("context invalidated") ||
+    message.includes("message port closed before a response was received")
+  );
+}
+
+function explainExtensionError(error) {
+  if (isExtensionContextInvalidated(error)) {
+    return "Hermes Sidecar was reloaded or updated. Reload the options page to reconnect.";
+  }
+  return String(error?.message || error || "Unknown extension error.");
+}
+
 function createPromptDraft(prompt = {}) {
   return {
     id: String(prompt.id || "").trim() || crypto.randomUUID(),
@@ -147,9 +163,14 @@ function renderQuickPromptList() {
 }
 
 async function sendRuntimeMessage(payload) {
-  const response = await chrome.runtime.sendMessage(payload);
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage(payload);
+  } catch (error) {
+    throw new Error(explainExtensionError(error));
+  }
   if (!response?.ok) {
-    throw new Error(response?.error || "Unknown extension error.");
+    throw new Error(explainExtensionError(response?.error || "Unknown extension error."));
   }
   return response;
 }
@@ -285,6 +306,26 @@ showChallengeMode.addEventListener("change", () => {
 
 document.getElementById("save-settings-button").addEventListener("click", () => {
   saveSettings().catch((error) => setStatus(error.message || String(error)));
+});
+
+window.addEventListener("error", (event) => {
+  if (!isExtensionContextInvalidated(event?.error || event?.message)) {
+    return;
+  }
+  const message = explainExtensionError(event.error || event.message);
+  setStatus(message);
+  setBridgeStatus(message);
+  event.preventDefault();
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  if (!isExtensionContextInvalidated(event?.reason)) {
+    return;
+  }
+  const message = explainExtensionError(event.reason);
+  setStatus(message);
+  setBridgeStatus(message);
+  event.preventDefault();
 });
 
 (async () => {

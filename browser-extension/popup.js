@@ -15,10 +15,31 @@ function setStatus(message) {
   statusText.textContent = message;
 }
 
+function isExtensionContextInvalidated(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("extension context invalidated") ||
+    message.includes("context invalidated") ||
+    message.includes("message port closed before a response was received")
+  );
+}
+
+function explainExtensionError(error) {
+  if (isExtensionContextInvalidated(error)) {
+    return "Hermes Sidecar was reloaded or updated. Reopen the popup and try again.";
+  }
+  return String(error?.message || error || "Unknown extension error.");
+}
+
 async function sendRuntimeMessage(payload) {
-  const response = await chrome.runtime.sendMessage(payload);
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage(payload);
+  } catch (error) {
+    throw new Error(explainExtensionError(error));
+  }
   if (!response?.ok) {
-    throw new Error(response?.error || "Unknown extension error.");
+    throw new Error(explainExtensionError(response?.error || "Unknown extension error."));
   }
   return response;
 }
@@ -139,6 +160,22 @@ document.getElementById("send-button").addEventListener("click", () => {
 
 document.getElementById("health-button").addEventListener("click", () => {
   checkBridge().catch((error) => setStatus(error.message));
+});
+
+window.addEventListener("error", (event) => {
+  if (!isExtensionContextInvalidated(event?.error || event?.message)) {
+    return;
+  }
+  setStatus(explainExtensionError(event.error || event.message));
+  event.preventDefault();
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  if (!isExtensionContextInvalidated(event?.reason)) {
+    return;
+  }
+  setStatus(explainExtensionError(event.reason));
+  event.preventDefault();
 });
 
 (async () => {

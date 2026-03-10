@@ -162,6 +162,37 @@ def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):
     assert shell.api_mode == "codex_responses"
 
 
+def test_init_agent_retries_provider_resolution_instead_of_openrouter_env_fallback(monkeypatch):
+    cli = _import_cli()
+    calls = {"count": 0}
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-should-not-win")
+    monkeypatch.setattr(cli, "AIAgent", _DummyAgent)
+
+    shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1, provider="openai-codex")
+
+    def _provider_ready():
+        calls["count"] += 1
+        shell.provider = "openai-codex"
+        shell.api_mode = "codex_responses"
+        shell.base_url = "https://chatgpt.com/backend-api/codex"
+        shell.api_key = "" if calls["count"] == 1 else "codex-token"
+        return True
+
+    monkeypatch.setattr(shell, "_ensure_runtime_credentials", _provider_ready)
+
+    assert shell._init_agent() is True
+    assert calls["count"] == 2
+    assert shell.agent is not None
+    assert shell.agent.kwargs["api_key"] == "codex-token"
+    assert shell.agent.kwargs["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert shell.agent.kwargs["provider"] == "openai-codex"
+
+
 def test_cmd_model_falls_back_to_auto_on_invalid_provider(monkeypatch, capsys):
     monkeypatch.setattr(
         "hermes_cli.config.load_config",

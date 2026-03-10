@@ -5,18 +5,20 @@ session search, web extraction, vision analysis, browser vision) picks up
 the best available backend without duplicating fallback logic.
 
 Resolution order for text tasks:
-  1. OpenRouter  (OPENROUTER_API_KEY)
-  2. Nous Portal (~/.hermes/auth.json active provider)
-  3. Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY)
-  4. Codex OAuth (Responses API via chatgpt.com with gpt-5.3-codex,
+  1. Runtime-selected provider (env/config/active auth provider)
+  2. OpenRouter  (OPENROUTER_API_KEY)
+  3. Nous Portal (~/.hermes/auth.json active provider)
+  4. Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY)
+  5. Codex OAuth (Responses API via chatgpt.com,
      wrapped to look like a chat.completions client)
-  5. None
+  6. None
 
 Resolution order for vision/multimodal tasks:
-  1. OpenRouter
-  2. Nous Portal
-  3. Codex OAuth (Responses API with multimodal input)
-  4. None  (custom endpoints still can't substitute for multimodal support)
+  1. Runtime-selected provider (env/config/active auth provider)
+  2. OpenRouter
+  3. Nous Portal
+  4. Codex OAuth (Responses API with multimodal input)
+  5. None  (custom endpoints still can't substitute for multimodal support)
 """
 
 import json
@@ -336,12 +338,12 @@ def _nous_base_url() -> str:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Read a valid Codex OAuth access token from Hermes auth store (~/.hermes/auth.json)."""
+    """Read a usable Codex OAuth access token from Hermes auth store."""
     try:
-        from hermes_cli.auth import _read_codex_tokens
-        data = _read_codex_tokens()
-        tokens = data.get("tokens", {})
-        access_token = tokens.get("access_token")
+        from hermes_cli.auth import resolve_codex_runtime_credentials
+
+        data = resolve_codex_runtime_credentials()
+        access_token = data.get("api_key")
         if isinstance(access_token, str) and access_token.strip():
             return access_token.strip()
         return None
@@ -361,6 +363,7 @@ def _resolve_auto_provider_preference() -> str:
     Priority:
     1. HERMES_INFERENCE_PROVIDER env var
     2. ~/.hermes/config.yaml -> model.provider
+    3. ~/.hermes/auth.json -> active_provider
     """
     env_pref = _normalize_provider_name(os.getenv("HERMES_INFERENCE_PROVIDER", ""))
     if env_pref and env_pref != "auto":
@@ -378,6 +381,15 @@ def _resolve_auto_provider_preference() -> str:
                     return cfg_pref
     except Exception as exc:
         logger.debug("Could not read model.provider from config for auxiliary client: %s", exc)
+
+    try:
+        from hermes_cli.auth import get_active_provider
+
+        active_provider = _normalize_provider_name(get_active_provider() or "")
+        if active_provider and active_provider != "auto":
+            return active_provider
+    except Exception as exc:
+        logger.debug("Could not read active_provider for auxiliary client: %s", exc)
 
     return "auto"
 
@@ -447,7 +459,7 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
         real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
         return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
 
-    # Auto mode: if runtime model provider is explicitly codex, use Codex first.
+    # Auto mode: if the runtime provider is explicitly selected, keep using it.
     if forced_provider == "auto":
         preferred_provider = _resolve_auto_provider_preference()
         if preferred_provider == "openai-codex":
@@ -459,6 +471,34 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
                 )
                 real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
                 return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
+            return None, None
+        if preferred_provider == "openrouter":
+            or_key = os.getenv("OPENROUTER_API_KEY")
+            if not or_key:
+                return None, None
+            logger.debug("Auxiliary text client: OpenRouter (via runtime provider preference)")
+            return (
+                OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL, default_headers=_OR_HEADERS),
+                _OPENROUTER_MODEL,
+            )
+        if preferred_provider == "nous":
+            nous = _read_nous_auth()
+            if not nous:
+                return None, None
+            auxiliary_is_nous = True
+            logger.debug("Auxiliary text client: Nous Portal (via runtime provider preference)")
+            return (
+                OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()),
+                _NOUS_MODEL,
+            )
+        if preferred_provider == "custom":
+            custom_base = os.getenv("OPENAI_BASE_URL")
+            custom_key = os.getenv("OPENAI_API_KEY")
+            if not (custom_base and custom_key):
+                return None, None
+            model = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
+            logger.debug("Auxiliary text client: custom endpoint (%s via runtime provider preference)", model)
+            return OpenAI(api_key=custom_key, base_url=custom_base), model
 
     # 1. OpenRouter
     or_key = os.getenv("OPENROUTER_API_KEY")
@@ -584,6 +624,22 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
                 )
                 real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
                 return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
+            return None, None
+        if preferred_provider == "openrouter":
+            or_key = os.getenv("OPENROUTER_API_KEY")
+            if not or_key:
+                return None, None
+            logger.debug("Auxiliary vision client: OpenRouter (via runtime provider preference)")
+            return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
+                          default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+        if preferred_provider == "nous":
+            nous = _read_nous_auth()
+            if not nous:
+                return None, None
+            logger.debug("Auxiliary vision client: Nous Portal (via runtime provider preference)")
+            return OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()), _NOUS_MODEL
+        if preferred_provider == "custom":
+            return None, None
 
     # 1. OpenRouter
     or_key = os.getenv("OPENROUTER_API_KEY")

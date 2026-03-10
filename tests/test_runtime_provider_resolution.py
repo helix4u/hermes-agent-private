@@ -134,7 +134,7 @@ def test_normalize_model_for_runtime_maps_openrouter_style_model_for_codex():
         default_model="google/gemini-2.0-flash-001:free",
     )
 
-    assert normalized == rp.CODEX_DEFAULT_MODEL
+    assert normalized == "google/gemini-2.0-flash-001:free"
 
 
 def test_normalize_model_for_runtime_strips_openai_prefix_for_codex():

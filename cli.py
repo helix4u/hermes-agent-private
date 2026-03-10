@@ -896,12 +896,6 @@ class HermesCLI:
         self._provider_source: Optional[str] = None
         self.provider = self.requested_provider
         self.api_mode = "chat_completions"
-        self.base_url = (
-            base_url
-            or os.getenv("OPENAI_BASE_URL")
-            or os.getenv("OPENROUTER_BASE_URL", CLI_CONFIG["model"]["base_url"])
-        )
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
         self._nous_key_expires_at: Optional[str] = None
         self._nous_key_source: Optional[str] = None
         # Max turns priority: CLI arg > config file > env var > default
@@ -1081,7 +1075,8 @@ class HermesCLI:
             except Exception:
                 pass
         
-        # Last-resort: ensure API key is set (env may have been loaded after provider resolution)
+        # Last-resort: env may have been loaded after initial provider resolution.
+        # Re-run provider-aware resolution instead of blindly preferring OpenRouter.
         if not (self.api_key and str(self.api_key).strip()):
             from dotenv import load_dotenv
             from hermes_cli.config import get_env_path
@@ -1091,8 +1086,8 @@ class HermesCLI:
                     load_dotenv(dotenv_path=env_path, encoding="utf-8")
                 except Exception:
                     pass
-            self.api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-            self.base_url = self.base_url or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+            if not self._ensure_runtime_credentials():
+                return False
         if not (self.api_key and str(self.api_key).strip()):
             self.console.print(
                 "[bold red]No API key found. Set OPENROUTER_API_KEY in ~/.hermes/.env or run 'hermes setup'.[/]"
