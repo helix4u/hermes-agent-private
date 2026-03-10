@@ -23,13 +23,13 @@
         <div class="section-head">
           <div>
             <h2>Conversation</h2>
-            <p class="section-copy">Separate browser-native session history.</p>
+            <p class="section-copy">Browse Hermes sessions from the browser, terminal, and connected gateways.</p>
             <div class="session-picker">
               <label for="session-history-select">Sessions</label>
               <select id="session-history-select" class="session-history-select">
                 <option value="">Loading sessions...</option>
               </select>
-              <button id="refresh-sessions-button" class="ghost-button small-button" type="button" title="Refresh the browser-side session list">Refresh</button>
+              <button id="refresh-sessions-button" class="ghost-button small-button" type="button" title="Refresh the Hermes session list">Refresh</button>
             </div>
           </div>
           <button id="reset-chat-button" class="ghost-button" type="button" title="Start a fresh sidecar session">New chat</button>
@@ -51,20 +51,13 @@
           ></textarea>
           <div class="composer-tools">
             <div class="tool-row tool-row-top">
-              <span class="tool-label">Quick prompts</span>
+              <span id="quick-prompts-label" class="tool-label" hidden>Quick prompts</span>
               <div class="tool-row-actions">
-                <button id="challenge-mode-button" class="ghost-button chip-button mode-button" type="button" aria-pressed="false" title="Tell Hermes to challenge your assumptions before answering">Challenge my framing</button>
+                <button id="challenge-mode-button" class="ghost-button chip-button mode-button" type="button" aria-pressed="false" title="Tell Hermes to challenge your assumptions before answering" hidden>Challenge my framing</button>
                 <button id="send-button" class="primary-button inline-send-button compact-action-button" type="button" title="Send your current message to Hermes">Send</button>
               </div>
             </div>
-            <div class="preset-strip" aria-label="Prompt presets">
-              <button class="ghost-button chip-button preset-button" type="button" data-template="Summarize this page." title="Send a summarize-this-page prompt right away">Summarize page</button>
-              <button class="ghost-button chip-button preset-button" type="button" data-template="Summarize this video." title="Send a prompt to summarize the video (uses transcript when available)">Summarize the video</button>
-              <button class="ghost-button chip-button preset-button" type="button" data-template="Argue against my current approach." title="Send a prompt asking Hermes to push back on your approach">Argue against me</button>
-              <button class="ghost-button chip-button preset-button" type="button" data-template="Extract the action items and decisions from this page." title="Send a prompt to extract action items and decisions">Extract action items</button>
-              <button class="ghost-button chip-button preset-button" type="button" data-template="Turn this into coding context I can use right away." title="Send a prompt to turn the page into coding context">Coding context</button>
-              <button class="ghost-button chip-button preset-button" type="button" data-template="Compare what this page says to the transcript and call out any mismatch." title="Send a prompt to compare page content with the transcript">Compare to transcript</button>
-            </div>
+            <div id="preset-strip" class="preset-strip" aria-label="Prompt presets" hidden></div>
           </div>
           <div class="toggle-cluster">
             <label class="checkbox-row compact-row">

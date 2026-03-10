@@ -20,11 +20,12 @@ const resetChatButton = document.getElementById("reset-chat-button");
 const activityPanel = document.getElementById("activity-panel");
 const sessionHistorySelect = document.getElementById("session-history-select");
 const refreshSessionsButton = document.getElementById("refresh-sessions-button");
+const quickPromptsLabel = document.getElementById("quick-prompts-label");
 const challengeModeButton = document.getElementById("challenge-mode-button");
 const bundlePanel = document.getElementById("bundle-panel");
 const bundleList = document.getElementById("bundle-list");
 const bundleModeNote = document.getElementById("bundle-mode-note");
-const presetButtons = Array.from(document.querySelectorAll(".preset-button"));
+const presetStrip = document.getElementById("preset-strip");
 const STATUS_INLINE_MAX_CHARS = 220;
 const STATUS_INLINE_MAX_LINES = 3;
 const STATUS_ACTIVITY_MAX_CHARS = 700;
@@ -55,6 +56,15 @@ let bundleSelectionState = null;
 let activeAudioMessageKey = "";
 let activeReplyAudio = null;
 let activeReplyAudioUrl = "";
+let sidebarSettings = {
+  showQuickPrompts: false,
+  showChallengeMode: false,
+  quickPrompts: [],
+  challengeModeLabel: "Challenge my framing",
+  challengeModePrompt: ""
+};
+let sessionHistoryByKey = new Map();
+let selectedSessionCanSend = true;
 
 function compactStatusText(
   message,
@@ -185,6 +195,21 @@ async function copyTextToClipboard(text) {
 
 function rerenderCurrentMessages() {
   renderMessages(currentMessages, currentProgress, pendingUserMessage);
+}
+
+function updateComposerAvailability() {
+  const canSend = !isBusy && selectedSessionCanSend;
+  sendButton.disabled = !canSend;
+  chatInput.disabled = !selectedSessionCanSend;
+  sendButton.textContent = isBusy ? "Working..." : "Send";
+  sendButton.title = isBusy
+    ? "Hermes is working on the current turn"
+    : selectedSessionCanSend
+      ? "Send your current message to Hermes"
+      : "This session is read-only in the side panel";
+  chatInput.placeholder = selectedSessionCanSend
+    ? "Ask Hermes something, or leave this empty and just share the page..."
+    : "Browsing a non-sidecar Hermes session. Select a browser sidecar session or start a new chat to send.";
 }
 
 function clearReplyAudioState() {
@@ -335,9 +360,10 @@ function buildOutgoingMessage(message) {
   if (!challengeModeEnabled) {
     return userMessage;
   }
-  const challengeInstruction =
-    "Before answering, briefly challenge my framing. " +
-    "Call out likely assumptions, missing context, and plausible alternative interpretations, then continue with the best answer.";
+  const challengeInstruction = String(sidebarSettings.challengeModePrompt || "").trim();
+  if (!challengeInstruction) {
+    return userMessage;
+  }
   if (!userMessage) {
     return challengeInstruction;
   }
@@ -391,14 +417,84 @@ function applyPresetTemplate(template) {
   chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
 }
 
+function renderPromptControls() {
+  const prompts = Array.isArray(sidebarSettings.quickPrompts) ? sidebarSettings.quickPrompts : [];
+  const showQuickPrompts = sidebarSettings.showQuickPrompts && prompts.length > 0;
+  const showChallengeMode =
+    sidebarSettings.showChallengeMode &&
+    String(sidebarSettings.challengeModePrompt || "").trim().length > 0;
+
+  if (quickPromptsLabel) {
+    quickPromptsLabel.hidden = !(showQuickPrompts || showChallengeMode);
+    quickPromptsLabel.style.display = showQuickPrompts || showChallengeMode ? "" : "none";
+  }
+
+  if (challengeModeButton) {
+    challengeModeButton.hidden = !showChallengeMode;
+    challengeModeButton.style.display = showChallengeMode ? "" : "none";
+    challengeModeButton.textContent = String(sidebarSettings.challengeModeLabel || "").trim() || "Challenge mode";
+    challengeModeButton.title = showChallengeMode
+      ? `Toggle "${challengeModeButton.textContent}" for this turn`
+      : "Challenge mode is disabled in Options";
+  }
+
+  if (presetStrip) {
+    presetStrip.hidden = !showQuickPrompts;
+    presetStrip.style.display = showQuickPrompts ? "" : "none";
+    presetStrip.textContent = "";
+    if (showQuickPrompts) {
+      for (const prompt of prompts) {
+        const button = document.createElement("button");
+        button.className = "ghost-button chip-button preset-button";
+        button.type = "button";
+        button.dataset.template = String(prompt.template || "").trim();
+        button.dataset.includeTranscript = prompt.includeTranscript ? "true" : "false";
+        button.title = button.dataset.template || "Send this saved prompt";
+        button.textContent = String(prompt.label || "").trim() || "Quick prompt";
+        presetStrip.appendChild(button);
+      }
+    }
+  }
+
+  if (!showChallengeMode) {
+    setChallengeModeEnabled(false);
+  } else if (challengeModeButton) {
+    challengeModeButton.setAttribute("aria-pressed", challengeModeEnabled ? "true" : "false");
+  }
+}
+
 function setChallengeModeEnabled(enabled) {
-  challengeModeEnabled = Boolean(enabled);
+  challengeModeEnabled =
+    Boolean(enabled) &&
+    sidebarSettings.showChallengeMode === true &&
+    String(sidebarSettings.challengeModePrompt || "").trim().length > 0;
   if (challengeModeButton) {
     challengeModeButton.setAttribute("aria-pressed", challengeModeEnabled ? "true" : "false");
   }
   if (bundleModeNote) {
     bundleModeNote.hidden = !challengeModeEnabled;
   }
+}
+
+function applySidebarSettings(settings, { preserveBusyState = false } = {}) {
+  const nextSettings = settings && typeof settings === "object" ? settings : {};
+  sidebarSettings = {
+    showQuickPrompts: nextSettings.showQuickPrompts === true,
+    showChallengeMode: nextSettings.showChallengeMode === true,
+    quickPrompts: Array.isArray(nextSettings.quickPrompts) ? nextSettings.quickPrompts : [],
+    challengeModeLabel: String(nextSettings.challengeModeLabel || "").trim() || "Challenge my framing",
+    challengeModePrompt: String(nextSettings.challengeModePrompt || "").trim()
+  };
+
+  includeTranscript.checked = nextSettings.includeTranscriptByDefault !== false;
+  sharePageByDefault = nextSettings.sharePageByDefault !== false;
+  if (!preserveBusyState || !isBusy) {
+    sharePageCheckbox.checked = sharePageByDefault;
+  }
+
+  renderPromptControls();
+  renderContextBundle();
+  updateComposerAvailability();
 }
 
 function renderContextBundle() {
@@ -519,7 +615,6 @@ function renderChatNotice(message) {
 
 function setBusyState(busy) {
   isBusy = busy;
-  sendButton.disabled = busy;
   resetChatButton.disabled = busy;
   if (sessionHistorySelect) {
     sessionHistorySelect.disabled = busy;
@@ -527,10 +622,7 @@ function setBusyState(busy) {
   if (refreshSessionsButton) {
     refreshSessionsButton.disabled = busy;
   }
-  sendButton.textContent = busy ? "Working..." : "Send";
-  sendButton.title = busy
-    ? "Hermes is working on the current turn"
-    : "Send your current message to Hermes";
+  updateComposerAvailability();
 }
 
 function stopPolling() {
@@ -622,7 +714,12 @@ function formatTimestamp(value) {
 }
 
 function formatSessionLabel(session) {
-  const title = session?.browser_label || "Sidecar session";
+  const title =
+    session?.browser_label ||
+    session?.session_label ||
+    session?.display_name ||
+    (session?.source ? String(session.source).replace(/_/g, " ") : "") ||
+    "Hermes session";
   const updatedAt = session?.updated_at ? formatTimestamp(session.updated_at) : "";
   const rawCount = Number(session?.message_count);
   const messageCount = Number.isFinite(rawCount) ? rawCount : null;
@@ -637,10 +734,12 @@ function renderSessionHistory(sessions, activeSessionKey = "") {
     return;
   }
   const normalizedSessions = Array.isArray(sessions) ? sessions : [];
+  sessionHistoryByKey = new Map();
   const knownKeys = new Set();
   for (const session of normalizedSessions) {
     if (session?.session_key) {
       knownKeys.add(session.session_key);
+      sessionHistoryByKey.set(session.session_key, session);
     }
   }
 
@@ -660,11 +759,13 @@ function renderSessionHistory(sessions, activeSessionKey = "") {
   if (!normalizedSessions.length) {
     const option = document.createElement("option");
     option.value = "";
-    option.textContent = "No sidecar sessions yet";
+    option.textContent = "No Hermes sessions yet";
     sessionHistorySelect.appendChild(option);
     sessionHistorySelect.disabled = true;
     isApplyingSessionSelection = false;
     selectedSessionKey = "";
+    selectedSessionCanSend = true;
+    updateComposerAvailability();
     return;
   }
 
@@ -682,6 +783,8 @@ function renderSessionHistory(sessions, activeSessionKey = "") {
     expectedSessionKey = nextSelected;
   }
   isApplyingSessionSelection = false;
+  selectedSessionCanSend = sessionHistoryByKey.get(nextSelected)?.can_send !== false;
+  updateComposerAvailability();
 }
 
 function renderSessionHistoryUnavailable(message = "") {
@@ -700,6 +803,8 @@ function renderSessionHistoryUnavailable(message = "") {
   isApplyingSessionSelection = false;
   selectedSessionKey = "";
   expectedSessionKey = "";
+  selectedSessionCanSend = true;
+  updateComposerAvailability();
 
   if (message) {
     setStatus(message, { openActivity: true });
@@ -1052,10 +1157,7 @@ function renderUnavailablePreview(message) {
 async function loadSettings() {
   const response = await sendRuntimeMessage({ type: "hermes:get-settings" });
   const settings = response.settings || {};
-  includeTranscript.checked = settings.includeTranscriptByDefault !== false;
-  sharePageByDefault = settings.sharePageByDefault !== false;
-  sharePageCheckbox.checked = sharePageByDefault;
-  renderContextBundle();
+  applySidebarSettings(settings, { preserveBusyState: true });
 }
 
 async function refreshPreview({ quiet = false } = {}) {
@@ -1124,6 +1226,7 @@ async function loadChatSession({ quiet = false, sessionKey = "" } = {}) {
     }
     expectedSessionKey = incomingSessionKey;
     selectedSessionKey = incomingSessionKey;
+    selectedSessionCanSend = response.result?.can_send !== false;
     if (sessionHistorySelect && !isApplyingSessionSelection) {
       const hasOption = Array.from(sessionHistorySelect.options).some((option) => option.value === incomingSessionKey);
       if (hasOption) {
@@ -1136,6 +1239,7 @@ async function loadChatSession({ quiet = false, sessionKey = "" } = {}) {
 
   currentMessages = incomingMessages;
   currentProgress = response.result?.progress || null;
+  updateComposerAvailability();
   clearPendingIfAcknowledged();
 
   if (currentProgress?.running) {
@@ -1183,6 +1287,12 @@ async function loadChatSession({ quiet = false, sessionKey = "" } = {}) {
 
 async function sendChatMessage(messageOverride = null, options = {}) {
   stopReplySpeech({ rerender: false });
+  if (!selectedSessionCanSend) {
+    throw new Error(
+      "This session is read-only in the browser side panel right now. " +
+      "Select a browser sidecar session or start a new chat to send from here."
+    );
+  }
   if (isBusy) {
     await loadChatSession({ quiet: true });
     if (isBusy) {
@@ -1466,16 +1576,15 @@ if (challengeModeButton) {
   });
 }
 
-function isTranscriptPreset(template) {
-  const t = String(template || "").trim();
-  return t.startsWith("Summarize this video.") || t.includes("transcript");
-}
-
-for (const button of presetButtons) {
-  button.addEventListener("click", () => {
+if (presetStrip) {
+  presetStrip.addEventListener("click", (event) => {
+    const button = event.target instanceof HTMLElement ? event.target.closest(".preset-button") : null;
+    if (!(button instanceof HTMLButtonElement)) {
+      return;
+    }
     const template = button.dataset.template || "";
-    const options = isTranscriptPreset(template) ? { forceIncludeTranscript: true } : {};
-    sendChatMessage(template, options).catch(handleSendError);
+    const forceIncludeTranscript = button.dataset.includeTranscript === "true";
+    sendChatMessage(template, { forceIncludeTranscript }).catch(handleSendError);
   });
 }
 
@@ -1514,19 +1623,21 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "sync") {
     return;
   }
-
-  if (changes.includeTranscriptByDefault) {
-    includeTranscript.checked = Boolean(changes.includeTranscriptByDefault.newValue);
-    renderContextBundle();
+  const watchedKeys = [
+    "includeTranscriptByDefault",
+    "sharePageByDefault",
+    "showQuickPrompts",
+    "showChallengeMode",
+    "quickPrompts",
+    "challengeModeLabel",
+    "challengeModePrompt"
+  ];
+  if (!watchedKeys.some((key) => Object.prototype.hasOwnProperty.call(changes, key))) {
+    return;
   }
-
-  if (changes.sharePageByDefault) {
-    sharePageByDefault = changes.sharePageByDefault.newValue !== false;
-    if (!isBusy) {
-      sharePageCheckbox.checked = sharePageByDefault;
-      renderContextBundle();
-    }
-  }
+  loadSettings().catch((error) => {
+    setStatus(explainBackgroundMismatch(error), { openActivity: true });
+  });
 });
 
 (async () => {

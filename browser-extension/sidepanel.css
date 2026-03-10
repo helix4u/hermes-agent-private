@@ -103,7 +103,7 @@ body {
 
 .session-picker label {
   color: #c8b089;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
 }
 
@@ -306,7 +306,7 @@ body {
   background: rgba(255, 248, 231, 0.035);
   font-size: 11px;
   line-height: 1.2;
-  padding: 7px 10px;
+  padding: 5px 9px;
 }
 
 .mode-button {
@@ -315,15 +315,15 @@ body {
 
 .inline-send-button {
   width: auto;
-  min-width: 108px;
-  padding-inline: 14px;
+  min-width: 92px;
+  padding-inline: 12px;
   flex-shrink: 0;
 }
 
 .compact-action-button {
-  height: 34px;
-  padding: 0 14px;
-  font-size: 12px;
+  height: 30px;
+  padding: 0 12px;
+  font-size: 11px;
   line-height: 1;
 }
 
@@ -501,8 +501,9 @@ button {
   border: 0;
   border-radius: 999px;
   cursor: pointer;
-  font: 600 13px/1 "Segoe UI", "Helvetica Neue", sans-serif;
-  padding: 11px 13px;
+  font: 600 12px/1 "Segoe UI", "Helvetica Neue", sans-serif;
+  padding: 8px 11px;
+  white-space: nowrap;
   transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
 }
 
@@ -555,6 +556,16 @@ button:disabled {
 
 .small-button {
   padding: 7px 10px;
+}
+
+#open-options-button,
+#reset-chat-button,
+#refresh-sessions-button,
+#domain-permission-button {
+  align-self: flex-start;
+  flex-shrink: 0;
+  min-height: 30px;
+  padding: 7px 11px;
 }
 
 #refresh-button {

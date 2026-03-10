@@ -65,6 +65,14 @@ body {
   margin-bottom: 10px;
 }
 
+.section-head-actions {
+  align-items: flex-end;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
 .section-head h2 {
   font-size: 15px;
   margin: 0;
@@ -74,6 +82,14 @@ body {
   color: #c8b089;
   font-size: 12px;
   margin: 4px 0 0;
+}
+
+.bridge-status-text {
+  color: #cdb58d;
+  font-size: 11px;
+  margin: 0;
+  max-width: 220px;
+  text-align: right;
 }
 
 .field {
@@ -89,7 +105,9 @@ body {
 }
 
 input[type="url"],
-input[type="password"] {
+input[type="password"],
+input[type="text"],
+textarea {
   width: 100%;
   border: 1px solid rgba(212, 167, 93, 0.24);
   border-radius: 14px;
@@ -100,9 +118,16 @@ input[type="password"] {
 }
 
 input[type="url"]:focus,
-input[type="password"]:focus {
+input[type="password"]:focus,
+input[type="text"]:focus,
+textarea:focus {
   border-color: rgba(255, 191, 73, 0.75);
   box-shadow: 0 0 0 1px rgba(255, 191, 73, 0.2);
+}
+
+textarea {
+  min-height: 100px;
+  resize: vertical;
 }
 
 .checkbox-row {
@@ -115,6 +140,84 @@ input[type="password"]:focus {
 
 .checkbox-row input {
   margin-top: 3px;
+}
+
+.editor-block {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 219, 146, 0.08);
+}
+
+.editor-head {
+  align-items: flex-start;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.editor-head h3 {
+  font-size: 14px;
+  margin: 0;
+}
+
+.prompt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.prompt-card {
+  border: 1px solid rgba(255, 219, 146, 0.12);
+  border-radius: 16px;
+  background: rgba(255, 248, 231, 0.03);
+  padding: 14px;
+}
+
+.prompt-card-head {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.prompt-card-title {
+  color: #f7dfb2;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.prompt-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.small-button {
+  font-size: 12px;
+  padding: 7px 10px;
+}
+
+.danger-button {
+  background: rgba(167, 53, 29, 0.18);
+  color: #ffd8ca;
+}
+
+.checkbox-row.tight-row {
+  margin-top: 0;
+}
+
+.empty-list {
+  border: 1px dashed rgba(255, 219, 146, 0.14);
+  border-radius: 14px;
+  color: #ceb488;
+  margin: 0;
+  padding: 16px;
+  text-align: center;
 }
 
 .actions-card {
@@ -135,8 +238,8 @@ button {
   border: 0;
   border-radius: 999px;
   cursor: pointer;
-  font: 600 13px/1 "Segoe UI", "Helvetica Neue", sans-serif;
-  padding: 12px 14px;
+  font: 600 12px/1 "Segoe UI", "Helvetica Neue", sans-serif;
+  padding: 9px 12px;
 }
 
 .primary-button {
@@ -147,4 +250,26 @@ button {
 .ghost-button {
   background: rgba(255, 219, 146, 0.08);
   color: #f7dfb2;
+}
+
+@media (max-width: 640px) {
+  .actions-card,
+  .editor-head,
+  .prompt-card-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .prompt-card-actions {
+    justify-content: flex-start;
+  }
+
+  .section-head-actions {
+    align-items: flex-start;
+  }
+
+  .bridge-status-text {
+    max-width: none;
+    text-align: left;
+  }
 }

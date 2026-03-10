@@ -1,5 +1,7 @@
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:8765/inject";
 const BRIDGE_TIMEOUT_MS = 12000;
+/** Session history/state loads can be larger than normal bridge requests. */
+const SESSION_BRIDGE_TIMEOUT_MS = 30000;
 /** TTS can be slow for long text (chunked synthesis + stitching); keep timeout generous. */
 const TTS_BRIDGE_TIMEOUT_MS = 300000;
 const TRANSCRIPT_STATE_KEY = "sharedTranscriptKeys";
@@ -9,6 +11,48 @@ const LEGACY_BROWSER_LABEL = "Chrome Extension";
 const ACTIVE_LABEL_KEY = "activeBrowserLabel";
 const PAGE_CONTEXT_CACHE_TTL_MS = 90000;
 const TRANSCRIPT_TEXT_CACHE_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_CHALLENGE_MODE_LABEL = "Challenge my framing";
+const DEFAULT_CHALLENGE_MODE_PROMPT =
+  "Before answering, briefly challenge my framing. " +
+  "Call out likely assumptions, missing context, and plausible alternative interpretations, then continue with the best answer.";
+const DEFAULT_QUICK_PROMPTS = [
+  {
+    id: "summarize-page",
+    label: "Summarize page",
+    template: "Summarize this page.",
+    includeTranscript: false
+  },
+  {
+    id: "summarize-video",
+    label: "Summarize the video",
+    template: "Summarize this video.",
+    includeTranscript: true
+  },
+  {
+    id: "argue-against-me",
+    label: "Argue against me",
+    template: "Argue against my current approach.",
+    includeTranscript: false
+  },
+  {
+    id: "extract-action-items",
+    label: "Extract action items",
+    template: "Extract the action items and decisions from this page.",
+    includeTranscript: false
+  },
+  {
+    id: "coding-context",
+    label: "Coding context",
+    template: "Turn this into coding context I can use right away.",
+    includeTranscript: false
+  },
+  {
+    id: "compare-to-transcript",
+    label: "Compare to transcript",
+    template: "Compare what this page says to the transcript and call out any mismatch.",
+    includeTranscript: true
+  }
+];
 const REQUIRED_HOST_ORIGINS = new Set([
   "http://127.0.0.1/*",
   "http://localhost/*",
@@ -28,6 +72,98 @@ function cloneContext(value) {
   } catch (_error) {
     return { ...(value || {}) };
   }
+}
+
+function createDefaultQuickPrompts() {
+  return DEFAULT_QUICK_PROMPTS.map((prompt) => ({ ...prompt }));
+}
+
+function normalizeQuickPrompts(value) {
+  if (!Array.isArray(value)) {
+    return createDefaultQuickPrompts();
+  }
+
+  const normalized = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const prompt = value[index];
+    if (!prompt || typeof prompt !== "object") {
+      continue;
+    }
+
+    const label = String(prompt.label || "").trim();
+    const template = String(prompt.template || "").trim();
+    if (!label || !template) {
+      continue;
+    }
+
+    const fallbackId = label
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || `prompt-${index + 1}`;
+
+    normalized.push({
+      id: String(prompt.id || "").trim() || `${fallbackId}-${index + 1}`,
+      label,
+      template,
+      includeTranscript: Boolean(prompt.includeTranscript)
+    });
+  }
+
+  return normalized;
+}
+
+function normalizeStoredSettings(settings) {
+  const next = settings && typeof settings === "object" ? settings : {};
+  return {
+    bridgeUrl: String(next.bridgeUrl || "").trim() || DEFAULT_BRIDGE_URL,
+    bridgeToken: String(next.bridgeToken || "").trim(),
+    includeTranscriptByDefault: next.includeTranscriptByDefault !== false,
+    sharePageByDefault: next.sharePageByDefault !== false,
+    showQuickPrompts: next.showQuickPrompts === true,
+    showChallengeMode: next.showChallengeMode === true,
+    quickPrompts: normalizeQuickPrompts(next.quickPrompts),
+    challengeModeLabel: String(next.challengeModeLabel || "").trim() || DEFAULT_CHALLENGE_MODE_LABEL,
+    challengeModePrompt: String(next.challengeModePrompt || "").trim() || DEFAULT_CHALLENGE_MODE_PROMPT
+  };
+}
+
+function buildSettingsPatch(settings) {
+  if (!settings || typeof settings !== "object") {
+    return {};
+  }
+
+  const patch = {};
+  if (Object.prototype.hasOwnProperty.call(settings, "bridgeUrl")) {
+    patch.bridgeUrl = String(settings.bridgeUrl || "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "bridgeToken")) {
+    patch.bridgeToken = String(settings.bridgeToken || "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "includeTranscriptByDefault")) {
+    patch.includeTranscriptByDefault = settings.includeTranscriptByDefault !== false;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "sharePageByDefault")) {
+    patch.sharePageByDefault = settings.sharePageByDefault !== false;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "showQuickPrompts")) {
+    patch.showQuickPrompts = settings.showQuickPrompts === true;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "showChallengeMode")) {
+    patch.showChallengeMode = settings.showChallengeMode === true;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "quickPrompts")) {
+    patch.quickPrompts = normalizeQuickPrompts(settings.quickPrompts);
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "challengeModeLabel")) {
+    patch.challengeModeLabel =
+      String(settings.challengeModeLabel || "").trim() || DEFAULT_CHALLENGE_MODE_LABEL;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "challengeModePrompt")) {
+    patch.challengeModePrompt =
+      String(settings.challengeModePrompt || "").trim() || DEFAULT_CHALLENGE_MODE_PROMPT;
+  }
+
+  return patch;
 }
 
 function getTextLength(value) {
@@ -461,16 +597,26 @@ async function configureSidePanelBehavior() {
 }
 
 async function getSettings() {
-  return chrome.storage.sync.get({
+  const stored = await chrome.storage.sync.get({
     bridgeUrl: DEFAULT_BRIDGE_URL,
     bridgeToken: "",
     includeTranscriptByDefault: true,
-    sharePageByDefault: true
+    sharePageByDefault: true,
+    showQuickPrompts: false,
+    showChallengeMode: false,
+    quickPrompts: createDefaultQuickPrompts(),
+    challengeModeLabel: DEFAULT_CHALLENGE_MODE_LABEL,
+    challengeModePrompt: DEFAULT_CHALLENGE_MODE_PROMPT
   });
+  return normalizeStoredSettings(stored);
 }
 
 async function setSettings(settings) {
-  await chrome.storage.sync.set(settings);
+  const patch = buildSettingsPatch(settings);
+  if (!Object.keys(patch).length) {
+    return;
+  }
+  await chrome.storage.sync.set(patch);
 }
 
 async function getClientSessionId() {
@@ -1122,6 +1268,7 @@ async function loadChatSession(sessionKey = "") {
 
   const requestState = async (label) => callBridge("/session", {
     token,
+    timeoutMs: SESSION_BRIDGE_TIMEOUT_MS,
     body: {
       action: "state",
       browserLabel: label,
@@ -1162,6 +1309,7 @@ async function listChatSessions(limit = 25, sessionKey = "") {
   try {
     return await callBridge("/session", {
       token,
+      timeoutMs: SESSION_BRIDGE_TIMEOUT_MS,
       body: {
         action: "list",
         browserLabel,
@@ -1208,6 +1356,7 @@ async function resetChatSession(sessionKey = "", createNew = false) {
   }
   return callBridge("/session", {
     token,
+    timeoutMs: SESSION_BRIDGE_TIMEOUT_MS,
     body: {
       action: "reset",
       browserLabel: PRIMARY_BROWSER_LABEL,

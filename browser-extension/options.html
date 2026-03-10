@@ -20,7 +20,10 @@
             <h2>Bridge</h2>
             <p class="section-copy">How this extension reaches your local Hermes gateway.</p>
           </div>
-          <button id="health-button" class="ghost-button" type="button">Check bridge</button>
+          <div class="section-head-actions">
+            <button id="health-button" class="ghost-button" type="button">Check bridge</button>
+            <p id="bridge-status-text" class="bridge-status-text">Not checked yet.</p>
+          </div>
         </div>
         <label class="field">
           <span class="field-label">Bridge URL</span>
@@ -47,6 +50,51 @@
           <input id="include-transcript" type="checkbox">
           <span>Include YouTube transcript by default</span>
         </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Sidecar tools</h2>
+            <p class="section-copy">Choose which helper controls show up in the side panel, and edit what they send.</p>
+          </div>
+        </div>
+        <label class="checkbox-row">
+          <input id="show-quick-prompts" type="checkbox">
+          <span>Show quick prompt buttons in the sidecar</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="show-challenge-mode" type="checkbox">
+          <span>Show the challenge mode toggle in the sidecar</span>
+        </label>
+
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Challenge mode</h3>
+              <p class="section-copy">Rename the toggle and control the instruction Hermes appends when it is on.</p>
+            </div>
+          </div>
+          <label class="field">
+            <span class="field-label">Button name</span>
+            <input id="challenge-mode-label" type="text" maxlength="60" spellcheck="false">
+          </label>
+          <label class="field">
+            <span class="field-label">Instruction prompt</span>
+            <textarea id="challenge-mode-prompt" rows="4" spellcheck="true"></textarea>
+          </label>
+        </div>
+
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Quick prompts</h3>
+              <p class="section-copy">Add, rename, remove, and reorder the prompt buttons that can send instantly from the sidecar.</p>
+            </div>
+            <button id="add-quick-prompt-button" class="ghost-button" type="button">Add prompt</button>
+          </div>
+          <div id="quick-prompt-list" class="prompt-list"></div>
+        </div>
       </section>
 
       <section class="card actions-card">

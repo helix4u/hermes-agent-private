@@ -160,6 +160,7 @@ from gateway.config import (
 from gateway.session import (
     SessionStore,
     SessionSource,
+    SessionEntry,
     SessionContext,
     build_session_context,
     build_session_context_prompt,
@@ -1841,6 +1842,132 @@ class GatewayRunner:
 
         return sessions
 
+    def _get_active_session_entry_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
+        self.session_store._ensure_loaded()
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            return None
+        for entry in self.session_store._entries.values():
+            if entry.session_id == normalized_session_id:
+                return entry
+        return None
+
+    def _get_active_session_entry_by_key_or_session_id(self, session_ref: str) -> Optional[SessionEntry]:
+        self.session_store._ensure_loaded()
+        normalized_session_ref = str(session_ref or "").strip()
+        if not normalized_session_ref:
+            return None
+
+        active_entry = self.session_store._entries.get(normalized_session_ref)
+        if active_entry:
+            return active_entry
+
+        return self._get_active_session_entry_by_session_id(normalized_session_ref)
+
+    @staticmethod
+    def _empty_sidebar_session_snapshot() -> Dict[str, Any]:
+        return {
+            "session_key": "",
+            "session_id": "",
+            "messages": [],
+            "progress": {},
+            "running": False,
+            "browser_label": "",
+            "source": "",
+            "is_browser_session": False,
+            "can_send": False,
+        }
+
+    @staticmethod
+    def _format_sidebar_source_label(source_name: str) -> str:
+        value = str(source_name or "").strip().lower()
+        if value == "cli":
+            return "CLI terminal"
+        if value == "local":
+            return "Local session"
+        if not value:
+            return "Hermes session"
+        return value.replace("_", " ").title()
+
+    def _format_sidebar_session_label(
+        self,
+        *,
+        session_entry: Optional[SessionEntry] = None,
+        session_record: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if session_entry and session_entry.origin:
+            source = session_entry.origin
+            if self._is_browser_bridge_source(source):
+                return source.chat_name or source.user_name or session_entry.display_name or "Browser Sidecar"
+            if source.platform == Platform.LOCAL and str(source.chat_id or "") == "cli":
+                return session_entry.display_name or "CLI terminal"
+
+            platform_label = self._format_sidebar_source_label(source.platform.value)
+            target_label = (
+                source.chat_name
+                or source.user_name
+                or session_entry.display_name
+                or source.chat_id
+                or ""
+            )
+            if target_label and target_label != platform_label:
+                return f"{platform_label}: {target_label}"
+            return platform_label
+
+        session_record = session_record or {}
+        return self._format_sidebar_source_label(session_record.get("source") or "")
+
+    def _list_sidebar_sessions(self, *, limit: int = 20) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 100))
+        db = self.session_store._db
+        if not db:
+            return self._list_browser_bridge_sessions(limit=limit)
+
+        session_rows = db.search_sessions(limit=limit)
+        sessions: List[Dict[str, Any]] = []
+        for row in session_rows:
+            session_id = str(row.get("id") or "").strip()
+            if not session_id:
+                continue
+
+            active_entry = self._get_active_session_entry_by_session_id(session_id)
+            active_origin = active_entry.origin if active_entry else None
+            is_browser_session = bool(active_origin and self._is_browser_bridge_source(active_origin))
+            progress = (
+                self._get_browser_bridge_progress_snapshot(active_entry.session_key)
+                if active_entry and is_browser_session
+                else {}
+            )
+            updated_at = (
+                active_entry.updated_at.isoformat()
+                if active_entry
+                else datetime.fromtimestamp(float(row.get("started_at") or 0)).isoformat()
+                if row.get("started_at")
+                else ""
+            )
+
+            sessions.append(
+                {
+                    "session_key": active_entry.session_key if active_entry else session_id,
+                    "session_id": session_id,
+                    "browser_label": self._format_sidebar_session_label(
+                        session_entry=active_entry,
+                        session_record=row,
+                    ),
+                    "source": str(row.get("source") or ""),
+                    "updated_at": updated_at,
+                    "created_at": updated_at,
+                    "message_count": int(row.get("message_count") or 0),
+                    "last_message_role": "",
+                    "last_message_preview": "",
+                    "running": bool(progress.get("running")),
+                    "is_browser_session": is_browser_session,
+                    "can_send": is_browser_session,
+                }
+            )
+
+        return sessions
+
     @staticmethod
     def _extract_browser_bridge_content(content: Any) -> str:
         """Flatten transcript content into sidebar-friendly text."""
@@ -2024,6 +2151,86 @@ class GatewayRunner:
             "running": bool(progress.get("running")),
         }
 
+    def _get_sidebar_session_snapshot(self, session_ref: str) -> Dict[str, Any]:
+        normalized_session_ref = str(session_ref or "").strip()
+        if not normalized_session_ref:
+            return self._empty_sidebar_session_snapshot()
+
+        active_entry = self._get_active_session_entry_by_key_or_session_id(normalized_session_ref)
+        resolved_session_id = active_entry.session_id if active_entry else normalized_session_ref
+        session_record = self.session_store._db.get_session(resolved_session_id) if self.session_store._db else None
+        if not active_entry and not session_record:
+            raise ValueError("Unknown Hermes session.")
+
+        history = self.session_store.load_transcript(resolved_session_id)
+        is_browser_session = bool(active_entry and active_entry.origin and self._is_browser_bridge_source(active_entry.origin))
+        progress = (
+            self._get_browser_bridge_progress_snapshot(active_entry.session_key)
+            if active_entry and is_browser_session
+            else {}
+        )
+        source_name = ""
+        if active_entry and active_entry.platform:
+            source_name = active_entry.platform.value
+        elif session_record:
+            source_name = str(session_record.get("source") or "")
+
+        return {
+            "session_key": active_entry.session_key if active_entry else resolved_session_id,
+            "session_id": resolved_session_id,
+            "messages": self._serialize_browser_bridge_history(history),
+            "progress": progress,
+            "running": bool(progress.get("running")),
+            "browser_label": self._format_sidebar_session_label(
+                session_entry=active_entry,
+                session_record=session_record or {},
+            ),
+            "source": source_name,
+            "is_browser_session": is_browser_session,
+            "can_send": is_browser_session,
+        }
+
+    def _get_sidebar_session_snapshot_by_session_id(self, session_id: str) -> Dict[str, Any]:
+        return self._get_sidebar_session_snapshot(session_id)
+
+    def _resolve_sidebar_active_session_key(
+        self,
+        *,
+        browser_label: str,
+        client_session_id: str = "",
+        session_key: str = "",
+    ) -> str:
+        normalized_session_key = str(session_key or "").strip()
+        if normalized_session_key:
+            try:
+                snapshot = self._get_sidebar_session_snapshot(normalized_session_key)
+                resolved = str(snapshot.get("session_key") or "").strip()
+                if resolved:
+                    return resolved
+            except ValueError:
+                pass
+
+            try:
+                source = self._resolve_browser_bridge_source(
+                    browser_label=browser_label,
+                    client_session_id=client_session_id,
+                    session_key=normalized_session_key,
+                )
+                session_entry = self.session_store.get_or_create_session(source)
+                return session_entry.session_key
+            except ValueError:
+                pass
+
+        try:
+            source = self._build_browser_bridge_source(
+                browser_label=browser_label,
+                client_session_id=client_session_id,
+            )
+            session_entry = self.session_store.get_or_create_session(source)
+            return session_entry.session_key
+        except Exception:
+            return ""
+
     async def _handle_browser_bridge_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Handle browser bridge API requests."""
         route = (payload or {}).pop("_bridge_route", "/inject")
@@ -2089,27 +2296,17 @@ class GatewayRunner:
                 limit = int(raw_limit)
             except (TypeError, ValueError):
                 limit = 20
-            try:
-                source = self._resolve_browser_bridge_source(
-                    browser_label=browser_label,
-                    client_session_id=client_session_id,
-                    session_key=selected_session_key,
-                )
-            except ValueError:
-                source = self._build_browser_bridge_source(
-                    browser_label=browser_label,
-                    client_session_id=client_session_id,
-                )
-            snapshot = self._get_browser_bridge_session_snapshot(source)
-            sessions = self._list_browser_bridge_sessions(
+            active_session_key = self._resolve_sidebar_active_session_key(
+                browser_label=browser_label,
                 client_session_id=client_session_id,
-                limit=limit,
+                session_key=selected_session_key,
             )
+            sessions = self._list_sidebar_sessions(limit=limit)
             return {
                 "ok": True,
                 "sessions": sessions,
-                "active_session_key": snapshot.get("session_key") or "",
-                **snapshot,
+                "active_session_key": active_session_key,
+                **self._empty_sidebar_session_snapshot(),
             }
 
         if action == "tts":
@@ -2193,6 +2390,24 @@ class GatewayRunner:
                 "mime_type": mime_type,
                 "audio_base64": audio_base64,
             }
+
+        if selected_session_key:
+            sidebar_snapshot = None
+            try:
+                sidebar_snapshot = self._get_sidebar_session_snapshot(selected_session_key)
+            except ValueError:
+                sidebar_snapshot = None
+
+            if sidebar_snapshot and not sidebar_snapshot.get("is_browser_session"):
+                if action == "state":
+                    return {
+                        "ok": True,
+                        **sidebar_snapshot,
+                    }
+                raise ValueError(
+                    "This session is read-only in the browser side panel right now. "
+                    "You can browse it here, but sending new turns is only supported for browser sidecar sessions."
+                )
 
         source = self._resolve_browser_bridge_source(
             browser_label=browser_label,
