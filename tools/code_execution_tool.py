@@ -45,6 +45,7 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
     "web_extract",
     "read_file",
     "write_file",
+    "append_file",
     "search_files",
     "patch",
     "terminal",
@@ -91,6 +92,12 @@ _TOOL_STUBS = {
         "write_file",
         "path: str, content: str",
         '"""Write content to a file (always overwrites). Returns dict with status."""',
+        '{"path": path, "content": content}',
+    ),
+    "append_file": (
+        "append_file",
+        "path: str, content: str",
+        '"""Append content to a file. Prefer for logs, diaries, and memory files. Returns dict with status."""',
         '{"path": path, "content": content}',
     ),
     "search_files": (
@@ -577,10 +584,12 @@ EXECUTE_CODE_SCHEMA = {
         "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}\n"
         "  write_file(path: str, content: str) -> dict\n"
         "    Always overwrites the entire file.\n"
+        "  append_file(path: str, content: str) -> dict\n"
+        "    Appends to the end of a file. Prefer for logs, daily memory, and repeated-record files.\n"
         "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50) -> dict\n"
         "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}\n"
         "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
-        "    Replaces old_string with new_string in the file.\n"
+        "    Replaces old_string with new_string in the file. Use append_file instead when updating logs or memory files with repeated boilerplate.\n"
         "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
         "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}\n\n"
         "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "

@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 
+from tools.interrupt import is_interrupted
+
 
 # ---------------------------------------------------------------------------
 # Write-path deny list — blocks writes to sensitive system/credential files
@@ -236,6 +238,11 @@ class FileOperations(ABC):
     @abstractmethod
     def write_file(self, path: str, content: str) -> WriteResult:
         """Write content to a file, creating directories as needed."""
+        ...
+
+    @abstractmethod
+    def append_file(self, path: str, content: str) -> WriteResult:
+        """Append content to a file, creating directories as needed."""
         ...
     
     @abstractmethod
@@ -943,6 +950,57 @@ class ShellFileOperations(FileOperations):
             return WriteResult(bytes_written=bytes_written, dirs_created=dirs_created)
         except Exception as e:
             return WriteResult(error=f"Failed to write file: {type(e).__name__}: {e}")
+
+    def append_file(self, path: str, content: str) -> WriteResult:
+        """
+        Append content to a file, creating parent directories as needed.
+
+        Prefer this for diary/log/memory files where repeated boilerplate
+        makes targeted patch matching ambiguous.
+        """
+        if self._is_windows_local_backend():
+            return self._append_file_windows(path, content)
+
+        path = self._expand_path(path)
+
+        if _is_write_denied(path):
+            return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+
+        parent = os.path.dirname(path)
+        dirs_created = False
+        if parent:
+            mkdir_cmd = f"mkdir -p {self._escape_shell_arg(parent)}"
+            mkdir_result = self._exec(mkdir_cmd)
+            if mkdir_result.exit_code == 0:
+                dirs_created = True
+
+        append_cmd = f"cat >> {self._escape_shell_arg(path)}"
+        append_result = self._exec(append_cmd, stdin_data=content)
+
+        if append_result.exit_code != 0:
+            return WriteResult(error=f"Failed to append file: {append_result.stdout}")
+
+        bytes_written = len(content.encode("utf-8"))
+        return WriteResult(bytes_written=bytes_written, dirs_created=dirs_created)
+
+    def _append_file_windows(self, path: str, content: str) -> WriteResult:
+        """Windows-native file append path for local backend."""
+        try:
+            resolved = self._resolve_windows_path(path)
+            parent = os.path.dirname(resolved)
+            dirs_created = False
+            if parent and not os.path.exists(parent):
+                os.makedirs(parent, exist_ok=True)
+                dirs_created = True
+
+            with open(resolved, "a", encoding="utf-8", newline="") as f:
+                f.write(content)
+                f.flush()
+
+            bytes_written = len(content.encode("utf-8"))
+            return WriteResult(bytes_written=bytes_written, dirs_created=dirs_created)
+        except Exception as e:
+            return WriteResult(error=f"Failed to append file: {type(e).__name__}: {e}")
     
     # =========================================================================
     # PATCH Implementation (Replace Mode)
@@ -1145,6 +1203,11 @@ class ShellFileOperations(FileOperations):
         import fnmatch
         import re as _re
 
+        def _interrupt_result() -> SearchResult:
+            return SearchResult(
+                error="Search interrupted by a newer user message.",
+            )
+
         base_path = self._resolve_windows_path(path or ".")
         if not os.path.exists(base_path):
             return SearchResult(error=f"Path not found: {base_path}")
@@ -1166,7 +1229,11 @@ class ShellFileOperations(FileOperations):
                 ) else []
             else:
                 for root, _, files in os.walk(base_path):
+                    if is_interrupted():
+                        return _interrupt_result()
                     for name in files:
+                        if is_interrupted():
+                            return _interrupt_result()
                         full = os.path.join(root, name)
                         if _is_env_file_path(full):
                             continue
@@ -1189,7 +1256,11 @@ class ShellFileOperations(FileOperations):
         else:
             files_to_scan = []
             for root, _, files in os.walk(base_path):
+                if is_interrupted():
+                    return _interrupt_result()
                 for name in files:
+                    if is_interrupted():
+                        return _interrupt_result()
                     if file_glob and not fnmatch.fnmatch(name, file_glob):
                         continue
                     if _is_env_file_path(os.path.join(root, name)):
@@ -1201,6 +1272,8 @@ class ShellFileOperations(FileOperations):
         counts: Dict[str, int] = {}
 
         for file_path in files_to_scan:
+            if is_interrupted():
+                return _interrupt_result()
             try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     lines = f.readlines()
@@ -1208,6 +1281,8 @@ class ShellFileOperations(FileOperations):
                 continue
             hit_count = 0
             for idx, line in enumerate(lines, start=1):
+                if is_interrupted():
+                    return _interrupt_result()
                 if regex.search(line):
                     hit_count += 1
                     if output_mode == "content":

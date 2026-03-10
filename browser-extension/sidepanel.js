@@ -31,6 +31,7 @@ const STATUS_ACTIVITY_MAX_CHARS = 700;
 const STATUS_ACTIVITY_MAX_LINES = 10;
 const PROGRESS_DETAIL_MAX_CHARS = 140;
 const PROGRESS_EVENT_MAX_CHARS = 110;
+const CHAT_AUTO_SCROLL_THRESHOLD_PX = 56;
 
 let activeTabId = null;
 let pollTimer = null;
@@ -837,7 +838,19 @@ function clearPendingIfAcknowledged() {
   }
 }
 
-function renderMessages(messages, progress = null, optimisticMessage = null) {
+function renderMessages(
+  messages,
+  progress = null,
+  optimisticMessage = null,
+  { forceScroll = false } = {}
+) {
+  const previousScrollTop = chatMessages.scrollTop;
+  const previousScrollHeight = chatMessages.scrollHeight;
+  const previousClientHeight = chatMessages.clientHeight;
+  const distanceFromBottom =
+    previousScrollHeight - (previousScrollTop + previousClientHeight);
+  const wasNearBottom = distanceFromBottom <= CHAT_AUTO_SCROLL_THRESHOLD_PX;
+
   chatMessages.textContent = "";
 
   const displayMessages = [...(Array.isArray(messages) ? messages : [])];
@@ -953,7 +966,11 @@ function renderMessages(messages, progress = null, optimisticMessage = null) {
     chatMessages.appendChild(wrapper);
   }
 
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  if (forceScroll || wasNearBottom) {
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    return;
+  }
+  chatMessages.scrollTop = previousScrollTop;
 }
 
 function applyTranscriptUiState(result) {
@@ -1195,7 +1212,12 @@ async function sendChatMessage(messageOverride = null, options = {}) {
 
   pendingUserMessage = buildOptimisticUserMessage(message, sharePage);
   pendingQueuedAt = Date.now();
-  renderMessages(currentMessages, { running: true, detail: "Sending your turn to Hermes...", recent_events: [] }, pendingUserMessage);
+  renderMessages(
+    currentMessages,
+    { running: true, detail: "Sending your turn to Hermes...", recent_events: [] },
+    pendingUserMessage,
+    { forceScroll: true }
+  );
   setBusyState(true);
   setStatus(sharePage ? "Sending your message with current page context..." : "Sending your message...", { openActivity: true });
   const targetSessionKey = String(selectedSessionKey || expectedSessionKey || "").trim();
@@ -1243,7 +1265,7 @@ async function sendChatMessage(messageOverride = null, options = {}) {
   }
 
   clearPendingIfAcknowledged();
-  renderMessages(currentMessages, currentProgress, pendingUserMessage);
+  renderMessages(currentMessages, currentProgress, pendingUserMessage, { forceScroll: true });
 
   const lines = ["Your turn was queued."];
   const sentPageTextLength = Number(response.result?.sent_page_text_length || 0);

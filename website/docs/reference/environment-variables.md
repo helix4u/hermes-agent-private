@@ -36,9 +36,15 @@ All variables go in `~/.hermes/.env`. You can also set them with `hermes config 
 |----------|-------------|
 | `FIRECRAWL_API_KEY` | Web scraping ([firecrawl.dev](https://firecrawl.dev/)) |
 | `FIRECRAWL_API_URL` | Custom Firecrawl API endpoint for self-hosted instances (optional) |
-| `BROWSERBASE_API_KEY` | Browser automation ([browserbase.com](https://browserbase.com/)) |
-| `BROWSERBASE_PROJECT_ID` | Browserbase project ID |
+| `BROWSER_BACKEND` | Browser backend: `playwright` (default) or `browserbase` |
+| `BROWSER_PROFILE_DIR` | Persistent browser profile directory for the Playwright backend |
+| `BROWSER_USER_AGENT` | Override user agent string for the Playwright backend |
+| `BROWSER_HEADLESS` | Run the Playwright backend headless (`true`/`false`, default: `false`) |
+| `BROWSER_TIMEZONE` | Override timezone used by the Playwright backend fingerprint |
+| `BROWSER_NAVIGATE_TIMEOUT` | Browser navigate timeout in seconds |
 | `BROWSER_INACTIVITY_TIMEOUT` | Browser session inactivity timeout in seconds |
+| `BROWSERBASE_API_KEY` | Browserbase API key when using the Browserbase backend |
+| `BROWSERBASE_PROJECT_ID` | Browserbase project ID when using the Browserbase backend |
 | `FAL_KEY` | Image generation ([fal.ai](https://fal.ai/)) |
 | `ELEVENLABS_API_KEY` | Premium TTS voices ([elevenlabs.io](https://elevenlabs.io/)) |
 | `HONCHO_API_KEY` | Cross-session user modeling ([honcho.dev](https://honcho.dev/)) |

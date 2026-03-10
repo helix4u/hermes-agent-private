@@ -1,7 +1,7 @@
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:8765/inject";
 const BRIDGE_TIMEOUT_MS = 12000;
-/** TTS can be slow for long text (external API + encoding); use a longer timeout. */
-const TTS_BRIDGE_TIMEOUT_MS = 120000;
+/** TTS can be slow for long text (chunked synthesis + stitching); keep timeout generous. */
+const TTS_BRIDGE_TIMEOUT_MS = 300000;
 const TRANSCRIPT_STATE_KEY = "sharedTranscriptKeys";
 const CLIENT_SESSION_ID_KEY = "clientSessionId";
 const PRIMARY_BROWSER_LABEL = "Hermes Sidecar";

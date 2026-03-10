@@ -114,6 +114,19 @@ if _config_path.exists():
             for _cfg_key, _env_var in _compression_env_map.items():
                 if _cfg_key in _compression_cfg:
                     os.environ[_env_var] = str(_compression_cfg[_cfg_key])
+        _browser_cfg = _cfg.get("browser", {})
+        if _browser_cfg and isinstance(_browser_cfg, dict):
+            _browser_env_map = {
+                "backend": "BROWSER_BACKEND",
+                "inactivity_timeout": "BROWSER_INACTIVITY_TIMEOUT",
+                "navigate_timeout": "BROWSER_NAVIGATE_TIMEOUT",
+                "headless": "BROWSER_HEADLESS",
+                "profile_dir": "BROWSER_PROFILE_DIR",
+                "user_agent": "BROWSER_USER_AGENT",
+            }
+            for _cfg_key, _env_var in _browser_env_map.items():
+                if _cfg_key in _browser_cfg:
+                    os.environ[_env_var] = str(_browser_cfg[_cfg_key])
         _agent_cfg = _cfg.get("agent", {})
         if _agent_cfg and isinstance(_agent_cfg, dict):
             if "max_turns" in _agent_cfg:
@@ -317,6 +330,115 @@ def _format_image_defaults(defaults: dict) -> str:
     if width and height:
         lines.append(f"- Resolution: `{width}x{height}`")
     return "\n".join(lines)
+
+
+_BROWSER_TTS_CHUNK_MAX_CHARS = 3500
+
+
+def _split_text_for_browser_tts(text: str, *, max_chars: int = _BROWSER_TTS_CHUNK_MAX_CHARS) -> List[str]:
+    """Split long browser-extension TTS text into natural chunks."""
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value).strip()
+    if not value:
+        return []
+    if len(value) <= max_chars:
+        return [value]
+
+    min_break = max(400, int(max_chars * 0.55))
+    chunks: List[str] = []
+    remaining = value
+
+    def _find_break_index(window: str) -> int:
+        for pattern in (r"\n\n+", r"(?<=[.!?])\s+", r"(?<=[,;:])\s+", r"\s+"):
+            candidates = [m.end() for m in re.finditer(pattern, window)]
+            for idx in reversed(candidates):
+                if idx >= min_break:
+                    return idx
+        return len(window)
+
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars]
+        break_index = _find_break_index(window)
+        chunk = remaining[:break_index].strip()
+        if not chunk:
+            chunk = remaining[:max_chars].strip()
+            break_index = len(chunk)
+        chunks.append(chunk)
+        remaining = remaining[break_index:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _concat_browser_tts_segments(segment_paths: List[Path], output_path: Path) -> Path:
+    """Concatenate MP3 segments into one output file for browser TTS playback."""
+    if not segment_paths:
+        raise ValueError("No TTS segments to concatenate.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(segment_paths) == 1:
+        shutil.copy2(segment_paths[0], output_path)
+        return output_path
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".txt",
+            delete=False,
+        ) as concat_file:
+            concat_list_path = Path(concat_file.name)
+            for segment in segment_paths:
+                # ffmpeg concat demuxer expects shell-style quoted paths.
+                escaped = str(segment).replace("'", "'\\''")
+                concat_file.write(f"file '{escaped}'\n")
+        try:
+            proc = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(concat_list_path),
+                    "-c",
+                    "copy",
+                    str(output_path),
+                    "-y",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+                return output_path
+            logger.warning(
+                "Browser TTS ffmpeg concat failed (%s): %s",
+                proc.returncode,
+                (proc.stderr or proc.stdout or "").strip(),
+            )
+        except Exception as exc:
+            logger.warning("Browser TTS ffmpeg concat failed with exception: %s", exc)
+        finally:
+            try:
+                concat_list_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    # Fallback: MP3 frame concatenation is widely supported by players.
+    with open(output_path, "wb") as dest:
+        for segment in segment_paths:
+            with open(segment, "rb") as src:
+                shutil.copyfileobj(src, dest)
+    return output_path
 
 
 def _get_wiki_source_root() -> Path:
@@ -1995,26 +2117,71 @@ class GatewayRunner:
             if not text:
                 raise ValueError("TTS text is required.")
 
-            from tools.tts_tool import text_to_speech_tool
+            from tools.tts_tool import MAX_TEXT_LENGTH, text_to_speech_tool
 
             audio_dir = _hermes_home / "audio_cache"
             audio_dir.mkdir(parents=True, exist_ok=True)
             output_path = audio_dir / f"browser_tts_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.mp3"
 
-            result_json = await asyncio.to_thread(
-                text_to_speech_tool,
+            segments = _split_text_for_browser_tts(
                 text,
-                str(output_path),
+                max_chars=min(int(MAX_TEXT_LENGTH), _BROWSER_TTS_CHUNK_MAX_CHARS),
             )
-            try:
-                result = json.loads(result_json)
-            except Exception as exc:
-                raise ValueError(f"Invalid TTS response: {result_json}") from exc
+            if not segments:
+                raise ValueError("TTS text is required.")
 
-            if not result.get("success"):
-                raise ValueError(str(result.get("error") or "TTS generation failed."))
+            provider = ""
+            file_path = output_path
+            if len(segments) == 1:
+                result_json = await asyncio.to_thread(
+                    text_to_speech_tool,
+                    segments[0],
+                    str(output_path),
+                )
+                try:
+                    result = json.loads(result_json)
+                except Exception as exc:
+                    raise ValueError(f"Invalid TTS response: {result_json}") from exc
+                if not result.get("success"):
+                    raise ValueError(str(result.get("error") or "TTS generation failed."))
+                file_path = Path(str(result.get("file_path") or "").strip())
+                provider = str(result.get("provider") or "")
+                if not file_path.exists() or file_path.stat().st_size <= 0:
+                    raise ValueError("TTS audio file was not created.")
+            else:
+                logger.info(
+                    "Browser TTS request split into %d chunk(s) (%d chars total).",
+                    len(segments),
+                    len(text),
+                )
+                chunk_dir = Path(tempfile.mkdtemp(prefix="browser_tts_chunks_", dir=str(audio_dir)))
+                chunk_paths: List[Path] = []
+                try:
+                    for index, chunk_text in enumerate(segments, start=1):
+                        chunk_output = chunk_dir / f"chunk_{index:03d}.mp3"
+                        result_json = await asyncio.to_thread(
+                            text_to_speech_tool,
+                            chunk_text,
+                            str(chunk_output),
+                        )
+                        try:
+                            result = json.loads(result_json)
+                        except Exception as exc:
+                            raise ValueError(f"Invalid TTS response: {result_json}") from exc
+                        if not result.get("success"):
+                            raise ValueError(str(result.get("error") or f"TTS chunk {index} failed."))
+                        provider = provider or str(result.get("provider") or "")
+                        produced_path = Path(str(result.get("file_path") or "").strip())
+                        if not produced_path.exists() or produced_path.stat().st_size <= 0:
+                            raise ValueError(f"TTS chunk {index} audio file was not created.")
+                        chunk_paths.append(produced_path)
+                    file_path = _concat_browser_tts_segments(chunk_paths, output_path)
+                finally:
+                    try:
+                        shutil.rmtree(chunk_dir, ignore_errors=True)
+                    except Exception:
+                        pass
 
-            file_path = Path(str(result.get("file_path") or "").strip())
             if not file_path.exists() or file_path.stat().st_size <= 0:
                 raise ValueError("TTS audio file was not created.")
 
@@ -2022,7 +2189,7 @@ class GatewayRunner:
             audio_base64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
             return {
                 "ok": True,
-                "provider": str(result.get("provider") or ""),
+                "provider": provider,
                 "mime_type": mime_type,
                 "audio_base64": audio_base64,
             }

@@ -77,6 +77,17 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
+def _resolve_default_toolsets() -> List[str]:
+    """Resolve child-agent default toolsets from config with a safe fallback."""
+    cfg = _load_config()
+    configured = cfg.get("default_toolsets")
+    if isinstance(configured, list):
+        cleaned = [str(t).strip() for t in configured if str(t).strip()]
+        if cleaned:
+            return cleaned
+    return list(DEFAULT_TOOLSETS)
+
+
 def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -174,7 +185,7 @@ def _run_single_child(
 
     child_start = time.monotonic()
 
-    child_toolsets = _strip_blocked_tools(toolsets or DEFAULT_TOOLSETS)
+    child_toolsets = _strip_blocked_tools(toolsets or _resolve_default_toolsets())
 
     child_prompt = _build_child_system_prompt(goal, context)
 
@@ -493,7 +504,8 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Toolsets to enable for this subagent. "
-                    "Default: ['terminal', 'file', 'web']. "
+                    "Default: uses config delegation.default_toolsets "
+                    "(fallback ['terminal', 'file', 'web']). "
                     "Common patterns: ['terminal', 'file'] for code work, "
                     "['web'] for research, ['terminal', 'file', 'web'] for "
                     "full-stack tasks."

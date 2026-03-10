@@ -15,7 +15,8 @@ Resolution order for text tasks:
 Resolution order for vision/multimodal tasks:
   1. OpenRouter
   2. Nous Portal
-  3. None  (custom endpoints can't substitute for Gemini multimodal)
+  3. Codex OAuth (Responses API with multimodal input)
+  4. None  (custom endpoints still can't substitute for multimodal support)
 """
 
 import json
@@ -64,6 +65,72 @@ _PROVIDER_ALIASES = {
 }
 
 
+def _chat_content_to_text(content: Any) -> str:
+    """Extract text from chat.completions-style message content."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+
+    parts: List[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in {"text", "input_text", "output_text"}:
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _chat_content_to_responses_content(content: Any) -> Any:
+    """Convert chat.completions content into Responses input content."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        text = str(content or "")
+        return text if text else ""
+
+    converted: List[Dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                converted.append({"type": "input_text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type in {"text", "input_text", "output_text"}:
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                converted.append({"type": "input_text", "text": text})
+            continue
+
+        if item_type in {"image_url", "input_image"}:
+            image_url = item.get("image_url")
+            detail = item.get("detail")
+            if isinstance(image_url, dict):
+                detail = image_url.get("detail", detail)
+                image_url = image_url.get("url") or image_url.get("image_url")
+            if isinstance(image_url, str) and image_url:
+                payload: Dict[str, Any] = {
+                    "type": "input_image",
+                    "image_url": image_url,
+                }
+                if isinstance(detail, str) and detail:
+                    payload["detail"] = detail
+                converted.append(payload)
+
+    if not converted:
+        return _chat_content_to_text(content)
+    return converted
+
+
 # ── Codex Responses → chat.completions adapter ─────────────────────────────
 # All auxiliary consumers call client.chat.completions.create(**kwargs) and
 # read response.choices[0].message.content. This adapter translates those
@@ -80,7 +147,6 @@ class _CodexCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
-        temperature = kwargs.get("temperature")
 
         # Separate system/instructions from conversation messages
         instructions = "You are a helpful assistant."
@@ -89,20 +155,19 @@ class _CodexCompletionsAdapter:
             role = msg.get("role", "user")
             content = msg.get("content") or ""
             if role == "system":
-                instructions = content
+                instructions = _chat_content_to_text(content) or instructions
             else:
-                input_msgs.append({"role": role, "content": content})
+                input_msgs.append({
+                    "role": role,
+                    "content": _chat_content_to_responses_content(content),
+                })
 
         resp_kwargs: Dict[str, Any] = {
             "model": model,
             "instructions": instructions,
             "input": input_msgs or [{"role": "user", "content": ""}],
-            "stream": True,
             "store": False,
         }
-
-        if temperature is not None:
-            resp_kwargs["temperature"] = temperature
 
         # Tools support for flush_memories and similar callers
         tools = kwargs.get("tools")
@@ -461,9 +526,65 @@ def get_async_text_auxiliary_client():
 def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, model_slug) for vision/multimodal auxiliary tasks.
 
-    Only OpenRouter and Nous Portal qualify — custom endpoints cannot
-    substitute for Gemini multimodal.
+    Falls through OpenRouter -> Nous Portal -> Codex OAuth -> (None, None).
+    Custom endpoints are not assumed to provide multimodal compatibility.
     """
+    forced_provider_raw = os.getenv(_AUX_PROVIDER_ENV, "auto").strip().lower()
+    forced_provider = _normalize_provider_name(forced_provider_raw)
+    valid_providers = {"auto", "openrouter", "nous", "custom", "openai-codex"}
+    if forced_provider not in valid_providers:
+        logger.warning(
+            "Unknown %s value '%s'; using auto auxiliary provider selection",
+            _AUX_PROVIDER_ENV,
+            forced_provider_raw,
+        )
+        forced_provider = "auto"
+
+    if forced_provider == "openrouter":
+        or_key = os.getenv("OPENROUTER_API_KEY")
+        if not or_key:
+            logger.warning("%s=openrouter but OPENROUTER_API_KEY is not set", _AUX_PROVIDER_ENV)
+            return None, None
+        logger.debug("Auxiliary vision client: OpenRouter (forced)")
+        return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
+                      default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+
+    if forced_provider == "nous":
+        nous = _read_nous_auth()
+        if not nous:
+            logger.warning("%s=nous but no active Nous auth was found", _AUX_PROVIDER_ENV)
+            return None, None
+        logger.debug("Auxiliary vision client: Nous Portal (forced)")
+        return OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()), _NOUS_MODEL
+
+    if forced_provider == "custom":
+        logger.warning(
+            "%s=custom is not supported for auxiliary vision; use OpenRouter, Nous, or openai-codex",
+            _AUX_PROVIDER_ENV,
+        )
+        return None, None
+
+    if forced_provider == "openai-codex":
+        codex_token = _read_codex_access_token()
+        if not codex_token:
+            logger.warning("%s=openai-codex but no Codex token was found", _AUX_PROVIDER_ENV)
+            return None, None
+        logger.debug("Auxiliary vision client: Codex OAuth (%s, forced)", _CODEX_AUX_MODEL)
+        real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
+        return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
+
+    if forced_provider == "auto":
+        preferred_provider = _resolve_auto_provider_preference()
+        if preferred_provider == "openai-codex":
+            codex_token = _read_codex_access_token()
+            if codex_token:
+                logger.debug(
+                    "Auxiliary vision client: Codex OAuth (%s via runtime provider preference)",
+                    _CODEX_AUX_MODEL,
+                )
+                real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
+                return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
+
     # 1. OpenRouter
     or_key = os.getenv("OPENROUTER_API_KEY")
     if or_key:
@@ -480,9 +601,36 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
             _NOUS_MODEL,
         )
 
-    # 3. Nothing suitable
+    # 3. Codex OAuth
+    codex_token = _read_codex_access_token()
+    if codex_token:
+        logger.debug("Auxiliary vision client: Codex OAuth (%s via Responses API)", _CODEX_AUX_MODEL)
+        real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
+        return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
+
+    # 4. Nothing suitable
     logger.debug("Auxiliary vision client: none available")
     return None, None
+
+
+def get_async_vision_auxiliary_client():
+    """Return (async_client, model_slug) for async multimodal auxiliary tasks."""
+    from openai import AsyncOpenAI
+
+    sync_client, model = get_vision_auxiliary_client()
+    if sync_client is None:
+        return None, None
+
+    if isinstance(sync_client, CodexAuxiliaryClient):
+        return AsyncCodexAuxiliaryClient(sync_client), model
+
+    async_kwargs = {
+        "api_key": sync_client.api_key,
+        "base_url": str(sync_client.base_url),
+    }
+    if "openrouter" in str(sync_client.base_url).lower():
+        async_kwargs["default_headers"] = dict(_OR_HEADERS)
+    return AsyncOpenAI(**async_kwargs), model
 
 
 def get_auxiliary_extra_body() -> dict:

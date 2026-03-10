@@ -79,7 +79,7 @@ Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, we
 | Feature | Provider | Env Variable |
 |---------|----------|--------------|
 | Web scraping | [Firecrawl](https://firecrawl.dev/) | `FIRECRAWL_API_KEY` |
-| Browser automation | [Browserbase](https://browserbase.com/) | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` |
+| Browser automation | Local Playwright by default; optional [Browserbase](https://browserbase.com/) fallback | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` only if using Browserbase |
 | Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
 | Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
 | OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
@@ -139,6 +139,28 @@ terminal:
 ```
 
 See [Code Execution](features/code-execution.md) and the [Terminal section of the README](features/tools.md) for details on each backend.
+
+## Browser Backend Configuration
+
+Configure which browser engine the browser tools use:
+
+```yaml
+browser:
+  backend: playwright      # default: playwright, optional: browserbase
+  navigate_timeout: 12
+  inactivity_timeout: 120
+  headless: false
+```
+
+Optional environment variables for the local backend:
+
+```bash
+BROWSER_PROFILE_DIR=~/.hermes/browser-profile
+BROWSER_USER_AGENT=Mozilla/5.0 (...)
+BROWSER_TIMEZONE=America/Denver
+```
+
+Use `backend: browserbase` only if you explicitly want Browserbase sessions and have the corresponding credentials in `.env`.
 
 ## Memory Configuration
 

@@ -141,6 +141,17 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
+def append_file_tool(path: str, content: str, task_id: str = "default") -> str:
+    """Append content to a file."""
+    try:
+        file_ops = _get_file_ops(task_id)
+        result = file_ops.append_file(path, content)
+        return json.dumps(result.to_dict(), ensure_ascii=False)
+    except Exception as e:
+        print(f"[FileTools] append_file error: {type(e).__name__}: {e}", flush=True)
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default") -> str:
@@ -185,6 +196,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 FILE_TOOLS = [
     {"name": "read_file", "function": read_file_tool},
     {"name": "write_file", "function": write_file_tool},
+    {"name": "append_file", "function": append_file_tool},
     {"name": "patch", "function": patch_tool},
     {"name": "search_files", "function": search_tool}
 ]
@@ -233,9 +245,22 @@ WRITE_FILE_SCHEMA = {
     }
 }
 
+APPEND_FILE_SCHEMA = {
+    "name": "append_file",
+    "description": "Append content to the end of a file, creating the file and parent directories if needed. Prefer this for logs, diary files, memory files, and repeated-record documents where 'patch' would be ambiguous because many blocks look alike.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file to append to (created if it doesn't exist)"},
+            "content": {"type": "string", "description": "Text to append exactly as provided"}
+        },
+        "required": ["path", "content"]
+    }
+}
+
 PATCH_SCHEMA = {
     "name": "patch",
-    "description": "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. Returns a unified diff. Auto-runs syntax checks after editing.\n\nReplace mode (default): find a unique string and replace it.\nPatch mode: apply V4A multi-file patches for bulk changes.",
+    "description": "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. Returns a unified diff. Auto-runs syntax checks after editing.\n\nReplace mode (default): find a unique string and replace it. Do not use this to append to logs or memory files with repeated boilerplate; use append_file for that.\nPatch mode: apply V4A multi-file patches for bulk changes.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -280,6 +305,11 @@ def _handle_write_file(args, **kw):
     return write_file_tool(path=args.get("path", ""), content=args.get("content", ""), task_id=tid)
 
 
+def _handle_append_file(args, **kw):
+    tid = kw.get("task_id") or "default"
+    return append_file_tool(path=args.get("path", ""), content=args.get("content", ""), task_id=tid)
+
+
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
     return patch_tool(
@@ -301,5 +331,6 @@ def _handle_search_files(args, **kw):
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs)
+registry.register(name="append_file", toolset="file", schema=APPEND_FILE_SCHEMA, handler=_handle_append_file, check_fn=_check_file_reqs)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs)

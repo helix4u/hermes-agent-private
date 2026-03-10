@@ -11,6 +11,7 @@ Handles:
 import logging
 import os
 import json
+import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -351,7 +352,14 @@ class SessionStore:
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_file, sessions_file)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_file, sessions_file)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""

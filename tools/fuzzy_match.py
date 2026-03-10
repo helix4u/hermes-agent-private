@@ -75,7 +75,8 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
             if len(matches) > 1 and not replace_all:
                 return content, 0, (
                     f"Found {len(matches)} matches for old_string. "
-                    f"Provide more context to make it unique, or use replace_all=True."
+                    f"Provide more context to make it unique, use replace_all=True, "
+                    f"or use append_file when you are adding to a repeated log/memory file."
                 )
             
             # Perform replacement

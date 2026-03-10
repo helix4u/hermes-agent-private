@@ -2,17 +2,17 @@
 """
 Browser Tool Module
 
-This module provides browser automation tools using agent-browser CLI with
-Browserbase cloud execution. It enables AI agents to navigate websites,
+This module provides browser automation tools using either a local Playwright
+backend or the legacy Browserbase cloud backend. It enables AI agents to navigate websites,
 interact with page elements, and extract information in a text-based format.
 
 The tool uses agent-browser's accessibility tree (ariaSnapshot) for text-based
 page representation, making it ideal for LLM agents without vision capabilities.
 
 Features:
-- Cloud browser execution via Browserbase (no local browser needed)
-- Basic Stealth Mode always active (random fingerprints, CAPTCHA solving)
-- Proxies enabled by default for better CAPTCHA solving and anti-bot avoidance
+- Local Playwright execution by default with a persistent browser profile
+- User-agent spoofing and anti-automation shims for common fingerprint checks
+- Optional Browserbase fallback for cloud execution
 - Session isolation per task ID
 - Text-based page snapshots using accessibility tree
 - Element interaction via ref selectors (@e1, @e2, etc.)
@@ -20,8 +20,14 @@ Features:
 - Automatic cleanup of browser sessions
 
 Environment Variables:
+- BROWSER_BACKEND: `playwright` (default) or `browserbase`
+- BROWSER_PROFILE_DIR: Persistent Playwright profile directory
+- BROWSER_USER_AGENT: Override the Playwright user agent string
+- BROWSER_HEADLESS: Run Playwright headless (`true`/`false`, default: `false`)
+- BROWSER_TIMEZONE: Override the Playwright timezone fingerprint
 - BROWSERBASE_API_KEY: API key for Browserbase (required)
 - BROWSERBASE_PROJECT_ID: Project ID for Browserbase (required)
+- BROWSER_NAVIGATE_TIMEOUT: Timeout for page navigation in seconds (default: "12")
 - BROWSERBASE_PROXIES: Enable/disable residential proxies (default: "true")
 - BROWSERBASE_ADVANCED_STEALTH: Enable advanced stealth mode with custom Chromium,
   requires Scale Plan (default: "false")
@@ -55,6 +61,7 @@ import tempfile
 import threading
 import time
 import requests
+from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from agent.auxiliary_client import get_vision_auxiliary_client
@@ -67,6 +74,32 @@ logger = logging.getLogger(__name__)
 
 # Default timeout for browser commands (seconds)
 DEFAULT_COMMAND_TIMEOUT = 30
+
+# Default timeout for browser navigation (seconds)
+BROWSER_NAVIGATE_TIMEOUT = int(os.environ.get("BROWSER_NAVIGATE_TIMEOUT", "12"))
+
+# Browser backend selection
+BROWSER_BACKEND = os.environ.get("BROWSER_BACKEND", "playwright").strip().lower()
+BROWSER_HEADLESS = os.environ.get("BROWSER_HEADLESS", "false").strip().lower() == "true"
+BROWSER_PROFILE_DIR = os.environ.get(
+    "BROWSER_PROFILE_DIR",
+    str(Path.home() / ".hermes" / "browser-profile"),
+)
+BROWSER_USER_AGENT = os.environ.get(
+    "BROWSER_USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+    ),
+)
+BROWSER_VIEWPORT_WIDTH = int(os.environ.get("BROWSER_VIEWPORT_WIDTH", "1440"))
+BROWSER_VIEWPORT_HEIGHT = int(os.environ.get("BROWSER_VIEWPORT_HEIGHT", "960"))
+BROWSER_SCREEN_WIDTH = int(os.environ.get("BROWSER_SCREEN_WIDTH", "1536"))
+BROWSER_SCREEN_HEIGHT = int(os.environ.get("BROWSER_SCREEN_HEIGHT", "1024"))
+BROWSER_DEVICE_SCALE_FACTOR = float(os.environ.get("BROWSER_DEVICE_SCALE_FACTOR", "1.25"))
+BROWSER_HARDWARE_CONCURRENCY = int(os.environ.get("BROWSER_HARDWARE_CONCURRENCY", "8"))
+BROWSER_DEVICE_MEMORY = int(os.environ.get("BROWSER_DEVICE_MEMORY", "8"))
+BROWSER_MAX_TOUCH_POINTS = int(os.environ.get("BROWSER_MAX_TOUCH_POINTS", "0"))
 
 # Default session timeout (seconds)
 DEFAULT_SESSION_TIMEOUT = 300
@@ -103,6 +136,408 @@ _cleanup_running = False
 # (subagents run concurrently via ThreadPoolExecutor)
 _cleanup_lock = threading.Lock()
 
+# Local Playwright state
+_playwright_runtime: Dict[str, Any] = {}
+_local_browser_pages: Dict[str, Any] = {}
+_local_ref_maps: Dict[str, Dict[str, str]] = {}
+
+
+def _using_playwright_backend() -> bool:
+    return BROWSER_BACKEND in {"playwright", "local"}
+
+
+def _detect_browser_timezone() -> str:
+    explicit = os.environ.get("BROWSER_TIMEZONE") or os.environ.get("TZ")
+    if explicit:
+        return explicit.strip()
+
+    try:
+        tzinfo = datetime.now().astimezone().tzinfo
+        for attr in ("key", "zone"):
+            value = getattr(tzinfo, attr, None)
+            if value:
+                return str(value)
+    except Exception:
+        pass
+
+    return "UTC"
+
+
+BROWSER_TIMEZONE = _detect_browser_timezone()
+
+
+def _get_playwright_stealth_script() -> str:
+    fingerprint = json.dumps({
+        "timezone": BROWSER_TIMEZONE,
+        "hardwareConcurrency": BROWSER_HARDWARE_CONCURRENCY,
+        "deviceMemory": BROWSER_DEVICE_MEMORY,
+        "maxTouchPoints": BROWSER_MAX_TOUCH_POINTS,
+        "screenWidth": BROWSER_SCREEN_WIDTH,
+        "screenHeight": BROWSER_SCREEN_HEIGHT,
+        "availWidth": BROWSER_SCREEN_WIDTH,
+        "availHeight": max(BROWSER_SCREEN_HEIGHT - 40, BROWSER_VIEWPORT_HEIGHT),
+        "colorDepth": 24,
+        "pixelDepth": 24,
+        "devicePixelRatio": BROWSER_DEVICE_SCALE_FACTOR,
+        "mediaDevices": [
+            {"deviceId": "default-audio-in", "groupId": "grp-audio", "kind": "audioinput", "label": "Default Microphone"},
+            {"deviceId": "default-audio-out", "groupId": "grp-audio", "kind": "audiooutput", "label": "Default Speakers"},
+            {"deviceId": "default-video", "groupId": "grp-video", "kind": "videoinput", "label": "Integrated Camera"},
+        ],
+    })
+    script = """
+(() => {
+  const cfg = __HERMES_FINGERPRINT__;
+  const override = (obj, key, value) => {
+    try {
+      Object.defineProperty(obj, key, { get: () => value, configurable: true });
+    } catch (_) {}
+  };
+  override(navigator, 'webdriver', undefined);
+  override(navigator, 'languages', ['en-US', 'en']);
+  override(navigator, 'platform', 'Win32');
+  override(navigator, 'plugins', [1, 2, 3, 4, 5]);
+  override(navigator, 'hardwareConcurrency', cfg.hardwareConcurrency);
+  override(navigator, 'deviceMemory', cfg.deviceMemory);
+  override(navigator, 'maxTouchPoints', cfg.maxTouchPoints);
+  if (!window.chrome) {
+    Object.defineProperty(window, 'chrome', {
+      value: { runtime: {}, app: {}, webstore: {} },
+      configurable: true,
+    });
+  }
+  override(screen, 'width', cfg.screenWidth);
+  override(screen, 'height', cfg.screenHeight);
+  override(screen, 'availWidth', cfg.availWidth);
+  override(screen, 'availHeight', cfg.availHeight);
+  override(screen, 'colorDepth', cfg.colorDepth);
+  override(screen, 'pixelDepth', cfg.pixelDepth);
+  override(window, 'devicePixelRatio', cfg.devicePixelRatio);
+  const originalResolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
+  Intl.DateTimeFormat.prototype.resolvedOptions = function(...args) {
+    const result = originalResolvedOptions.apply(this, args);
+    return { ...result, timeZone: cfg.timezone };
+  };
+  const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+  if (originalQuery) {
+    window.navigator.permissions.query = (parameters) => (
+      parameters && parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters)
+    );
+  }
+  if (!navigator.mediaDevices) {
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: {},
+      configurable: true,
+    });
+  }
+  if (navigator.mediaDevices) {
+    navigator.mediaDevices.enumerateDevices = async () => cfg.mediaDevices;
+    navigator.mediaDevices.getSupportedConstraints = () => ({
+      width: true,
+      height: true,
+      aspectRatio: true,
+      frameRate: true,
+      facingMode: true,
+      resizeMode: true,
+    });
+  }
+  const originalMatchMedia = window.matchMedia;
+  window.matchMedia = (query) => {
+    if (query === '(prefers-color-scheme: dark)') {
+      return { matches: false, media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return false; } };
+    }
+    if (query === '(prefers-reduced-motion: reduce)') {
+      return { matches: false, media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return false; } };
+    }
+    return originalMatchMedia(query);
+  };
+})();
+"""
+    return script.replace("__HERMES_FINGERPRINT__", fingerprint)
+
+
+def _ensure_playwright_runtime() -> Dict[str, Any]:
+    if _playwright_runtime.get("context") is not None:
+        return _playwright_runtime
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:  # pragma: no cover - import failure path
+        raise RuntimeError(
+            "Playwright backend requested but the Python Playwright package is unavailable. "
+            "Install it with `pip install playwright` and `playwright install chromium`."
+        ) from exc
+
+    profile_dir = Path(BROWSER_PROFILE_DIR).expanduser()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    playwright = sync_playwright().start()
+    context = playwright.chromium.launch_persistent_context(
+        user_data_dir=str(profile_dir),
+        headless=BROWSER_HEADLESS,
+        user_agent=BROWSER_USER_AGENT,
+        viewport={"width": BROWSER_VIEWPORT_WIDTH, "height": BROWSER_VIEWPORT_HEIGHT},
+        screen={"width": BROWSER_SCREEN_WIDTH, "height": BROWSER_SCREEN_HEIGHT},
+        device_scale_factor=BROWSER_DEVICE_SCALE_FACTOR,
+        timezone_id=BROWSER_TIMEZONE,
+        has_touch=BROWSER_MAX_TOUCH_POINTS > 0,
+        is_mobile=False,
+        locale="en-US",
+        color_scheme="light",
+        reduced_motion="no-preference",
+        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--no-default-browser-check",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ],
+    )
+    context.add_init_script(_get_playwright_stealth_script())
+    _playwright_runtime.update({
+        "playwright": playwright,
+        "context": context,
+        "profile_dir": str(profile_dir),
+    })
+    return _playwright_runtime
+
+
+def _shutdown_playwright_runtime() -> None:
+    context = _playwright_runtime.get("context")
+    playwright = _playwright_runtime.get("playwright")
+    try:
+        if context is not None:
+            context.close()
+    finally:
+        if playwright is not None:
+            playwright.stop()
+        _playwright_runtime.clear()
+
+
+def _ensure_local_page(task_id: str):
+    runtime = _ensure_playwright_runtime()
+    page = _local_browser_pages.get(task_id)
+    if page is not None and not page.is_closed():
+        return page
+
+    page = runtime["context"].new_page()
+    _local_browser_pages[task_id] = page
+    with _cleanup_lock:
+        _active_sessions[task_id] = {
+            "session_name": f"playwright_{task_id}",
+            "backend": "playwright",
+            "profile_dir": runtime["profile_dir"],
+        }
+    return page
+
+
+def _build_local_snapshot(page, full: bool) -> Dict[str, Any]:
+    snapshot_js = """
+({ full }) => {
+  const normalize = (value, maxLen) => (value || "").replace(/\\s+/g, " ").trim().slice(0, maxLen);
+  const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style &&
+      style.visibility !== "hidden" &&
+      style.display !== "none" &&
+      rect.width > 0 &&
+      rect.height > 0;
+  };
+  const cssPath = (el) => {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const parts = [];
+    let current = el;
+    while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 6) {
+      let selector = current.nodeName.toLowerCase();
+      if (current.classList && current.classList.length) {
+        selector += "." + Array.from(current.classList).slice(0, 2).map((cls) => CSS.escape(cls)).join(".");
+      }
+      let sibling = current;
+      let index = 1;
+      while ((sibling = sibling.previousElementSibling)) {
+        if (sibling.nodeName === current.nodeName) index += 1;
+      }
+      selector += `:nth-of-type(${index})`;
+      parts.unshift(selector);
+      current = current.parentElement;
+    }
+    return parts.join(" > ");
+  };
+
+  const selectors = [
+    "a[href]",
+    "button",
+    "input",
+    "textarea",
+    "select",
+    "[role='button']",
+    "[role='link']",
+    "[contenteditable='true']",
+    "summary"
+  ].join(",");
+  const interactive = Array.from(document.querySelectorAll(selectors))
+    .filter(isVisible)
+    .slice(0, full ? 200 : 80)
+    .map((el, index) => {
+      const ref = `@e${index + 1}`;
+      const label = normalize(
+        el.getAttribute("aria-label") ||
+        el.innerText ||
+        el.textContent ||
+        el.getAttribute("placeholder") ||
+        el.getAttribute("name") ||
+        el.getAttribute("title"),
+        140
+      );
+      return {
+        ref,
+        selector: cssPath(el),
+        tag: el.tagName.toLowerCase(),
+        type: el.getAttribute("type") || "",
+        label,
+      };
+    });
+
+  const refs = {};
+  interactive.forEach((item) => {
+    refs[item.ref] = item.selector;
+  });
+
+  const bodyText = normalize(document.body ? document.body.innerText : "", full ? 12000 : 4000);
+  const lines = [
+    `Title: ${document.title || ""}`,
+    `URL: ${location.href}`,
+  ];
+  if (bodyText) {
+    lines.push("");
+    lines.push("Visible text:");
+    lines.push(bodyText);
+  }
+  if (interactive.length) {
+    lines.push("");
+    lines.push("Interactive elements:");
+    interactive.forEach((item) => {
+      const extras = [item.tag, item.type].filter(Boolean).join("/");
+      lines.push(`${item.ref} ${extras}: ${item.label || "<no label>"}`);
+    });
+  }
+  return { snapshot: lines.join("\\n"), refs };
+}
+"""
+    return page.evaluate(snapshot_js, {"full": full})
+
+
+def _lookup_local_selector(task_id: str, ref: str) -> str:
+    ref_map = _local_ref_maps.get(task_id, {})
+    selector = ref_map.get(ref)
+    if selector:
+        return selector
+    raise RuntimeError(
+        f"Unknown element ref {ref}. Snapshot refs go stale after navigation or DOM changes; run browser_snapshot again."
+    )
+
+
+def _run_playwright_command(
+    task_id: str,
+    command: str,
+    args: Optional[List[str]] = None,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
+) -> Dict[str, Any]:
+    args = args or []
+    _start_browser_cleanup_thread()
+    _update_session_activity(task_id)
+
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    except Exception:  # pragma: no cover - import already validated
+        PlaywrightTimeoutError = TimeoutError
+
+    try:
+        if command == "close":
+            page = _local_browser_pages.pop(task_id, None)
+            _local_ref_maps.pop(task_id, None)
+            with _cleanup_lock:
+                _active_sessions.pop(task_id, None)
+                _session_last_activity.pop(task_id, None)
+            if page is not None and not page.is_closed():
+                page.close()
+            if not _local_browser_pages:
+                _shutdown_playwright_runtime()
+            return {"success": True, "data": {"closed": True}}
+
+        page = _ensure_local_page(task_id)
+        page.set_default_timeout(timeout * 1000)
+
+        if command == "open":
+            target = args[0]
+            page.goto(target, wait_until="domcontentloaded", timeout=timeout * 1000)
+            page.wait_for_timeout(350)
+            return {
+                "success": True,
+                "data": {
+                    "url": page.url,
+                    "title": page.title(),
+                }
+            }
+        if command == "snapshot":
+            full = "-c" not in args
+            data = _build_local_snapshot(page, full=full)
+            _local_ref_maps[task_id] = data.get("refs", {})
+            return {"success": True, "data": data}
+        if command == "click":
+            ref = args[0]
+            selector = _lookup_local_selector(task_id, ref)
+            page.locator(selector).first.click(timeout=timeout * 1000)
+            return {"success": True, "data": {"clicked": ref}}
+        if command == "fill":
+            ref, text = args[0], args[1]
+            selector = _lookup_local_selector(task_id, ref)
+            page.locator(selector).first.fill(text, timeout=timeout * 1000)
+            return {"success": True, "data": {"filled": ref}}
+        if command == "scroll":
+            direction = args[0]
+            delta = 900 if direction == "down" else -900
+            page.mouse.wheel(0, delta)
+            page.wait_for_timeout(150)
+            return {"success": True, "data": {"direction": direction}}
+        if command == "back":
+            page.go_back(wait_until="domcontentloaded", timeout=timeout * 1000)
+            page.wait_for_timeout(200)
+            return {"success": True, "data": {"url": page.url, "title": page.title()}}
+        if command == "press":
+            page.keyboard.press(args[0])
+            return {"success": True, "data": {"pressed": args[0]}}
+        if command == "eval":
+            result = page.evaluate(args[0])
+            return {"success": True, "data": {"result": result}}
+        if command == "screenshot":
+            path = args[0]
+            page.screenshot(path=path, full_page=False)
+            return {"success": True, "data": {"path": path}}
+
+        return {"success": False, "error": f"Unsupported Playwright browser command: {command}"}
+
+    except PlaywrightTimeoutError:
+        if command == "open":
+            target = args[0] if args else "<unknown url>"
+            return {
+                "success": False,
+                "error": (
+                    f"Navigation to {target} did not finish within {timeout} seconds under the Playwright backend. "
+                    "The page may be slow, blocked, or stuck in client-side rendering."
+                ),
+            }
+        return {
+            "success": False,
+            "error": f"Playwright browser command '{command}' timed out after {timeout} seconds.",
+        }
+    except Exception as exc:
+        return {"success": False, "error": f"Playwright browser command '{command}' failed: {exc}"}
+
 
 def _emergency_cleanup_all_sessions():
     """
@@ -115,6 +550,21 @@ def _emergency_cleanup_all_sessions():
     _cleanup_done = True
     
     if not _active_sessions:
+        return
+
+    if _using_playwright_backend():
+        try:
+            for task_id in list(_local_browser_pages.keys()):
+                try:
+                    _run_playwright_command(task_id, "close", [], timeout=5)
+                except Exception as exc:
+                    logger.error("Error closing local Playwright page %s: %s", task_id, exc)
+            _shutdown_playwright_runtime()
+            _local_browser_pages.clear()
+            _local_ref_maps.clear()
+            _active_sessions.clear()
+        except Exception as e:
+            logger.error("Emergency Playwright cleanup error: %s", e)
         return
     
     logger.info("Emergency cleanup: closing %s active session(s)...", len(_active_sessions))
@@ -576,6 +1026,13 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     """
     if task_id is None:
         task_id = "default"
+
+    if _using_playwright_backend():
+        _start_browser_cleanup_thread()
+        _update_session_activity(task_id)
+        _ensure_local_page(task_id)
+        with _cleanup_lock:
+            return _active_sessions[task_id]
     
     # Start the cleanup thread if not running (handles inactivity timeouts)
     _start_browser_cleanup_thread()
@@ -701,6 +1158,9 @@ def _run_browser_command(
         Parsed JSON response from agent-browser
     """
     args = args or []
+
+    if _using_playwright_backend():
+        return _run_playwright_command(task_id, command, args, timeout)
     
     # Build the command
     try:
@@ -777,14 +1237,38 @@ def _run_browser_command(
         # Check for errors
         if result.returncode != 0:
             error_msg = result.stderr.strip() if result.stderr else f"Command failed with code {result.returncode}"
-            return {"success": False, "error": error_msg}
+            command_label = f"browser {command}"
+            if args:
+                rendered_args = ", ".join(repr(str(arg)) for arg in args[:3])
+                if len(args) > 3:
+                    rendered_args += ", ..."
+                command_label += f"({rendered_args})"
+            return {"success": False, "error": f"{command_label} failed: {error_msg}"}
         
         return {"success": True, "data": {}}
         
     except subprocess.TimeoutExpired:
-        return {"success": False, "error": f"Command timed out after {timeout} seconds"}
+        if command == "open":
+            target = args[0] if args else "<unknown url>"
+            detail = (
+                f"Navigation to {target} did not finish within {timeout} seconds. "
+                "The site may be slow, blocking automation, or waiting on heavy client-side rendering."
+            )
+        elif command == "snapshot":
+            detail = (
+                f"Snapshot capture did not finish within {timeout} seconds. "
+                "The page may be hung, the browser session may be stale, or the accessibility tree may be failing to render."
+            )
+        elif command == "screenshot":
+            detail = (
+                f"Screenshot capture did not finish within {timeout} seconds. "
+                "The page may be hung or the browser session may be stale."
+            )
+        else:
+            detail = f"Browser command '{command}' timed out after {timeout} seconds."
+        return {"success": False, "error": detail}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": f"Browser command '{command}' failed: {str(e)}"}
 
 
 def _extract_relevant_content(
@@ -877,7 +1361,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     if is_first_nav:
         session_info["_first_nav"] = False
     
-    result = _run_browser_command(effective_task_id, "open", [url], timeout=60)
+    result = _run_browser_command(
+        effective_task_id,
+        "open",
+        [url],
+        timeout=BROWSER_NAVIGATE_TIMEOUT,
+    )
     
     if result.get("success"):
         data = result.get("data", {})
@@ -956,6 +1445,18 @@ def browser_snapshot(
         data = result.get("data", {})
         snapshot_text = data.get("snapshot", "")
         refs = data.get("refs", {})
+
+        if not snapshot_text and not refs:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Snapshot returned empty content. The page may be blank, login-gated, "
+                    "bot-blocked, or the browser/CDP session may be stale."
+                ),
+                "details": {
+                    "hint": "Try navigating again or re-opening the page before requesting a snapshot."
+                }
+            }, ensure_ascii=False)
         
         # Check if snapshot needs summarization
         if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
@@ -1141,6 +1642,17 @@ def browser_close(task_id: Optional[str] = None) -> str:
     effective_task_id = task_id or "default"
     result = _run_browser_command(effective_task_id, "close", [])
     
+    if _using_playwright_backend():
+        if result.get("success"):
+            return json.dumps({
+                "success": True,
+                "closed": True
+            }, ensure_ascii=False)
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", "Failed to close Playwright browser session")
+        }, ensure_ascii=False)
+
     # Close the BrowserBase session via API
     session_key = task_id if task_id and task_id in _active_sessions else "default"
     if session_key in _active_sessions:
@@ -1250,7 +1762,7 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
         return json.dumps({
             "success": False,
             "error": "Browser vision unavailable: no auxiliary vision model configured. "
-                     "Set OPENROUTER_API_KEY or configure Nous Portal to enable browser vision."
+                     "Set OPENROUTER_API_KEY, configure Nous Portal, or sign in to Codex to enable browser vision."
         }, ensure_ascii=False)
     
     # Create a temporary file target for the screenshot.
@@ -1343,9 +1855,17 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
         }, ensure_ascii=False)
     
     except Exception as e:
+        error_text = str(e)
+        if "Insufficient credits" in error_text or "code': 402" in error_text or '"code": 402' in error_text:
+            error_text = (
+                "Vision analysis failed because the auxiliary vision provider reported insufficient credits "
+                "(HTTP 402 from OpenRouter). Screenshot capture may have succeeded, but image analysis could not run."
+            )
+        else:
+            error_text = f"Error during vision analysis: {error_text}"
         return json.dumps({
             "success": False,
-            "error": f"Error during vision analysis: {str(e)}"
+            "error": error_text
         }, ensure_ascii=False)
     
     finally:
@@ -1423,6 +1943,10 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     
     logger.debug("cleanup_browser called for task_id: %s", task_id)
     logger.debug("Active sessions: %s", list(_active_sessions.keys()))
+
+    if _using_playwright_backend():
+        _run_playwright_command(task_id, "close", [], timeout=5)
+        return
     
     # Check if session exists (under lock), but don't remove yet -
     # _run_browser_command needs it to build the close command.
@@ -1509,13 +2033,20 @@ def check_browser_requirements() -> bool:
     Returns:
         True if all requirements are met, False otherwise
     """
+    if _using_playwright_backend():
+        try:
+            from playwright.sync_api import sync_playwright  # noqa: F401
+            return True
+        except Exception:
+            return False
+
     # Check for Browserbase credentials
     api_key = os.environ.get("BROWSERBASE_API_KEY")
     project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-    
+
     if not api_key or not project_id:
         return False
-    
+
     # Check for agent-browser CLI
     try:
         _find_agent_browser()
@@ -1572,7 +2103,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_navigate"],
     handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )
 registry.register(
     name="browser_snapshot",
@@ -1581,7 +2112,7 @@ registry.register(
     handler=lambda args, **kw: browser_snapshot(
         full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )
 registry.register(
     name="browser_click",
@@ -1589,7 +2120,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_click"],
     handler=lambda args, **kw: browser_click(**args, task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )
 registry.register(
     name="browser_type",
@@ -1597,7 +2128,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_type"],
     handler=lambda args, **kw: browser_type(**args, task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )
 registry.register(
     name="browser_scroll",
@@ -1605,7 +2136,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_scroll"],
     handler=lambda args, **kw: browser_scroll(**args, task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )
 registry.register(
     name="browser_back",
@@ -1613,7 +2144,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_back"],
     handler=lambda args, **kw: browser_back(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )
 registry.register(
     name="browser_press",
@@ -1621,7 +2152,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_press"],
     handler=lambda args, **kw: browser_press(key=args.get("key", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )
 registry.register(
     name="browser_close",
@@ -1629,7 +2160,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_close"],
     handler=lambda args, **kw: browser_close(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )
 registry.register(
     name="browser_get_images",
@@ -1637,7 +2168,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_get_images"],
     handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )
 registry.register(
     name="browser_vision",
@@ -1645,5 +2176,5 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
     handler=lambda args, **kw: browser_vision(question=args.get("question", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
-    requires_env=["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+    requires_env=[],
 )

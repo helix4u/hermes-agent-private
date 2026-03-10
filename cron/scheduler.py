@@ -9,6 +9,7 @@ runs at a time if multiple processes overlap.
 """
 
 import asyncio
+import json
 import logging
 import multiprocessing
 import os
@@ -71,6 +72,7 @@ def _resolve_cron_job_timeout_seconds() -> int:
 def _build_job_failure_output(job: dict, error_msg: str, tb: Optional[str] = None) -> str:
     """Build a markdown failure document consistent with run_job() output."""
     trace_block = tb or "No traceback available."
+    timing_block = _format_latest_session_timing_block(job.get("id", "unknown"))
     return f"""# Cron Job: {job.get("name", job.get("id", "unknown"))} (FAILED)
 
 **Job ID:** {job.get("id", "unknown")}
@@ -88,7 +90,80 @@ def _build_job_failure_output(job: dict, error_msg: str, tb: Optional[str] = Non
 
 {trace_block}
 ```
+{timing_block}
 """
+
+
+def _find_latest_cron_session_log(job_id: str) -> Optional[Path]:
+    """Return the newest saved session log for a cron job, if present."""
+    sessions_dir = _hermes_home / "sessions"
+    if not sessions_dir.exists():
+        return None
+    candidates = sorted(
+        sessions_dir.glob(f"session_cron_{job_id}_*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _load_tool_events_from_session(session_path: Path) -> list[dict]:
+    """Load structured tool timing events from a session log file."""
+    try:
+        with open(session_path, encoding="utf-8", errors="replace") as fh:
+            data = json.load(fh)
+        events = data.get("tool_events")
+        if isinstance(events, list):
+            return [e for e in events if isinstance(e, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def _format_tool_timing_block(tool_events: list[dict], session_path: Optional[Path] = None) -> str:
+    """Build a compact markdown timing section from tool events."""
+    if not tool_events and not session_path:
+        return ""
+
+    lines = ["", "## Timing"]
+    if session_path:
+        lines.append("")
+        lines.append(f"**Session Log:** `{session_path}`")
+
+    if not tool_events:
+        lines.append("")
+        lines.append("No structured tool timing events were available.")
+        return "\n".join(lines)
+
+    total = sum(float(e.get("duration_seconds") or 0.0) for e in tool_events)
+    lines.append("")
+    lines.append(f"**Tool Calls:** {len(tool_events)}")
+    lines.append(f"**Tracked Tool Time:** {total:.2f}s")
+    lines.append("")
+    lines.append("| # | Tool | Duration | Preview |")
+    lines.append("|---|------|----------|---------|")
+    ranked = sorted(
+        enumerate(tool_events, start=1),
+        key=lambda item: float(item[1].get("duration_seconds") or 0.0),
+        reverse=True,
+    )
+    for idx, event in ranked[:10]:
+        tool_name = str(event.get("tool_name") or "?").replace("|", "\\|")
+        duration = float(event.get("duration_seconds") or 0.0)
+        preview = str(event.get("args_preview") or "").replace("\n", " ").replace("|", "\\|").strip()
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        lines.append(f"| {idx} | `{tool_name}` | {duration:.2f}s | {preview or '-'} |")
+    return "\n".join(lines)
+
+
+def _format_latest_session_timing_block(job_id: str) -> str:
+    """Build a timing section from the newest session log for this cron job."""
+    session_path = _find_latest_cron_session_log(job_id)
+    if not session_path:
+        return ""
+    tool_events = _load_tool_events_from_session(session_path)
+    return _format_tool_timing_block(tool_events, session_path=session_path)
 
 
 def _run_job_worker(job: dict, conn) -> None:
@@ -349,6 +424,12 @@ def run_job(job: dict, tool_progress_callback=None) -> tuple[bool, str, str, Opt
         final_response = result.get("final_response", "")
         if not final_response:
             final_response = "(No response generated)"
+        session_log_file = result.get("session_log_file") or str(agent.session_log_file)
+        tool_events = result.get("tool_events") or []
+        timing_block = _format_tool_timing_block(
+            tool_events,
+            session_path=Path(session_log_file) if session_log_file else None,
+        )
         
         output = f"""# Cron Job: {job_name}
 
@@ -363,6 +444,7 @@ def run_job(job: dict, tool_progress_callback=None) -> tuple[bool, str, str, Opt
 ## Response
 
 {final_response}
+{timing_block}
 """
         
         logger.info("Job '%s' completed successfully", job_name)

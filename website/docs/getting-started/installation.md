@@ -42,7 +42,7 @@ The only prerequisite is **Git**. The installer automatically handles everything
 
 - **uv** (fast Python package manager)
 - **Python 3.11** (via uv, no sudo needed)
-- **Node.js v22** (for browser automation and WhatsApp bridge)
+- **Node.js v22** (for optional Browserbase tooling and the WhatsApp bridge)
 - **ripgrep** (fast file search)
 - **ffmpeg** (audio format conversion for TTS)
 
@@ -135,7 +135,7 @@ Both are optional — if you skip them, the corresponding toolsets simply won't 
 
 ### Step 5: Install Node.js Dependencies (Optional)
 
-Only needed for **browser automation** (Browserbase-powered) and **WhatsApp bridge**:
+Only needed for the **optional Browserbase backend** and **WhatsApp bridge**:
 
 ```bash
 npm install
@@ -229,7 +229,7 @@ export VIRTUAL_ENV="$(pwd)/venv"
 uv pip install -e ".[all]"
 uv pip install -e "./mini-swe-agent"
 uv pip install -e "./tinker-atropos"
-npm install  # optional, for browser tools and WhatsApp
+npm install  # optional, for Browserbase backend support and WhatsApp
 
 # Configure
 mkdir -p ~/.hermes/{cron,sessions,logs,memories,skills,pairing,hooks,image_cache,audio_cache,whatsapp/session}

@@ -1,64 +1,75 @@
 ---
 title: Browser Automation
-description: Control cloud browsers with Browserbase integration for web interaction, form filling, scraping, and more.
+description: Control websites with Hermes's Playwright-backed browser tools, with optional Browserbase fallback.
 sidebar_label: Browser
 sidebar_position: 5
 ---
 
 # Browser Automation
 
-Hermes Agent includes a full browser automation toolset powered by [Browserbase](https://browserbase.com), enabling the agent to navigate websites, interact with page elements, fill forms, and extract information — all running in cloud-hosted browsers with built-in anti-bot stealth features.
+Hermes Agent includes a full browser automation toolset powered by a local Playwright backend by default, with the legacy [Browserbase](https://browserbase.com) path still available as an opt-in fallback. The goal is simple: free local browser control first, paid cloud sessions only if you explicitly want them.
 
 ## Overview
 
-The browser tools use the `agent-browser` CLI with Browserbase cloud execution. Pages are represented as **accessibility trees** (text-based snapshots), making them ideal for LLM agents. Interactive elements get ref IDs (like `@e1`, `@e2`) that the agent uses for clicking and typing.
+The browser tools expose the same `browser_*` interface regardless of backend. On the default Playwright backend, Hermes launches a persistent local Chromium profile, applies lightweight anti-automation shims, and builds text snapshots with stable element refs like `@e1`, `@e2` for clicking and typing.
 
 Key capabilities:
 
-- **Cloud execution** — no local browser needed
-- **Built-in stealth** — random fingerprints, CAPTCHA solving, residential proxies
+- **Local execution by default** — no Browserbase account required
+- **Persistent profile support** — reuse cookies, sessions, and seeded credentials
+- **Light anti-detection shims** — user-agent, webdriver, hardware, timezone, screen, and media fingerprint shaping
 - **Session isolation** — each task gets its own browser session
 - **Automatic cleanup** — inactive sessions are closed after a timeout
+- **Optional Browserbase fallback** — still available when you explicitly enable it
 - **Vision analysis** — screenshot + AI analysis for visual understanding
 
 ## Setup
 
-### Required Environment Variables
+### Default Setup: Local Playwright
 
 ```bash
-# Add to ~/.hermes/.env
+# ~/.hermes/config.yaml
+browser:
+  backend: playwright
+  navigate_timeout: 12
+  headless: false
+```
+
+Optional environment variables for the local backend:
+
+```bash
+# ~/.hermes/.env
+BROWSER_PROFILE_DIR=C:\Users\you\.hermes\browser-profile
+BROWSER_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36
+```
+
+`BROWSER_PROFILE_DIR` is the important one if you want Hermes to reuse a seeded browser profile with existing cookies or login state.
+
+### Optional Browserbase Fallback
+
+```bash
+# ~/.hermes/config.yaml
+browser:
+  backend: browserbase
+
+# ~/.hermes/.env
 BROWSERBASE_API_KEY=your-api-key-here
 BROWSERBASE_PROJECT_ID=your-project-id-here
-```
 
-Get your credentials at [browserbase.com](https://browserbase.com).
-
-### Optional Environment Variables
-
-```bash
-# Residential proxies for better CAPTCHA solving (default: "true")
+# Optional Browserbase extras
 BROWSERBASE_PROXIES=true
-
-# Advanced stealth with custom Chromium — requires Scale Plan (default: "false")
 BROWSERBASE_ADVANCED_STEALTH=false
-
-# Session reconnection after disconnects — requires paid plan (default: "true")
 BROWSERBASE_KEEP_ALIVE=true
-
-# Custom session timeout in milliseconds (default: project default)
-# Examples: 600000 (10min), 1800000 (30min)
 BROWSERBASE_SESSION_TIMEOUT=600000
-
-# Inactivity timeout before auto-cleanup in seconds (default: 300)
-BROWSER_INACTIVITY_TIMEOUT=300
 ```
 
-### Install agent-browser CLI
+### Local Backend Configuration
 
 ```bash
-npm install -g agent-browser
-# Or install locally in the repo:
-npm install
+# ~/.hermes/.env
+BROWSER_INACTIVITY_TIMEOUT=120
+BROWSER_NAVIGATE_TIMEOUT=12
+BROWSER_HEADLESS=false
 ```
 
 :::info
@@ -69,7 +80,7 @@ The `browser` toolset must be included in your config's `toolsets` list or enabl
 
 ### `browser_navigate`
 
-Navigate to a URL. Must be called before any other browser tool. Initializes the Browserbase session.
+Navigate to a URL. Must be called before any other browser tool. Initializes the active browser session for the selected backend.
 
 ```
 Navigate to https://github.com/NousResearch
@@ -132,7 +143,7 @@ List all images on the current page with their URLs and alt text. Useful for fin
 
 ### `browser_vision`
 
-Take a screenshot and analyze it with vision AI. Use this when text snapshots don't capture important visual information — especially useful for CAPTCHAs, complex layouts, or visual verification challenges.
+Take a screenshot and analyze it with a vision model. Use this when text snapshots don't capture important visual information — especially useful for CAPTCHAs, complex layouts, or visual verification challenges.
 
 ```
 What does the chart on this page show?
@@ -140,7 +151,7 @@ What does the chart on this page show?
 
 ### `browser_close`
 
-Close the browser session and release resources. Call this when done to free up Browserbase session quota.
+Close the browser session and release resources. On the Playwright backend this closes the local page. On the Browserbase backend it also releases the remote session quota.
 
 ## Practical Examples
 
@@ -171,35 +182,36 @@ Agent workflow:
 4. browser_close()
 ```
 
-## Stealth Features
+## Backend Behavior
 
-Browserbase provides automatic stealth capabilities:
+The current default is `playwright`. Browserbase is optional.
 
 | Feature | Default | Notes |
 |---------|---------|-------|
-| Basic Stealth | Always on | Random fingerprints, viewport randomization, CAPTCHA solving |
-| Residential Proxies | On | Routes through residential IPs for better access |
-| Advanced Stealth | Off | Custom Chromium build, requires Scale Plan |
-| Keep Alive | On | Session reconnection after network hiccups |
+| Backend | `playwright` | Free local browser automation with a persistent profile |
+| Profile reuse | On when `BROWSER_PROFILE_DIR` is set | Good for seeded creds/cookies |
+| User-agent override | On | Configurable with `BROWSER_USER_AGENT` |
+| Browserbase fallback | Off by default | Enable with `browser.backend: browserbase` |
+| Browser vision | Separate from backend | Still requires a configured vision provider |
 
 :::note
-If paid features aren't available on your plan, Hermes automatically falls back — first disabling `keepAlive`, then proxies — so browsing still works on free plans.
+Local Playwright browsing is free. `browser_vision` is a separate capability and still depends on your configured multimodal provider.
 :::
 
 ## Session Management
 
-- Each task gets an isolated browser session via Browserbase
-- Sessions are automatically cleaned up after inactivity (default: 5 minutes)
+- Each task gets an isolated browser session
+- Sessions are automatically cleaned up after inactivity
 - A background thread checks every 30 seconds for stale sessions
 - Emergency cleanup runs on process exit to prevent orphaned sessions
-- Sessions are released via the Browserbase API (`REQUEST_RELEASE` status)
+- Browserbase sessions are only released via API when the Browserbase backend is active
 
 ## Limitations
 
-- **Requires Browserbase account** — no local browser fallback
-- **Requires `agent-browser` CLI** — must be installed via npm
-- **Text-based interaction** — relies on accessibility tree, not pixel coordinates
+- **Text-based interaction** — snapshots are DOM/text driven, not pixel-coordinate computer use
+- **Anti-detection is best-effort** — user-agent spoofing and webdriver masking help, but some sites still block automation
+- **Anti-detection is best-effort** — Hermes now shapes user-agent, hardware, timezone, screen, and media signals, but determined anti-bot systems can still detect automation
 - **Snapshot size** — large pages may be truncated or LLM-summarized at 8000 characters
-- **Session timeout** — sessions expire based on your Browserbase plan settings
-- **Cost** — each session consumes Browserbase credits; use `browser_close` when done
+- **Browser vision is not free by itself** — screenshot analysis still depends on the configured multimodal backend
+- **Browserbase costs only apply if you switch to the Browserbase backend**
 - **No file downloads** — cannot download files from the browser

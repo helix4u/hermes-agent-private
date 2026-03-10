@@ -159,7 +159,10 @@ def load_cli_config() -> Dict[str, Any]:
             "modal_image": "python:3.11",
         },
         "browser": {
-            "inactivity_timeout": 120,  # Auto-cleanup inactive browser sessions after 2 min
+            "backend": "playwright",   # Free local browser automation with persistent profile
+            "inactivity_timeout": 120, # Auto-cleanup inactive browser sessions after 2 min
+            "navigate_timeout": 12,    # Fail fast on slow or blocked page loads
+            "headless": False,         # Headed mode looks less bot-like on many sites
         },
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
@@ -317,7 +320,12 @@ def load_cli_config() -> Dict[str, Any]:
     # Apply browser config to environment variables
     browser_config = defaults.get("browser", {})
     browser_env_mappings = {
+        "backend": "BROWSER_BACKEND",
         "inactivity_timeout": "BROWSER_INACTIVITY_TIMEOUT",
+        "navigate_timeout": "BROWSER_NAVIGATE_TIMEOUT",
+        "headless": "BROWSER_HEADLESS",
+        "profile_dir": "BROWSER_PROFILE_DIR",
+        "user_agent": "BROWSER_USER_AGENT",
     }
     
     for config_key, env_var in browser_env_mappings.items():

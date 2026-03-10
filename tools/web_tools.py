@@ -59,10 +59,24 @@ def _get_firecrawl_client():
     """Get or create the Firecrawl client (lazy initialization)."""
     global _firecrawl_client
     if _firecrawl_client is None:
-        api_key = os.getenv("FIRECRAWL_API_KEY")
-        if not api_key:
-            raise ValueError("FIRECRAWL_API_KEY environment variable not set")
-        _firecrawl_client = Firecrawl(api_key=api_key)
+        api_key = (os.getenv("FIRECRAWL_API_KEY") or "").strip()
+        api_url = (os.getenv("FIRECRAWL_API_URL") or "").strip()
+        if not api_key and not api_url:
+            raise ValueError(
+                "Set FIRECRAWL_API_KEY for Firecrawl cloud or FIRECRAWL_API_URL for a self-hosted instance"
+            )
+
+        client_kwargs = {}
+        if api_key:
+            client_kwargs["api_key"] = api_key
+
+        if api_url:
+            try:
+                _firecrawl_client = Firecrawl(api_url=api_url, **client_kwargs)
+            except TypeError:
+                _firecrawl_client = Firecrawl(base_url=api_url, **client_kwargs)
+        else:
+            _firecrawl_client = Firecrawl(**client_kwargs)
     return _firecrawl_client
 
 DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 5000
@@ -1133,12 +1147,12 @@ async def web_crawl_tool(
 # Convenience function to check if API key is available
 def check_firecrawl_api_key() -> bool:
     """
-    Check if the Firecrawl API key is available in environment variables.
+    Check if Firecrawl is configured in environment variables.
     
     Returns:
-        bool: True if API key is set, False otherwise
+        bool: True if cloud or self-hosted Firecrawl is configured, False otherwise
     """
-    return bool(os.getenv("FIRECRAWL_API_KEY"))
+    return bool(os.getenv("FIRECRAWL_API_KEY") or os.getenv("FIRECRAWL_API_URL"))
 
 
 def check_auxiliary_model() -> bool:
@@ -1163,11 +1177,11 @@ if __name__ == "__main__":
     nous_available = check_auxiliary_model()
     
     if not firecrawl_available:
-        print("❌ FIRECRAWL_API_KEY environment variable not set")
-        print("Please set your API key: export FIRECRAWL_API_KEY='your-key-here'")
-        print("Get API key at: https://firecrawl.dev/")
+        print("❌ Firecrawl is not configured")
+        print("Set FIRECRAWL_API_KEY for Firecrawl cloud or FIRECRAWL_API_URL for a self-hosted instance")
+        print("Get cloud API key at: https://firecrawl.dev/")
     else:
-        print("✅ Firecrawl API key found")
+        print("✅ Firecrawl backend configured")
     
     if not nous_available:
         print("❌ No auxiliary model available for LLM content processing")

@@ -182,7 +182,7 @@ The `hermes config set` command automatically routes values to the right file �
 | Feature | Provider | Env Variable |
 |---------|----------|--------------|
 | Web scraping | [Firecrawl](https://firecrawl.dev/) | `FIRECRAWL_API_KEY` |
-| Browser automation | [Browserbase](https://browserbase.com/) | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` |
+| Browser automation | Local Playwright by default; optional [Browserbase](https://browserbase.com/) fallback | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` only if using Browserbase |
 | Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
 | Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
 | OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
@@ -875,16 +875,21 @@ stt:
 
 ### 🌐 Browser Automation
 
-Browser tools let the agent navigate websites, fill forms, click buttons, and extract content using [Browserbase](https://browserbase.com/).
+Browser tools now use a local Playwright backend by default, with Browserbase still available as an opt-in fallback. The default local path is headed, persistent, and applies lightweight fingerprint shaping for user-agent, hardware, timezone, screen, and media signals.
 
 **Setup:**
 ```bash
-# 1. Get credentials from browserbase.com
+# 1. Use the free local backend (default)
+hermes config set browser.backend playwright
+hermes config set browser.navigate_timeout 12
+
+# 2. Optional: persist cookies/logins in a seeded profile
+hermes config set browser.profile_dir ~/.hermes/browser-profile
+
+# 3. Optional: only if you want Browserbase instead
+hermes config set browser.backend browserbase
 hermes config set BROWSERBASE_API_KEY your_api_key
 hermes config set BROWSERBASE_PROJECT_ID your_project_id
-
-# 2. Install Node.js dependencies (if not already)
-cd ~/.hermes-agent && npm install
 ```
 
 **Available tools:** `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_back`, `browser_press`, `browser_close`, `browser_get_images`
@@ -1342,13 +1347,13 @@ Both are optional — if you skip them, the corresponding toolsets simply won't 
 
 ### Step 5: Install Node.js Dependencies (Optional)
 
-Only needed if you plan to use the **browser automation** toolset (Browserbase-powered):
+Only needed if you plan to use the **optional Browserbase backend**:
 
 ```bash
 npm install
 ```
 
-This installs the `agent-browser` package defined in `package.json`. Skip this step if you don't need browser tools.
+This installs the `agent-browser` package defined in `package.json`. Skip this step if you're using the default Playwright backend only.
 
 ---
 
@@ -1395,8 +1400,8 @@ OPENROUTER_API_KEY=sk-or-v1-your-key-here
 
 # Optional — enable additional tools:
 FIRECRAWL_API_KEY=fc-your-key          # Web search & scraping
-BROWSERBASE_API_KEY=bb-your-key        # Browser automation
-BROWSERBASE_PROJECT_ID=your-project-id # Browser automation
+BROWSERBASE_API_KEY=bb-your-key        # Browserbase backend only
+BROWSERBASE_PROJECT_ID=your-project-id # Browserbase backend only
 FAL_KEY=your-fal-key                   # Image generation (FLUX)
 TINKER_API_KEY=your-tinker-key         # RL training
 WANDB_API_KEY=your-wandb-key           # RL training metrics
@@ -1501,7 +1506,7 @@ export VIRTUAL_ENV="$(pwd)/venv"
 uv pip install -e ".[all]"
 uv pip install -e "./mini-swe-agent"
 uv pip install -e "./tinker-atropos"
-npm install  # optional, for browser tools
+npm install  # optional, for Browserbase backend support
 
 # Configure
 mkdir -p ~/.hermes/{cron,sessions,logs,memories,skills}
@@ -1636,8 +1641,13 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 | Variable | Description |
 |----------|-------------|
 | `FIRECRAWL_API_KEY` | Web scraping (firecrawl.dev) |
-| `BROWSERBASE_API_KEY` | Browser automation |
-| `BROWSERBASE_PROJECT_ID` | Browserbase project |
+| `BROWSER_BACKEND` | Browser backend: `playwright` (default) or `browserbase` |
+| `BROWSER_PROFILE_DIR` | Persistent profile directory for Playwright browser sessions |
+| `BROWSER_USER_AGENT` | Override user agent string for Playwright browser sessions |
+| `BROWSER_HEADLESS` | Run the Playwright backend headless (`true`/`false`, default: `false`) |
+| `BROWSER_NAVIGATE_TIMEOUT` | Browser navigate timeout in seconds |
+| `BROWSERBASE_API_KEY` | Browserbase API key when using the Browserbase backend |
+| `BROWSERBASE_PROJECT_ID` | Browserbase project when using the Browserbase backend |
 | `FAL_KEY` | Image generation (fal.ai) |
 | `HONCHO_API_KEY` | Cross-session user modeling ([honcho.dev](https://honcho.dev/)) |
 

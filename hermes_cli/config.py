@@ -77,7 +77,10 @@ DEFAULT_CONFIG = {
     },
     
     "browser": {
+        "backend": "playwright",
         "inactivity_timeout": 120,
+        "navigate_timeout": 12,
+        "headless": False,
     },
     
     "compression": {

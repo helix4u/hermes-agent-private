@@ -12,6 +12,26 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+_CONTEXT_SCAN_SKIP_DIRS = {
+    "__pycache__",
+    "node_modules",
+    "venv",
+    ".venv",
+    "browser-profile",
+    "audio_cache",
+    "image_cache",
+    "document_cache",
+    "cache",
+    "logs",
+    "sessions",
+    "sandboxes",
+    "dist",
+    "build",
+    "coverage",
+    "tmp",
+    "temp",
+}
+
 # ---------------------------------------------------------------------------
 # Context file scanning — detect prompt injection in AGENTS.md, .cursorrules,
 # SOUL.md before they get injected into the system prompt.
@@ -85,6 +105,12 @@ SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, consider saving the approach as a "
     "skill with skill_manage so you can reuse it next time."
+)
+
+RESPONSE_GUIDANCE = (
+    "Every assistant response must include user-visible response content in the "
+    "normal response field. Never return reasoning-only output. Reasoning may be "
+    "present as metadata, but it is not a substitute for the actual answer."
 )
 
 PLATFORM_HINTS = {
@@ -259,7 +285,12 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
     if top_level_agents:
         agents_files = []
         for root, dirs, files in os.walk(cwd_path):
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__', 'venv', '.venv')]
+            # Skip hidden directories and bulky/generated state directories so
+            # context discovery does not walk caches, browser profiles, or logs.
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith(".") and d not in _CONTEXT_SCAN_SKIP_DIRS
+            ]
             for f in files:
                 if f.lower() == "agents.md":
                     agents_files.append(Path(root) / f)

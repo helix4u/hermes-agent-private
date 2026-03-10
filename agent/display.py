@@ -24,7 +24,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
     """Build a short preview of a tool call's primary argument for display."""
     primary_args = {
         "terminal": "command", "web_search": "query", "web_extract": "urls",
-        "read_file": "path", "write_file": "path", "patch": "path",
+        "read_file": "path", "write_file": "path", "append_file": "path", "patch": "path",
         "search_files": "pattern", "browser_navigate": "url",
         "browser_click": "ref", "browser_type": "text",
         "image_generate": "prompt", "text_to_speech": "text",
@@ -373,6 +373,8 @@ def get_cute_tool_message(
         return _wrap(f"┊ 📖 read      {_path(args.get('path', ''))}  {dur}")
     if tool_name == "write_file":
         return _wrap(f"┊ ✍️  write     {_path(args.get('path', ''))}  {dur}")
+    if tool_name == "append_file":
+        return _wrap(f"┊ 📝 append    {_path(args.get('path', ''))}  {dur}")
     if tool_name == "patch":
         return _wrap(f"┊ 🔧 patch     {_path(args.get('path', ''))}  {dur}")
     if tool_name == "search_files":

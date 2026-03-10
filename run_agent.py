@@ -71,7 +71,7 @@ from hermes_constants import OPENROUTER_BASE_URL, OPENROUTER_MODELS_URL
 # Agent internals extracted to agent/ package for modularity
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE, RESPONSE_GUIDANCE,
 )
 from agent.model_metadata import (
     fetch_model_metadata, get_model_context_length,
@@ -475,6 +475,7 @@ class AIAgent:
         
         # Track conversation messages for session logging
         self._session_messages: List[Dict[str, Any]] = []
+        self._tool_events: List[Dict[str, Any]] = []
         
         # Cached system prompt -- built once per session, only rebuilt on compression
         self._cached_system_prompt: Optional[str] = None
@@ -1216,6 +1217,7 @@ class AIAgent:
                 "system_prompt": self._cached_system_prompt or "",
                 "tools": self.tools or [],
                 "message_count": len(cleaned),
+                "tool_events": list(self._tool_events),
                 "messages": cleaned,
             }
 
@@ -1385,7 +1387,7 @@ class AIAgent:
         prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
         # Tool-aware behavioral guidance: only inject when the tools are loaded
-        tool_guidance = []
+        tool_guidance = [RESPONSE_GUIDANCE]
         if "memory" in self.valid_tool_names:
             tool_guidance.append(MEMORY_GUIDANCE)
         if "session_search" in self.valid_tool_names:
@@ -2958,6 +2960,7 @@ class AIAgent:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
             tool_start_time = time.time()
+            tool_started_at = datetime.now()
 
             if function_name == "todo":
                 from tools.todo_tool import todo_tool as _todo_tool
@@ -3049,7 +3052,7 @@ class AIAgent:
                 tool_emoji_map = {
                     'web_search': '🔍', 'web_extract': '📄', 'web_crawl': '🕸️',
                     'terminal': '💻', 'process': '⚙️',
-                    'read_file': '📖', 'write_file': '✍️', 'patch': '🔧', 'search_files': '🔎',
+                    'read_file': '📖', 'write_file': '✍️', 'append_file': '📝', 'patch': '🔧', 'search_files': '🔎',
                     'browser_navigate': '🌐', 'browser_snapshot': '📸',
                     'browser_click': '👆', 'browser_type': '⌨️',
                     'browser_scroll': '📜', 'browser_back': '◀️',
@@ -3115,10 +3118,25 @@ class AIAgent:
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
-                "tool_call_id": tool_call.id
+                "tool_call_id": tool_call.id,
+                "tool_name": function_name,
+                "duration_seconds": round(float(tool_duration), 3),
+                "started_at": tool_started_at.isoformat(),
+                "completed_at": datetime.now().isoformat(),
             }
             messages.append(tool_msg)
             self._log_msg_to_db(tool_msg)
+            self._tool_events.append({
+                "tool_call_id": tool_call.id,
+                "tool_name": function_name,
+                "duration_seconds": round(float(tool_duration), 3),
+                "started_at": tool_started_at.isoformat(),
+                "completed_at": datetime.now().isoformat(),
+                "args_preview": _build_tool_preview(function_name, function_args) or function_name,
+                "had_error": bool(_is_error_result),
+            })
+            self._session_messages = messages
+            self._save_session_log(messages)
 
             if not self.quiet_mode:
                 response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
@@ -4373,6 +4391,19 @@ class AIAgent:
                         # Show any reasoning/thinking content for debugging context.
                         reasoning_text = self._extract_reasoning(assistant_message)
                         print(f"{self.log_prefix}⚠️  Response content was empty")
+                        # Diagnostic: why empty (finish_reason, reasoning fields present)
+                        try:
+                            fr = getattr(response.choices[0], "finish_reason", None) if response and getattr(response, "choices", None) else None
+                            diag = [f"finish_reason={fr!r}"]
+                            if hasattr(assistant_message, "reasoning") and getattr(assistant_message, "reasoning", None):
+                                diag.append(f"reasoning len={len(assistant_message.reasoning)}")
+                            if hasattr(assistant_message, "reasoning_content") and getattr(assistant_message, "reasoning_content", None):
+                                diag.append(f"reasoning_content len={len(assistant_message.reasoning_content)}")
+                            if hasattr(assistant_message, "reasoning_details") and getattr(assistant_message, "reasoning_details", None):
+                                diag.append(f"reasoning_details count={len(assistant_message.reasoning_details)}")
+                            print(f"{self.log_prefix}   Diagnostics: {', '.join(diag)}")
+                        except Exception:
+                            pass
                         if reasoning_text:
                             reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
                             print(f"{self.log_prefix}   Reasoning: {reasoning_preview}")
@@ -4380,10 +4411,23 @@ class AIAgent:
                             content_preview = final_response[:80] + "..." if len(final_response) > 80 else final_response
                             print(f"{self.log_prefix}   Content: '{content_preview}'")
                         
+                        final_response = ""
+
                         if self._empty_content_retries < 3:
+                            retry_note = {
+                                "role": "user",
+                                "content": (
+                                    "[System: Your previous turn contained no user-visible response content. "
+                                    "Every assistant response must include the actual answer in normal content. "
+                                    "Do not return reasoning-only output. Reply again with the user-facing answer.]"
+                                ),
+                            }
+                            messages.append(retry_note)
+                            self._log_msg_to_db(retry_note)
                             print(f"{self.log_prefix}🔄 Retrying API call ({self._empty_content_retries}/3)...")
                             continue
                         else:
+                            # Still empty after reasoning fallback and retries
                             print(f"{self.log_prefix}❌ Max retries (3) for empty content exceeded.")
                             self._empty_content_retries = 0
                             
@@ -4407,26 +4451,16 @@ class AIAgent:
                                 final_response = self._strip_think_blocks(fallback).strip()
                                 break
                             
-                            # No fallback -- append the empty message as-is
-                            empty_msg = {
-                                "role": "assistant",
-                                "content": final_response,
-                                "reasoning": reasoning_text,
-                                "finish_reason": finish_reason,
-                            }
-                            messages.append(empty_msg)
-                            self._log_msg_to_db(empty_msg)
-                            
                             self._cleanup_task_resources(effective_task_id)
                             self._persist_session(messages, conversation_history)
                             
                             return {
-                                "final_response": final_response or None,
+                                "final_response": "I couldn't get a user-visible answer from the model after 3 retries.",
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Model generated only think blocks with no actual response after 3 retries"
+                                "error": "Model generated reasoning-only output with no actual response after 3 retries"
                             }
                     
                     # Reset retry counter on successful content
@@ -4548,6 +4582,8 @@ class AIAgent:
             "completed": completed,
             "partial": False,  # True only when stopped due to invalid tool calls
             "interrupted": interrupted,
+            "tool_events": list(self._tool_events),
+            "session_log_file": str(self.session_log_file),
         }
         
         # Include interrupt message if one triggered the interrupt
