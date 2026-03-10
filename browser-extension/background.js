@@ -15,6 +15,9 @@ const DEFAULT_CHALLENGE_MODE_LABEL = "Challenge my framing";
 const DEFAULT_CHALLENGE_MODE_PROMPT =
   "Before answering, briefly challenge my framing. " +
   "Call out likely assumptions, missing context, and plausible alternative interpretations, then continue with the best answer.";
+const DEFAULT_THEME_NAME = "original";
+const DEFAULT_CUSTOM_THEME_ACCENT = "#9ca3af";
+const DEFAULT_CUSTOM_THEMES = [];
 const DEFAULT_QUICK_PROMPTS = [
   {
     id: "summarize-page",
@@ -112,8 +115,34 @@ function normalizeQuickPrompts(value) {
   return normalized;
 }
 
+function normalizeCustomThemes(value) {
+  if (!Array.isArray(value)) {
+    return DEFAULT_CUSTOM_THEMES.slice();
+  }
+
+  return value
+    .filter((theme) => theme && typeof theme === "object")
+    .map((theme, index) => {
+      const mode = String(theme.mode || "").trim().toLowerCase() === "light" ? "light" : "dark";
+      return {
+        id: String(theme.id || "").trim() || `custom-theme-${index + 1}`,
+        label: String(theme.label || "").trim() || `Custom Theme ${index + 1}`,
+        mode,
+        primaryColor: String(theme.primaryColor || "").trim() || (mode === "light" ? "#111827" : "#8b5cf6"),
+        secondaryColor: String(theme.secondaryColor || "").trim() || (mode === "light" ? "#64748b" : "#22d3ee"),
+        textColor: String(theme.textColor || "").trim() || (mode === "light" ? "#111827" : "#f8fafc"),
+        mutedTextColor: String(theme.mutedTextColor || "").trim() || (mode === "light" ? "#475569" : "#94a3b8"),
+        surfaceColor: String(theme.surfaceColor || "").trim() || (mode === "light" ? "#ffffff" : "#1b1a25"),
+        fieldColor: String(theme.fieldColor || "").trim() || (mode === "light" ? "#ffffff" : "#11131d"),
+        fieldTextColor: String(theme.fieldTextColor || "").trim() || (mode === "light" ? "#111827" : "#f8fafc")
+      };
+    });
+}
+
 function normalizeStoredSettings(settings) {
   const next = settings && typeof settings === "object" ? settings : {};
+  const themeName = String(next.themeName || "").trim().toLowerCase() || DEFAULT_THEME_NAME;
+  const customThemeAccent = String(next.customThemeAccent || "").trim() || DEFAULT_CUSTOM_THEME_ACCENT;
   return {
     bridgeUrl: String(next.bridgeUrl || "").trim() || DEFAULT_BRIDGE_URL,
     bridgeToken: String(next.bridgeToken || "").trim(),
@@ -123,7 +152,10 @@ function normalizeStoredSettings(settings) {
     showChallengeMode: next.showChallengeMode === true,
     quickPrompts: normalizeQuickPrompts(next.quickPrompts),
     challengeModeLabel: String(next.challengeModeLabel || "").trim() || DEFAULT_CHALLENGE_MODE_LABEL,
-    challengeModePrompt: String(next.challengeModePrompt || "").trim() || DEFAULT_CHALLENGE_MODE_PROMPT
+    challengeModePrompt: String(next.challengeModePrompt || "").trim() || DEFAULT_CHALLENGE_MODE_PROMPT,
+    themeName,
+    customThemeAccent,
+    customThemes: normalizeCustomThemes(next.customThemes)
   };
 }
 
@@ -161,6 +193,15 @@ function buildSettingsPatch(settings) {
   if (Object.prototype.hasOwnProperty.call(settings, "challengeModePrompt")) {
     patch.challengeModePrompt =
       String(settings.challengeModePrompt || "").trim() || DEFAULT_CHALLENGE_MODE_PROMPT;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "themeName")) {
+    patch.themeName = String(settings.themeName || "").trim().toLowerCase() || DEFAULT_THEME_NAME;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "customThemeAccent")) {
+    patch.customThemeAccent = String(settings.customThemeAccent || "").trim() || DEFAULT_CUSTOM_THEME_ACCENT;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "customThemes")) {
+    patch.customThemes = normalizeCustomThemes(settings.customThemes);
   }
 
   return patch;
@@ -606,7 +647,10 @@ async function getSettings() {
     showChallengeMode: false,
     quickPrompts: createDefaultQuickPrompts(),
     challengeModeLabel: DEFAULT_CHALLENGE_MODE_LABEL,
-    challengeModePrompt: DEFAULT_CHALLENGE_MODE_PROMPT
+    challengeModePrompt: DEFAULT_CHALLENGE_MODE_PROMPT,
+    themeName: DEFAULT_THEME_NAME,
+    customThemeAccent: DEFAULT_CUSTOM_THEME_ACCENT,
+    customThemes: DEFAULT_CUSTOM_THEMES.slice()
   });
   return normalizeStoredSettings(stored);
 }
@@ -1582,4 +1626,3 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return true;
 });
-

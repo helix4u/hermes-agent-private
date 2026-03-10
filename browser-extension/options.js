@@ -2,6 +2,10 @@ const bridgeUrlInput = document.getElementById("bridge-url");
 const bridgeTokenInput = document.getElementById("bridge-token");
 const sharePageByDefault = document.getElementById("share-page-by-default");
 const includeTranscript = document.getElementById("include-transcript");
+const themeSelect = document.getElementById("theme-select");
+const themeDescription = document.getElementById("theme-description");
+const customThemeList = document.getElementById("custom-theme-list");
+const addThemeButton = document.getElementById("add-theme-button");
 const showQuickPrompts = document.getElementById("show-quick-prompts");
 const showChallengeMode = document.getElementById("show-challenge-mode");
 const challengeModeLabel = document.getElementById("challenge-mode-label");
@@ -11,7 +15,23 @@ const addQuickPromptButton = document.getElementById("add-quick-prompt-button");
 const bridgeStatusText = document.getElementById("bridge-status-text");
 const statusText = document.getElementById("status-text");
 
+const THEME_GROUP_ORDER = [
+  "Monochrome dark",
+  "Light themes",
+  "Original",
+  "Sepia",
+  "Retro",
+  "Custom themes"
+];
+
 let quickPromptDrafts = [];
+let customThemeDrafts = [];
+let currentThemeAccent = window.HermesTheme?.defaultCustomThemePrimary || "#8b5cf6";
+let themePreviewSaveTimer = null;
+
+window.HermesTheme?.applyThemeToDocument({
+  themeName: window.HermesTheme?.defaultThemeId || "obsidian"
+});
 
 function setStatus(message) {
   statusText.textContent = message;
@@ -44,6 +64,116 @@ function createPromptDraft(prompt = {}) {
     template: String(prompt.template || "").trim(),
     includeTranscript: Boolean(prompt.includeTranscript)
   };
+}
+
+function createCustomThemeDraft(theme = {}, index = 0) {
+  const normalized = window.HermesTheme?.normalizeCustomThemeDefinition?.(theme, index) || {
+    id: String(theme.id || "").trim() || `custom-theme-${index + 1}`,
+    label: String(theme.label || "").trim() || `Custom Theme ${index + 1}`,
+    mode: String(theme.mode || "").trim().toLowerCase() === "light" ? "light" : "dark",
+    primaryColor: window.HermesTheme?.normalizeHexColor(theme.primaryColor, "#8b5cf6") || "#8b5cf6",
+    secondaryColor: window.HermesTheme?.normalizeHexColor(theme.secondaryColor, "#22d3ee") || "#22d3ee",
+    textColor: window.HermesTheme?.normalizeHexColor(theme.textColor, "#f8fafc") || "#f8fafc",
+    mutedTextColor: window.HermesTheme?.normalizeHexColor(theme.mutedTextColor, "#94a3b8") || "#94a3b8",
+    surfaceColor: window.HermesTheme?.normalizeHexColor(theme.surfaceColor, "#1b1a25") || "#1b1a25",
+    fieldColor: window.HermesTheme?.normalizeHexColor(theme.fieldColor, "#11131d") || "#11131d",
+    fieldTextColor: window.HermesTheme?.normalizeHexColor(theme.fieldTextColor, "#f8fafc") || "#f8fafc"
+  };
+  return { ...normalized };
+}
+
+function getThemeSettingsForPreview(themeName = themeSelect.value) {
+  return {
+    themeName,
+    customThemeAccent: currentThemeAccent,
+    customThemes: customThemeDrafts
+  };
+}
+
+function populateThemeOptions({ selectedThemeId = themeSelect.value } = {}) {
+  const entries = window.HermesTheme?.getThemePresetEntries?.({
+    customThemes: customThemeDrafts
+  }) || [];
+
+  const groups = new Map(
+    THEME_GROUP_ORDER.map((groupLabel) => [groupLabel, { label: groupLabel, options: [] }])
+  );
+
+  entries.forEach((entry) => {
+    if (!groups.has(entry.group)) {
+      groups.set(entry.group, { label: entry.group, options: [] });
+    }
+    groups.get(entry.group).options.push(entry);
+  });
+
+  themeSelect.textContent = "";
+  for (const group of groups.values()) {
+    if (!group.options.length) {
+      continue;
+    }
+    const optgroup = document.createElement("optgroup");
+    optgroup.label = group.label;
+    group.options.forEach((entry) => {
+      const option = document.createElement("option");
+      option.value = entry.id;
+      option.textContent = entry.label;
+      option.title = entry.description;
+      optgroup.appendChild(option);
+    });
+    themeSelect.appendChild(optgroup);
+  }
+
+  const hasSelectedTheme =
+    selectedThemeId &&
+    Array.from(themeSelect.options).some((option) => option.value === selectedThemeId);
+  themeSelect.value = hasSelectedTheme
+    ? selectedThemeId
+    : window.HermesTheme?.defaultThemeId || "obsidian";
+}
+
+function updateThemeDescription(themeName = themeSelect.value) {
+  if (!themeDescription) {
+    return;
+  }
+  const resolved = window.HermesTheme?.resolveThemePalette?.(
+    getThemeSettingsForPreview(themeName)
+  );
+  if (!resolved) {
+    themeDescription.textContent = "";
+    return;
+  }
+  const modeLabel = resolved.mode === "light" ? "Light mode" : "Dark mode";
+  const groupLabel = resolved.group ? `${resolved.group}. ` : "";
+  themeDescription.textContent = `${modeLabel}. ${groupLabel}${resolved.description}`;
+}
+
+function applyThemePreview(themeName = themeSelect.value) {
+  const selectedCustomTheme = customThemeDrafts.find((theme) => theme.id === themeName);
+  if (selectedCustomTheme) {
+    currentThemeAccent = selectedCustomTheme.primaryColor;
+  }
+  updateThemeDescription(themeName);
+  window.HermesTheme?.applyThemeToDocument(getThemeSettingsForPreview(themeName));
+}
+
+function scheduleThemePreviewSave(savedPrefix = "Custom theme saved.") {
+  if (themePreviewSaveTimer) {
+    clearTimeout(themePreviewSaveTimer);
+  }
+  themePreviewSaveTimer = setTimeout(() => {
+    themePreviewSaveTimer = null;
+    const { settings } = buildSettingsPayload();
+    sendRuntimeMessage({
+      type: "hermes:save-settings",
+      settings: {
+        themeName: settings.themeName,
+        customThemeAccent: settings.customThemeAccent,
+        customThemes: settings.customThemes
+      }
+    })
+      .then(() => setStatus(savedPrefix))
+      .catch((error) => setStatus(error.message || String(error)));
+  }, 120);
 }
 
 function renderQuickPromptList() {
@@ -162,6 +292,222 @@ function renderQuickPromptList() {
   });
 }
 
+function renderCustomThemeList() {
+  customThemeList.textContent = "";
+
+  if (!customThemeDrafts.length) {
+    const emptyState = document.createElement("p");
+    emptyState.className = "empty-list";
+    emptyState.textContent = "No custom themes yet. Add one to create a named palette you can select from the dropdown.";
+    customThemeList.appendChild(emptyState);
+    return;
+  }
+
+  customThemeDrafts.forEach((theme, index) => {
+    const card = document.createElement("section");
+    card.className = "prompt-card";
+
+    const head = document.createElement("div");
+    head.className = "prompt-card-head";
+
+    const title = document.createElement("p");
+    title.className = "prompt-card-title";
+    title.textContent = theme.label;
+    head.appendChild(title);
+
+    const actions = document.createElement("div");
+    actions.className = "prompt-card-actions";
+
+    const useButton = document.createElement("button");
+    useButton.className = "ghost-button small-button";
+    useButton.type = "button";
+    useButton.textContent = themeSelect.value === theme.id ? "Selected" : "Use theme";
+    useButton.disabled = themeSelect.value === theme.id;
+    useButton.addEventListener("click", () => {
+      populateThemeOptions({ selectedThemeId: theme.id });
+      applyThemePreview(theme.id);
+    });
+    actions.appendChild(useButton);
+
+    const removeButton = document.createElement("button");
+    removeButton.className = "ghost-button small-button danger-button";
+    removeButton.type = "button";
+    removeButton.textContent = "Remove";
+    removeButton.addEventListener("click", () => {
+      const wasSelected = themeSelect.value === theme.id;
+      customThemeDrafts.splice(index, 1);
+      populateThemeOptions({
+        selectedThemeId: wasSelected ? window.HermesTheme?.defaultThemeId || "obsidian" : themeSelect.value
+      });
+      renderCustomThemeList();
+      applyThemePreview(themeSelect.value);
+    });
+    actions.appendChild(removeButton);
+
+    head.appendChild(actions);
+    card.appendChild(head);
+
+    const nameField = document.createElement("label");
+    nameField.className = "field";
+    const nameLabel = document.createElement("span");
+    nameLabel.className = "field-label";
+    nameLabel.textContent = "Theme name";
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.maxLength = 60;
+    nameInput.spellcheck = false;
+    nameInput.value = theme.label;
+    nameInput.addEventListener("input", () => {
+      customThemeDrafts[index].label = nameInput.value;
+      title.textContent = nameInput.value.trim() || `Custom Theme ${index + 1}`;
+    });
+    nameInput.addEventListener("change", () => {
+      const previousId = customThemeDrafts[index].id;
+      customThemeDrafts[index] = createCustomThemeDraft(customThemeDrafts[index], index);
+      const selectedThemeId = themeSelect.value === previousId ? customThemeDrafts[index].id : themeSelect.value;
+      populateThemeOptions({ selectedThemeId });
+      renderCustomThemeList();
+      applyThemePreview(themeSelect.value);
+    });
+    nameField.appendChild(nameLabel);
+    nameField.appendChild(nameInput);
+    card.appendChild(nameField);
+
+    const modeField = document.createElement("label");
+    modeField.className = "field";
+    const modeLabel = document.createElement("span");
+    modeLabel.className = "field-label";
+    modeLabel.textContent = "Mode";
+    const modeSelect = document.createElement("select");
+    const darkOption = document.createElement("option");
+    darkOption.value = "dark";
+    darkOption.textContent = "Dark";
+    const lightOption = document.createElement("option");
+    lightOption.value = "light";
+    lightOption.textContent = "Light";
+    modeSelect.appendChild(darkOption);
+    modeSelect.appendChild(lightOption);
+    modeSelect.value = theme.mode;
+    modeSelect.addEventListener("change", () => {
+      customThemeDrafts[index] = createCustomThemeDraft({
+        ...customThemeDrafts[index],
+        mode: modeSelect.value
+      }, index);
+      populateThemeOptions({ selectedThemeId: themeSelect.value });
+      renderCustomThemeList();
+      if (themeSelect.value === customThemeDrafts[index].id) {
+        applyThemePreview(themeSelect.value);
+      }
+    });
+    modeField.appendChild(modeLabel);
+    modeField.appendChild(modeSelect);
+    card.appendChild(modeField);
+
+    const colorGrid = document.createElement("div");
+    colorGrid.className = "theme-color-grid";
+
+    const createColorEditor = (labelText, colorKey, fallback) => {
+      const wrapper = document.createElement("label");
+      wrapper.className = "field color-field";
+      const label = document.createElement("span");
+      label.className = "field-label";
+      label.textContent = labelText;
+
+      const row = document.createElement("div");
+      row.className = "color-input-row";
+
+      const picker = document.createElement("input");
+      picker.type = "color";
+      picker.value = theme[colorKey];
+
+      const hexInput = document.createElement("input");
+      hexInput.type = "text";
+      hexInput.maxLength = 7;
+      hexInput.spellcheck = false;
+      hexInput.value = theme[colorKey];
+
+      const applyColor = (rawValue, { persist = false } = {}) => {
+        const normalized =
+          window.HermesTheme?.normalizeHexColor(rawValue, fallback) || fallback;
+        picker.value = normalized;
+        hexInput.value = normalized;
+        customThemeDrafts[index][colorKey] = normalized;
+        if (themeSelect.value === customThemeDrafts[index].id) {
+          currentThemeAccent = customThemeDrafts[index].primaryColor;
+          applyThemePreview(themeSelect.value);
+          if (persist) {
+            scheduleThemePreviewSave();
+          }
+        }
+      };
+
+      picker.addEventListener("input", () => applyColor(picker.value, { persist: true }));
+      picker.addEventListener("change", () => applyColor(picker.value, { persist: true }));
+      hexInput.addEventListener("input", () => applyColor(hexInput.value, { persist: true }));
+      hexInput.addEventListener("change", () => applyColor(hexInput.value, { persist: true }));
+
+      row.appendChild(picker);
+      row.appendChild(hexInput);
+      wrapper.appendChild(label);
+      wrapper.appendChild(row);
+      return wrapper;
+    };
+
+    colorGrid.appendChild(
+      createColorEditor(
+        "Primary color",
+        "primaryColor",
+        window.HermesTheme?.defaultCustomThemePrimary || "#8b5cf6"
+      )
+    );
+    colorGrid.appendChild(
+      createColorEditor(
+        "Secondary color",
+        "secondaryColor",
+        window.HermesTheme?.defaultCustomThemeSecondary || "#22d3ee"
+      )
+    );
+    colorGrid.appendChild(
+      createColorEditor(
+        "Text color",
+        "textColor",
+        theme.mode === "light" ? "#111827" : "#f8fafc"
+      )
+    );
+    colorGrid.appendChild(
+      createColorEditor(
+        "Muted text",
+        "mutedTextColor",
+        theme.mode === "light" ? "#475569" : "#94a3b8"
+      )
+    );
+    colorGrid.appendChild(
+      createColorEditor(
+        "Surface color",
+        "surfaceColor",
+        theme.mode === "light" ? "#ffffff" : "#1b1a25"
+      )
+    );
+    colorGrid.appendChild(
+      createColorEditor(
+        "Field color",
+        "fieldColor",
+        theme.mode === "light" ? "#ffffff" : "#11131d"
+      )
+    );
+    colorGrid.appendChild(
+      createColorEditor(
+        "Field text",
+        "fieldTextColor",
+        theme.mode === "light" ? "#111827" : "#f8fafc"
+      )
+    );
+
+    card.appendChild(colorGrid);
+    customThemeList.appendChild(card);
+  });
+}
+
 async function sendRuntimeMessage(payload) {
   let response;
   try {
@@ -178,10 +524,20 @@ async function sendRuntimeMessage(payload) {
 async function loadSettings() {
   const response = await sendRuntimeMessage({ type: "hermes:get-settings" });
   const settings = response.settings || {};
+  const themeSettings = window.HermesTheme?.normalizeThemeSettings(settings) || {
+    themeName: window.HermesTheme?.defaultThemeId || "obsidian",
+    customThemeAccent: window.HermesTheme?.defaultCustomThemePrimary || "#8b5cf6",
+    customThemes: []
+  };
   bridgeUrlInput.value = settings.bridgeUrl || "";
   bridgeTokenInput.value = settings.bridgeToken || "";
   sharePageByDefault.checked = settings.sharePageByDefault !== false;
   includeTranscript.checked = settings.includeTranscriptByDefault !== false;
+  customThemeDrafts = Array.isArray(themeSettings.customThemes)
+    ? themeSettings.customThemes.map((theme, index) => createCustomThemeDraft(theme, index))
+    : [];
+  populateThemeOptions({ selectedThemeId: themeSettings.themeName });
+  currentThemeAccent = themeSettings.customThemeAccent;
   showQuickPrompts.checked = settings.showQuickPrompts === true;
   showChallengeMode.checked = settings.showChallengeMode === true;
   challengeModeLabel.value = settings.challengeModeLabel || "";
@@ -190,6 +546,8 @@ async function loadSettings() {
     ? settings.quickPrompts.map((prompt) => createPromptDraft(prompt))
     : [];
   renderQuickPromptList();
+  renderCustomThemeList();
+  applyThemePreview(themeSelect.value);
 }
 
 async function checkBridge() {
@@ -229,6 +587,17 @@ function collectQuickPromptPayload() {
 
 function buildSettingsPayload() {
   const { prompts, skippedCount } = collectQuickPromptPayload();
+  const normalizedCustomThemes = window.HermesTheme?.normalizeCustomThemes?.(customThemeDrafts) ||
+    customThemeDrafts.map((theme, index) => createCustomThemeDraft(theme, index));
+  const themeSettings = window.HermesTheme?.normalizeThemeSettings({
+    themeName: themeSelect.value,
+    customThemeAccent: currentThemeAccent,
+    customThemes: normalizedCustomThemes
+  }) || {
+    themeName: themeSelect.value || window.HermesTheme?.defaultThemeId || "obsidian",
+    customThemeAccent: currentThemeAccent || "#8b5cf6",
+    customThemes: normalizedCustomThemes
+  };
   return {
     skippedCount,
     settings: {
@@ -236,6 +605,9 @@ function buildSettingsPayload() {
       bridgeToken: bridgeTokenInput.value.trim(),
       includeTranscriptByDefault: includeTranscript.checked,
       sharePageByDefault: sharePageByDefault.checked,
+      themeName: themeSettings.themeName,
+      customThemeAccent: themeSettings.customThemeAccent,
+      customThemes: themeSettings.customThemes,
       showQuickPrompts: showQuickPrompts.checked,
       showChallengeMode: showChallengeMode.checked,
       quickPrompts: prompts,
@@ -285,9 +657,28 @@ document.getElementById("health-button").addEventListener("click", () => {
     .catch((error) => setBridgeStatus(error.message || String(error)));
 });
 
+addThemeButton.addEventListener("click", () => {
+  const nextTheme = createCustomThemeDraft({}, customThemeDrafts.length);
+  customThemeDrafts.push(nextTheme);
+  populateThemeOptions({ selectedThemeId: nextTheme.id });
+  renderCustomThemeList();
+  applyThemePreview(nextTheme.id);
+});
+
 addQuickPromptButton.addEventListener("click", () => {
   quickPromptDrafts.push(createPromptDraft({ label: "", template: "", includeTranscript: false }));
   renderQuickPromptList();
+});
+
+themeSelect.addEventListener("input", () => {
+  applyThemePreview(themeSelect.value);
+});
+
+themeSelect.addEventListener("change", () => {
+  saveSettings({
+    checkBridgeAfterSave: false,
+    savedPrefix: "Theme saved."
+  }).catch((error) => setStatus(error.message || String(error)));
 });
 
 showQuickPrompts.addEventListener("change", () => {
@@ -332,6 +723,8 @@ window.addEventListener("unhandledrejection", (event) => {
   try {
     await loadSettings();
   } catch (error) {
-    setStatus(error.message || String(error));
+    const message = error.message || String(error);
+    setStatus(message);
+    setBridgeStatus(message);
   }
 })();

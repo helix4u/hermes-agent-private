@@ -11,6 +11,10 @@ const statusText = document.getElementById("status-text");
 
 let activeTabId = null;
 
+window.HermesTheme?.applyThemeToDocument({
+  themeName: window.HermesTheme?.defaultThemeId || "obsidian"
+});
+
 function setStatus(message) {
   statusText.textContent = message;
 }
@@ -78,6 +82,7 @@ async function loadSettings() {
   bridgeUrlInput.value = settings.bridgeUrl || "";
   bridgeTokenInput.value = settings.bridgeToken || "";
   includeTranscript.checked = Boolean(settings.includeTranscriptByDefault);
+  window.HermesTheme?.applyThemeToDocument(settings);
 }
 
 async function saveSettings() {
@@ -89,6 +94,7 @@ async function saveSettings() {
       includeTranscriptByDefault: includeTranscript.checked
     }
   });
+  await loadSettings();
   setStatus("Settings saved.");
 }
 

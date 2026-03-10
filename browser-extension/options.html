@@ -12,7 +12,7 @@
       <header class="hero">
         <p class="eyebrow">Hermes Agent</p>
         <h1>Sidecar settings</h1>
-        <p class="subhead">Configure bridge and default behavior here. Chat stays clean in the side panel.</p>
+        <p class="subhead">Configure bridge, defaults, and polished extension theming here. Chat stays clean in the side panel.</p>
       </header>
 
       <section class="card">
@@ -51,6 +51,30 @@
           <input id="include-transcript" type="checkbox">
           <span>Include YouTube transcript by default</span>
         </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Appearance</h2>
+            <p class="section-copy">Choose from monochrome, sepia, restored classics, and retro-gamer palettes for the popup, sidecar, and options page.</p>
+          </div>
+        </div>
+        <label class="field">
+          <span class="field-label">Theme</span>
+          <select id="theme-select"></select>
+        </label>
+        <p id="theme-description" class="theme-note">Loading theme library...</p>
+        <div class="editor-block">
+          <div class="editor-head">
+            <div>
+              <h3>Custom themes</h3>
+              <p class="section-copy">Add named themes and tune their light or dark primary and secondary colors.</p>
+            </div>
+            <button id="add-theme-button" class="ghost-button" type="button">Add theme</button>
+          </div>
+          <div id="custom-theme-list" class="prompt-list"></div>
+        </div>
       </section>
 
       <section class="card">
@@ -103,6 +127,7 @@
         <p id="status-text" class="status-text">Waiting for input.</p>
       </section>
     </main>
+    <script src="theme.js"></script>
     <script src="options.js"></script>
   </body>
 </html>

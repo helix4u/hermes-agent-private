@@ -61,8 +61,15 @@ let sidebarSettings = {
   showChallengeMode: false,
   quickPrompts: [],
   challengeModeLabel: "Challenge my framing",
-  challengeModePrompt: ""
+  challengeModePrompt: "",
+  themeName: window.HermesTheme?.defaultThemeId || "obsidian",
+  customThemeAccent: "#9ca3af",
+  customThemes: []
 };
+
+window.HermesTheme?.applyThemeToDocument({
+  themeName: window.HermesTheme?.defaultThemeId || "obsidian"
+});
 let sessionHistoryByKey = new Map();
 let selectedSessionCanSend = true;
 let extensionContextInvalidated = false;
@@ -484,9 +491,16 @@ function applySidebarSettings(settings, { preserveBusyState = false } = {}) {
     showChallengeMode: nextSettings.showChallengeMode === true,
     quickPrompts: Array.isArray(nextSettings.quickPrompts) ? nextSettings.quickPrompts : [],
     challengeModeLabel: String(nextSettings.challengeModeLabel || "").trim() || "Challenge my framing",
-    challengeModePrompt: String(nextSettings.challengeModePrompt || "").trim()
+    challengeModePrompt: String(nextSettings.challengeModePrompt || "").trim(),
+    themeName:
+      String(nextSettings.themeName || window.HermesTheme?.defaultThemeId || "obsidian").trim().toLowerCase() ||
+      window.HermesTheme?.defaultThemeId ||
+      "obsidian",
+    customThemeAccent: String(nextSettings.customThemeAccent || "#9ca3af").trim() || "#9ca3af",
+    customThemes: Array.isArray(nextSettings.customThemes) ? nextSettings.customThemes : []
   };
 
+  window.HermesTheme?.applyThemeToDocument(sidebarSettings);
   includeTranscript.checked = nextSettings.includeTranscriptByDefault !== false;
   sharePageByDefault = nextSettings.sharePageByDefault !== false;
   if (!preserveBusyState || !isBusy) {
@@ -1713,7 +1727,10 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     "showChallengeMode",
     "quickPrompts",
     "challengeModeLabel",
-    "challengeModePrompt"
+    "challengeModePrompt",
+    "themeName",
+    "customThemeAccent",
+    "customThemes"
   ];
   if (!watchedKeys.some((key) => Object.prototype.hasOwnProperty.call(changes, key))) {
     return;

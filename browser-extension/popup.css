@@ -2,13 +2,36 @@
   box-sizing: border-box;
 }
 
+:root {
+  color-scheme: dark;
+  --theme-body-bg: radial-gradient(circle at top right, rgba(229, 231, 235, 0.16), transparent 34%), linear-gradient(180deg, #0a0a0b 0%, #050506 100%);
+  --theme-text-main: #f5f5f5;
+  --theme-text-soft: #d4d4d8;
+  --theme-text-muted: #a1a1aa;
+  --theme-text-faint: #71717a;
+  --theme-text-accent: #ffffff;
+  --theme-accent: #e5e7eb;
+  --theme-accent-strong: #9ca3af;
+  --theme-accent-contrast: #050506;
+  --theme-accent-glow: rgba(229, 231, 235, 0.18);
+  --theme-card-bg: rgba(17, 18, 21, 0.9);
+  --theme-card-border: rgba(229, 231, 235, 0.14);
+  --theme-card-inset: rgba(255, 255, 255, 0.05);
+  --theme-field-bg: rgba(10, 11, 13, 0.74);
+  --theme-field-border: rgba(229, 231, 235, 0.16);
+  --theme-field-focus: rgba(156, 163, 175, 0.58);
+  --theme-field-text: #f5f5f5;
+  --theme-chip-bg: rgba(229, 231, 235, 0.05);
+  --theme-chip-border: rgba(229, 231, 235, 0.1);
+  --theme-primary-button-bg: linear-gradient(135deg, #e5e7eb, #9ca3af);
+  --theme-ghost-button-bg: rgba(229, 231, 235, 0.08);
+}
+
 body {
   margin: 0;
   min-width: 380px;
-  background:
-    radial-gradient(circle at top right, rgba(255, 191, 73, 0.18), transparent 34%),
-    linear-gradient(180deg, #0f0d0a 0%, #17120d 100%);
-  color: #f8f0dc;
+  background: var(--theme-body-bg);
+  color: var(--theme-text-main);
   font: 14px/1.45 "Segoe UI", "Helvetica Neue", sans-serif;
 }
 
@@ -25,7 +48,7 @@ body {
 
 .eyebrow {
   margin: 0 0 4px;
-  color: #d4a75d;
+  color: var(--theme-accent);
   font: 600 11px/1.2 "Consolas", "Courier New", monospace;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -39,14 +62,14 @@ body {
 
 .subhead {
   margin: 8px 0 0;
-  color: #dbc8a3;
+  color: var(--theme-text-soft);
 }
 
 .card {
-  border: 1px solid rgba(212, 167, 93, 0.2);
+  border: 1px solid var(--theme-card-border);
   border-radius: 16px;
-  background: rgba(27, 21, 15, 0.88);
-  box-shadow: inset 0 1px 0 rgba(255, 232, 184, 0.05);
+  background: var(--theme-card-bg);
+  box-shadow: inset 0 1px 0 var(--theme-card-inset);
   padding: 14px;
 }
 
@@ -71,7 +94,7 @@ body {
 
 .page-url {
   margin: 6px 0 0;
-  color: #b89f76;
+  color: var(--theme-text-muted);
   font-size: 12px;
   word-break: break-all;
 }
@@ -84,14 +107,14 @@ body {
 }
 
 .meta-chip {
-  border: 1px solid rgba(255, 219, 146, 0.08);
+  border: 1px solid var(--theme-chip-border);
   border-radius: 12px;
-  background: rgba(255, 219, 146, 0.04);
+  background: var(--theme-chip-bg);
   padding: 10px;
 }
 
 .meta-label {
-  color: #c6a970;
+  color: var(--theme-text-faint);
   display: block;
   font-size: 11px;
   margin-bottom: 4px;
@@ -105,18 +128,18 @@ body {
 .note-input,
 .field input {
   width: 100%;
-  border: 1px solid rgba(212, 167, 93, 0.24);
+  border: 1px solid var(--theme-field-border);
   border-radius: 12px;
-  background: rgba(7, 7, 7, 0.42);
-  color: #fff6e4;
+  background: var(--theme-field-bg);
+  color: var(--theme-field-text);
   padding: 10px 12px;
   outline: none;
 }
 
 .note-input:focus,
 .field input:focus {
-  border-color: rgba(255, 191, 73, 0.75);
-  box-shadow: 0 0 0 1px rgba(255, 191, 73, 0.2);
+  border-color: var(--theme-field-focus);
+  box-shadow: 0 0 0 1px var(--theme-accent-glow);
 }
 
 .note-input {
@@ -130,7 +153,7 @@ body {
 }
 
 .field-label {
-  color: #c9af82;
+  color: var(--theme-text-soft);
   display: block;
   font-size: 12px;
   margin-bottom: 6px;
@@ -138,7 +161,7 @@ body {
 
 .checkbox-row {
   align-items: flex-start;
-  color: #dbc8a3;
+  color: var(--theme-text-soft);
   display: flex;
   gap: 10px;
   margin: 12px 0 14px;
@@ -167,14 +190,14 @@ button:active {
 
 .primary-button {
   width: 100%;
-  background: linear-gradient(135deg, #f1b44c, #d88a2d);
-  color: #241406;
+  background: var(--theme-primary-button-bg);
+  color: var(--theme-accent-contrast);
 }
 
 .secondary-button,
 .ghost-button {
-  background: rgba(255, 219, 146, 0.08);
-  color: #f7dfb2;
+  background: var(--theme-ghost-button-bg);
+  color: var(--theme-text-accent);
 }
 
 .status-card {
@@ -183,6 +206,6 @@ button:active {
 
 .status-text {
   margin: 0;
-  color: #f0dbc1;
+  color: var(--theme-text-main);
   white-space: pre-wrap;
 }
