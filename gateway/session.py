@@ -662,7 +662,28 @@ class SessionStore:
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""
-        # Try SQLite first
+        # Prefer legacy JSONL transcript first so browser sidecar and other
+        # consumers see the same single-source transcript that the gateway
+        # appends to per turn. SQLite is used as a secondary source of truth
+        # for tooling/search and as a fallback when JSONL is missing/empty.
+        transcript_path = self.get_transcript_path(session_id)
+
+        if transcript_path.exists():
+            messages: List[Dict[str, Any]] = []
+            try:
+                with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            messages.append(json.loads(line))
+            except Exception as e:
+                logger.debug("Could not load messages from JSONL transcript %s: %s", transcript_path, e)
+                messages = []
+
+            if messages:
+                return messages
+
+        # Fall back to SQLite conversation view if JSONL is unavailable or empty.
         if self._db:
             try:
                 messages = self._db.get_messages_as_conversation(session_id)
@@ -670,21 +691,8 @@ class SessionStore:
                     return messages
             except Exception as e:
                 logger.debug("Could not load messages from DB: %s", e)
-        
-        # Fall back to legacy JSONL
-        transcript_path = self.get_transcript_path(session_id)
-        
-        if not transcript_path.exists():
-            return []
-        
-        messages = []
-        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    messages.append(json.loads(line))
-        
-        return messages
+
+        return []
 
 
 def build_session_context(

@@ -4571,7 +4571,6 @@ class GatewayRunner:
                 step_callback=_step_callback_sync if _hooks_ref.loaded_hooks else None,
                 platform=platform_key,
                 honcho_session_key=session_key,
-                session_db=self._session_db,
             )
             
             # Store agent reference for interrupt support
