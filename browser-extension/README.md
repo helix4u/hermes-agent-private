@@ -8,6 +8,7 @@ real Hermes chat session beside the active tab.
 - Keep a dedicated browser-side Hermes session with transcript history
 - Switch between recent sidecar sessions from the session history picker
 - Send normal chat messages to that session
+- Interrupt an in-flight sidecar response chain when you need Hermes to stop
 - Share the current page into the same conversation when you want more context
 - Include page title, URL, visible text, selection, and metadata when sharing
 - For YouTube watch pages: include the transcript the first time that video is
@@ -45,7 +46,8 @@ real Hermes chat session beside the active tab.
 4. If the page is a YouTube video, optionally include the transcript the first
    time you share that video.
 5. Use `New chat` to reset just the sidecar session.
-6. Use the `Session history` picker to jump between recent sidecar sessions.
+6. Use `Interrupt` while Hermes is working if you need to stop the current turn.
+7. Use the `Session history` picker to jump between recent sidecar sessions.
 
 ## Notes
 

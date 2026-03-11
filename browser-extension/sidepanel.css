@@ -363,6 +363,12 @@ textarea::placeholder {
   flex-shrink: 0;
 }
 
+.interrupt-button {
+  background: var(--theme-danger-bg);
+  color: var(--theme-danger-text);
+  flex-shrink: 0;
+}
+
 .compact-action-button {
   height: 30px;
   padding: 0 12px;

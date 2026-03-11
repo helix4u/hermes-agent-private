@@ -1410,6 +1410,23 @@ async function resetChatSession(sessionKey = "", createNew = false) {
   });
 }
 
+async function interruptChatSession(sessionKey = "") {
+  const token = await getBridgeToken();
+  const clientSessionId = await getClientSessionId();
+  const browserLabel = await getActiveBrowserLabel();
+  const normalizedSessionKey = String(sessionKey || "").trim();
+  return callBridge("/session", {
+    token,
+    timeoutMs: SESSION_BRIDGE_TIMEOUT_MS,
+    body: {
+      action: "interrupt",
+      browserLabel,
+      clientSessionId,
+      sessionKey: normalizedSessionKey || undefined
+    }
+  });
+}
+
 async function startChatMessage(tabId, message, sharePage, includeTranscript, sessionKey = "", contextOptions = null) {
   const token = await getBridgeToken();
   const clientSessionId = await getClientSessionId();
@@ -1600,6 +1617,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         message.sessionKey || "",
         Boolean(message.createNew)
       );
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:interrupt-chat-session") {
+      const result = await interruptChatSession(message.sessionKey || "");
       sendResponse({ ok: true, result });
       return;
     }

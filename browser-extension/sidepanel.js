@@ -16,6 +16,7 @@ const domainPermissionStatus = document.getElementById("domain-permission-status
 const domainPermissionButton = document.getElementById("domain-permission-button");
 const activityText = document.getElementById("activity-text");
 const sendButton = document.getElementById("send-button");
+const interruptButton = document.getElementById("interrupt-button");
 const resetChatButton = document.getElementById("reset-chat-button");
 const activityPanel = document.getElementById("activity-panel");
 const sessionHistorySelect = document.getElementById("session-history-select");
@@ -45,6 +46,7 @@ let pendingUserMessage = null;
 let lastPreview = null;
 let sharePageByDefault = true;
 let isBusy = false;
+let interruptRequested = false;
 let pendingQueuedAt = 0;
 let expectedSessionKey = "";
 let selectedSessionKey = "";
@@ -207,6 +209,7 @@ function rerenderCurrentMessages() {
 
 function updateComposerAvailability() {
   const canSend = !isBusy && selectedSessionCanSend;
+  const canInterrupt = Boolean(interruptButton) && isBusy && selectedSessionCanSend;
   sendButton.disabled = !canSend;
   chatInput.disabled = !selectedSessionCanSend;
   sendButton.textContent = isBusy ? "Working..." : "Send";
@@ -218,6 +221,16 @@ function updateComposerAvailability() {
   chatInput.placeholder = selectedSessionCanSend
     ? "Ask Hermes something, or leave this empty and just share the page..."
     : "Browsing a non-sidecar Hermes session. Select a browser sidecar session or start a new chat to send.";
+  if (interruptButton) {
+    interruptButton.hidden = !canInterrupt;
+    interruptButton.disabled = !canInterrupt || interruptRequested;
+    interruptButton.textContent = interruptRequested ? "Stopping..." : "Interrupt";
+    interruptButton.title = !canInterrupt
+      ? "Interrupt is only available while Hermes is working on this browser sidecar session"
+      : interruptRequested
+        ? "Interrupt already requested for the current turn"
+        : "Ask Hermes to stop the current response chain";
+  }
 }
 
 function clearReplyAudioState() {
@@ -630,6 +643,9 @@ function renderChatNotice(message) {
 
 function setBusyState(busy) {
   isBusy = busy;
+  if (!busy) {
+    interruptRequested = false;
+  }
   resetChatButton.disabled = busy;
   if (sessionHistorySelect) {
     sessionHistorySelect.disabled = busy;
@@ -1503,6 +1519,59 @@ async function sendChatMessage(messageOverride = null, options = {}) {
   schedulePolling();
 }
 
+async function interruptChatSession() {
+  stopReplySpeech({ rerender: false });
+  if (!selectedSessionCanSend) {
+    throw new Error(
+      "This session is read-only in the browser side panel right now. " +
+      "Select a browser sidecar session to interrupt from here."
+    );
+  }
+  if (!isBusy && !currentProgress?.running) {
+    setStatus("No active Hermes turn to interrupt.");
+    return;
+  }
+  if (interruptRequested) {
+    setStatus("Interrupt already requested. Waiting for Hermes to stop...", { openActivity: true });
+    return;
+  }
+
+  const targetSessionKey = String(selectedSessionKey || expectedSessionKey || "").trim();
+  interruptRequested = true;
+  updateComposerAvailability();
+  setStatus("Stopping the current Hermes turn...", { openActivity: true });
+
+  try {
+    const response = await sendRuntimeMessage({
+      type: "hermes:interrupt-chat-session",
+      sessionKey: targetSessionKey
+    });
+    currentMessages = response.result?.messages || currentMessages;
+    currentProgress = response.result?.progress || currentProgress;
+    expectedSessionKey = response.result?.session_key || expectedSessionKey;
+    selectedSessionKey = expectedSessionKey || targetSessionKey;
+    interruptRequested = Boolean(response.result?.interrupt_requested);
+    renderMessages(currentMessages, currentProgress, pendingUserMessage);
+    setStatus(
+      response.result?.detail || "Interrupt requested. Hermes will stop after the current step.",
+      { openActivity: true }
+    );
+    loadSessionHistory({
+      quiet: true,
+      preferredSessionKey: expectedSessionKey || targetSessionKey
+    }).catch(() => {});
+    if (currentProgress?.running || isBusy) {
+      schedulePolling();
+    } else {
+      setBusyState(false);
+    }
+  } catch (error) {
+    interruptRequested = false;
+    updateComposerAvailability();
+    throw error;
+  }
+}
+
 function handleSendError(error) {
   setBusyState(false);
   pendingUserMessage = null;
@@ -1654,6 +1723,14 @@ if (sessionHistorySelect) {
 document.getElementById("send-button").addEventListener("click", () => {
   sendChatMessage().catch(handleSendError);
 });
+
+if (interruptButton) {
+  interruptButton.addEventListener("click", () => {
+    interruptChatSession().catch((error) => {
+      setStatus(explainBackgroundMismatch(error), { openActivity: true });
+    });
+  });
+}
 
 document.getElementById("reset-chat-button").addEventListener("click", () => {
   resetChatSession().catch((error) => {

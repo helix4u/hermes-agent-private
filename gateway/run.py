@@ -627,6 +627,7 @@ class GatewayRunner:
         self._browser_bridge: BrowserBridgeServer | None = None
         self._browser_bridge_tasks: Dict[str, asyncio.Task] = {}
         self._browser_bridge_progress: Dict[str, Dict[str, Any]] = {}
+        self._browser_bridge_pending_interrupts: set[str] = set()
         
         # Initialize session database for session_search tool support
         self._session_db = None
@@ -728,6 +729,26 @@ class GatewayRunner:
             "completed_at": state.get("completed_at") or "",
             "error": state.get("error") or "",
         }
+
+    def _append_browser_bridge_progress_event(
+        self,
+        session_key: str,
+        detail: str,
+        *,
+        max_events: int = 8,
+    ) -> List[str]:
+        """Append a timestamped progress event for sidecar polling."""
+        existing = list(self._browser_bridge_progress.get(session_key, {}).get("recent_events") or [])
+        text = str(detail or "").strip()
+        if not text:
+            return existing
+        event_line = f"`{datetime.now().strftime('%H:%M:%S')}` {text}"
+        if existing and existing[-1] == event_line:
+            return existing
+        existing.append(event_line)
+        while len(existing) > max_events:
+            existing.pop(0)
+        return existing
 
     def _wiki_host_status_message(self) -> str:
         """Human-readable current wiki hosting state."""
@@ -2429,6 +2450,76 @@ class GatewayRunner:
             snapshot = self._get_browser_bridge_session_snapshot(source)
             return {
                 "ok": True,
+                **snapshot,
+            }
+
+        if action == "interrupt":
+            session_entry = self.session_store.get_or_create_session(source)
+            session_key = session_entry.session_key
+            task = self._browser_bridge_tasks.get(session_key)
+            if task and task.done():
+                self._browser_bridge_tasks.pop(session_key, None)
+                task = None
+
+            agent = self._running_agents.get(session_key)
+            task_running = bool(task and not task.done())
+            if agent is not None:
+                agent.interrupt()
+                detail = "Interrupt requested. Hermes will stop after the current step."
+                current = self._browser_bridge_progress.get(session_key, {})
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=True,
+                    phase=current.get("phase") or "thinking",
+                    detail=detail,
+                    tool_calls=int(current.get("tool_calls") or 0),
+                    updates=max(1, int(current.get("updates") or 0)) + 1,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        "Interrupt requested from the sidecar.",
+                    ),
+                    started_at=current.get("started_at"),
+                    error="",
+                )
+                snapshot = self._get_browser_bridge_session_snapshot(source)
+                return {
+                    "ok": True,
+                    "interrupt_requested": True,
+                    "detail": detail,
+                    **snapshot,
+                }
+
+            if task_running:
+                self._browser_bridge_pending_interrupts.add(session_key)
+                detail = "Interrupt queued. Hermes is still starting this turn."
+                current = self._browser_bridge_progress.get(session_key, {})
+                self._set_browser_bridge_progress(
+                    session_key,
+                    running=True,
+                    phase=current.get("phase") or "starting",
+                    detail=detail,
+                    tool_calls=int(current.get("tool_calls") or 0),
+                    updates=max(1, int(current.get("updates") or 0)) + 1,
+                    recent_events=self._append_browser_bridge_progress_event(
+                        session_key,
+                        "Interrupt queued while Hermes was starting.",
+                    ),
+                    started_at=current.get("started_at"),
+                    error="",
+                )
+                snapshot = self._get_browser_bridge_session_snapshot(source)
+                return {
+                    "ok": True,
+                    "interrupt_requested": True,
+                    "detail": detail,
+                    **snapshot,
+                }
+
+            snapshot = self._get_browser_bridge_session_snapshot(source)
+            return {
+                "ok": True,
+                "interrupt_requested": False,
+                "detail": "No active Hermes turn to interrupt.",
                 **snapshot,
             }
 
@@ -4752,6 +4843,9 @@ class GatewayRunner:
                 await asyncio.sleep(0.05)
             if session_key:
                 self._running_agents[session_key] = agent_holder[0]
+                if session_key in self._browser_bridge_pending_interrupts:
+                    self._browser_bridge_pending_interrupts.discard(session_key)
+                    agent_holder[0].interrupt()
         
         tracking_task = asyncio.create_task(track_agent())
         
@@ -4842,6 +4936,8 @@ class GatewayRunner:
             tracking_task.cancel()
             if session_key and session_key in self._running_agents:
                 del self._running_agents[session_key]
+            if session_key:
+                self._browser_bridge_pending_interrupts.discard(session_key)
             
             # Wait for cancelled tasks
             for task in [progress_task, interrupt_monitor, tracking_task]:

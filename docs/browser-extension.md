@@ -57,6 +57,7 @@ Accepts a page-context payload and sends it as a browser-context turn.
 Accepts a JSON body with one of these actions:
 
 - `state`: load the current browser session transcript
+- `interrupt`: request that the active browser sidecar turn stop early
 - `send`: send a normal chat turn, optionally with `pageContext`
 - `reset`: start a fresh browser session without affecting the CLI
 
@@ -87,5 +88,5 @@ Example `send` shape:
 
 The unpacked extension lives in [`browser-extension`](../browser-extension).
 It uses Chrome's `sidePanel` API so clicking the toolbar icon opens a persistent
-Hermes Sidecar with chat history, a normal composer, and optional page sharing
-for each turn.
+Hermes Sidecar with chat history, a normal composer, optional page sharing
+for each turn, and an interrupt button while a browser-side turn is running.
