@@ -243,6 +243,27 @@ body {
   word-break: break-word;
 }
 
+.message-images {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  margin-top: 10px;
+}
+
+.message-image-link {
+  display: block;
+}
+
+.message-image {
+  border: 1px solid var(--theme-chip-border);
+  border-radius: 12px;
+  display: block;
+  height: auto;
+  max-height: 220px;
+  object-fit: cover;
+  width: 100%;
+}
+
 .status-inline {
   margin: 8px 0 0;
   color: var(--theme-text-muted);
@@ -295,6 +316,12 @@ body {
   box-shadow: 0 0 0 1px var(--theme-accent-glow);
 }
 
+.composer.is-dragover .chat-input,
+.composer.is-dragover {
+  border-color: var(--theme-field-focus);
+  box-shadow: 0 0 0 1px var(--theme-accent-glow);
+}
+
 .session-history-select option,
 input,
 select,
@@ -342,6 +369,70 @@ textarea::placeholder {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.attachment-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.attachment-chip {
+  align-items: center;
+  background: var(--theme-subtle-bg);
+  border: 1px solid var(--theme-chip-border);
+  border-radius: 14px;
+  display: flex;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+}
+
+.attachment-thumb {
+  border-radius: 8px;
+  flex-shrink: 0;
+  height: 34px;
+  object-fit: cover;
+  width: 34px;
+}
+
+.attachment-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.attachment-name,
+.attachment-size {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-name {
+  color: var(--theme-text-accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.attachment-size {
+  color: var(--theme-text-faint);
+  font-size: 10px;
+}
+
+.attachment-remove {
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--theme-chip-border);
+  color: var(--theme-text-soft);
+  display: inline-flex;
+  flex-shrink: 0;
+  height: 24px;
+  justify-content: center;
+  padding: 0;
+  width: 24px;
 }
 
 .chip-button {

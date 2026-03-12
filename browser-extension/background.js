@@ -657,10 +657,13 @@ async function getSettings() {
 
 async function setSettings(settings) {
   const patch = buildSettingsPatch(settings);
+  const obsoleteKeys = ["showCommandTools", "commandCatalog"];
   if (!Object.keys(patch).length) {
+    await chrome.storage.sync.remove(obsoleteKeys);
     return;
   }
   await chrome.storage.sync.set(patch);
+  await chrome.storage.sync.remove(obsoleteKeys);
 }
 
 async function getClientSessionId() {
@@ -1427,11 +1430,22 @@ async function interruptChatSession(sessionKey = "") {
   });
 }
 
-async function startChatMessage(tabId, message, sharePage, includeTranscript, sessionKey = "", contextOptions = null) {
+async function startChatMessage(
+  tabId,
+  message,
+  sharePage,
+  includeTranscript,
+  sessionKey = "",
+  contextOptions = null,
+  attachments = []
+) {
   const token = await getBridgeToken();
   const clientSessionId = await getClientSessionId();
   const browserLabel = await getActiveBrowserLabel();
   const normalizedSessionKey = String(sessionKey || "").trim();
+  const normalizedAttachments = Array.isArray(attachments)
+    ? attachments.filter((attachment) => attachment && typeof attachment === "object")
+    : [];
   const body = {
     action: "send_async",
     browserLabel,
@@ -1439,6 +1453,9 @@ async function startChatMessage(tabId, message, sharePage, includeTranscript, se
     message: message || "",
     sessionKey: normalizedSessionKey || undefined
   };
+  if (normalizedAttachments.length) {
+    body.attachments = normalizedAttachments;
+  }
 
   let preview = null;
   let sentSelectionLength = 0;
@@ -1606,7 +1623,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         message.sharePage,
         message.includeTranscript,
         message.sessionKey || "",
-        message.contextOptions || null
+        message.contextOptions || null,
+        message.attachments || []
       );
       sendResponse({ ok: true, result });
       return;

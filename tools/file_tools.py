@@ -39,6 +39,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     if cached is not None:
         with _env_lock:
             if task_id in _active_environments:
+                cached.task_id = task_id
                 _last_activity[task_id] = time.time()
                 return cached
             else:
@@ -105,7 +106,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("%s environment ready for task %s", env_type, task_id[:8])
 
     # Build file_ops from the (guaranteed live) environment and cache it
+    setattr(terminal_env, "_hermes_task_id", task_id)
     file_ops = ShellFileOperations(terminal_env)
+    file_ops.task_id = task_id
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops
     return file_ops
@@ -171,9 +174,29 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             result = file_ops.patch_v4a(patch)
         else:
             return json.dumps({"error": f"Unknown mode: {mode}"})
-        
-        return json.dumps(result.to_dict(), ensure_ascii=False)
+
+        result_dict = result.to_dict()
+        if logger.isEnabledFor(logging.INFO):
+            summary_bits = []
+            if result_dict.get("status"):
+                summary_bits.append(f"status={result_dict['status']}")
+            if result_dict.get("details"):
+                summary_bits.append(str(result_dict["details"]))
+            if result_dict.get("error"):
+                summary_bits.append(f"error={result_dict['error']}")
+            if result_dict.get("files_modified"):
+                summary_bits.append(f"files_modified={len(result_dict['files_modified'])}")
+            logger.info(
+                "patch[%s] mode=%s path=%s %s",
+                task_id[:12],
+                mode,
+                path or "<multi-file>",
+                " | ".join(summary_bits) if summary_bits else "completed",
+            )
+
+        return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
+        logger.exception("patch[%s] crashed for path=%s mode=%s", task_id[:12], path or "<multi-file>", mode)
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 

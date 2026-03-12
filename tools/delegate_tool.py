@@ -36,7 +36,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
     "execute_code",    # children should reason step-by-step, not write scripts
 ])
 
-MAX_CONCURRENT_CHILDREN = 3
+MAX_CONCURRENT_CHILDREN = 2
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
@@ -51,6 +51,7 @@ def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
     """Build a focused system prompt for a child agent."""
     parts = [
         "You are a focused subagent working on a specific delegated task.",
+        "Act like an implementation agent, not a status reporter.",
         "",
         f"YOUR TASK:\n{goal}",
     ]
@@ -58,6 +59,9 @@ def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
         parts.append(f"\nCONTEXT:\n{context}")
     parts.append(
         "\nComplete this task using the tools available to you. "
+        "Inspect only what you need, then make progress. Avoid repeated planning loops, "
+        "avoid rereading the same files unless something changed, and prefer direct implementation "
+        "plus verification over commentary. If a requested edit is already present, note that and move on.\n\n"
         "When finished, provide a clear, concise summary of:\n"
         "- What you did\n"
         "- What you found or accomplished\n"
@@ -86,6 +90,17 @@ def _resolve_default_toolsets() -> List[str]:
         if cleaned:
             return cleaned
     return list(DEFAULT_TOOLSETS)
+
+
+def _resolve_max_concurrent_children(cfg: Optional[Dict[str, Any]] = None) -> int:
+    """Resolve child-agent fan-out from config with a safe default."""
+    cfg = cfg or _load_config()
+    raw_value = cfg.get("max_concurrent_children", MAX_CONCURRENT_CHILDREN)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = MAX_CONCURRENT_CHILDREN
+    return max(1, min(value, 3))
 
 
 def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1) -> Optional[callable]:
@@ -165,6 +180,16 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
 
     _callback._flush = _flush
     return _callback
+
+
+def _format_task_banner(task_index: int, task_count: int, goal: str, toolsets: List[str], max_iterations: int) -> str:
+    """Build a concise start banner for a delegated child task."""
+    prefix = f"[{task_index + 1}/{task_count}] " if task_count > 1 else ""
+    tools_label = ",".join(toolsets or [])
+    goal_preview = (goal or "").strip().replace("\n", " ")
+    if len(goal_preview) > 72:
+        goal_preview = goal_preview[:69] + "..."
+    return f"↳ {prefix}{goal_preview} | tools={tools_label or '-'} | max_iter={max_iterations}"
 
 
 def _run_single_child(
@@ -249,6 +274,8 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif result.get("partial") and summary:
+            status = "partial"
         elif completed and summary:
             status = "completed"
         else:
@@ -263,6 +290,10 @@ def _run_single_child(
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+        if result.get("stopped_reason"):
+            entry["stopped_reason"] = result.get("stopped_reason")
+        if result.get("partial"):
+            entry["partial"] = True
 
         return entry
 
@@ -321,11 +352,12 @@ def delegate_task(
     # Load config
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    max_concurrent_children = _resolve_max_concurrent_children(cfg)
     effective_max_iter = max_iterations or default_max_iter
 
     # Normalize to task list
     if tasks and isinstance(tasks, list):
-        task_list = tasks[:MAX_CONCURRENT_CHILDREN]
+        task_list = tasks[:3]
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
     else:
@@ -349,6 +381,25 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         t = task_list[0]
+        spinner_ref = getattr(parent_agent, '_delegate_spinner', None)
+        parent_cb = getattr(parent_agent, 'tool_progress_callback', None)
+        start_line = _format_task_banner(
+            task_index=0,
+            task_count=1,
+            goal=t["goal"],
+            toolsets=t.get("toolsets") or toolsets or _resolve_default_toolsets(),
+            max_iterations=effective_max_iter,
+        )
+        if spinner_ref:
+            try:
+                spinner_ref.print_above(start_line)
+            except Exception:
+                pass
+        if parent_cb:
+            try:
+                parent_cb("subagent_progress", start_line)
+            except Exception:
+                pass
         result = _run_single_child(
             task_index=0,
             goal=t["goal"],
@@ -364,15 +415,33 @@ def delegate_task(
         # Batch -- run in parallel with per-task progress lines
         completed_count = 0
         spinner_ref = getattr(parent_agent, '_delegate_spinner', None)
+        parent_cb = getattr(parent_agent, 'tool_progress_callback', None)
 
         # Save stdout/stderr before the executor — redirect_stdout in child
         # threads races on sys.stdout and can leave it as devnull permanently.
         _saved_stdout = sys.stdout
         _saved_stderr = sys.stderr
 
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHILDREN) as executor:
+        with ThreadPoolExecutor(max_workers=max_concurrent_children) as executor:
             futures = {}
             for i, t in enumerate(task_list):
+                start_line = _format_task_banner(
+                    task_index=i,
+                    task_count=n_tasks,
+                    goal=t["goal"],
+                    toolsets=t.get("toolsets") or toolsets or _resolve_default_toolsets(),
+                    max_iterations=effective_max_iter,
+                )
+                if spinner_ref:
+                    try:
+                        spinner_ref.print_above(start_line)
+                    except Exception:
+                        pass
+                if parent_cb:
+                    try:
+                        parent_cb("subagent_progress", start_line)
+                    except Exception:
+                        pass
                 future = executor.submit(
                     _run_single_child,
                     task_index=i,
@@ -407,9 +476,16 @@ def delegate_task(
                 label = task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
                 dur = entry.get("duration_seconds", 0)
                 status = entry.get("status", "?")
-                icon = "✓" if status == "completed" else "✗"
+                if status == "completed":
+                    icon = "✓"
+                elif status == "partial":
+                    icon = "!"
+                elif status == "interrupted":
+                    icon = "■"
+                else:
+                    icon = "✗"
                 remaining = n_tasks - completed_count
-                completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
+                completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s, {status})"
                 if spinner_ref:
                     try:
                         spinner_ref.print_above(completion_line)
@@ -417,6 +493,11 @@ def delegate_task(
                         print(f"  {completion_line}")
                 else:
                     print(f"  {completion_line}")
+                if parent_cb:
+                    try:
+                        parent_cb("subagent_progress", completion_line)
+                    except Exception:
+                        pass
 
                 # Update spinner text to show remaining count
                 if spinner_ref and remaining > 0:

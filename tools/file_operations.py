@@ -29,12 +29,17 @@ import os
 import re
 import json
 import difflib
+import logging
+import threading
 from abc import ABC, abstractmethod
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 
 from tools.interrupt import is_interrupted
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +82,37 @@ WRITE_DENIED_PREFIXES = [
 ]
 
 READ_DENIED_BASENAMES = {".env"}
+
+
+_FILE_WRITE_REGISTRY_LOCK = threading.Lock()
+_FILE_WRITE_LOCKS: dict[str, threading.RLock] = {}
+_FILE_WRITE_OWNERS: dict[str, str] = {}
+
+
+def _get_file_write_lock(path: str) -> threading.RLock:
+    """Return the shared write lock for a normalized file path."""
+    normalized = os.path.realpath(os.path.expanduser(path))
+    with _FILE_WRITE_REGISTRY_LOCK:
+        lock = _FILE_WRITE_LOCKS.get(normalized)
+        if lock is None:
+            lock = threading.RLock()
+            _FILE_WRITE_LOCKS[normalized] = lock
+        return lock
+
+
+def _read_file_write_owner(path: str) -> str:
+    normalized = os.path.realpath(os.path.expanduser(path))
+    with _FILE_WRITE_REGISTRY_LOCK:
+        return _FILE_WRITE_OWNERS.get(normalized, "")
+
+
+def _set_file_write_owner(path: str, owner: str) -> None:
+    normalized = os.path.realpath(os.path.expanduser(path))
+    with _FILE_WRITE_REGISTRY_LOCK:
+        if owner:
+            _FILE_WRITE_OWNERS[normalized] = owner
+        else:
+            _FILE_WRITE_OWNERS.pop(normalized, None)
 
 
 def _is_write_denied(path: str) -> bool:
@@ -138,6 +174,8 @@ class WriteResult:
 class PatchResult:
     """Result from patching a file."""
     success: bool = False
+    status: Optional[str] = None
+    details: Optional[str] = None
     diff: str = ""
     files_modified: List[str] = field(default_factory=list)
     files_created: List[str] = field(default_factory=list)
@@ -147,6 +185,10 @@ class PatchResult:
     
     def to_dict(self) -> dict:
         result = {"success": self.success}
+        if self.status:
+            result["status"] = self.status
+        if self.details:
+            result["details"] = self.details
         if self.diff:
             result["diff"] = self.diff
         if self.files_modified:
@@ -340,9 +382,62 @@ class ShellFileOperations(FileOperations):
         if os.name == "nt":
             resolved_cwd = str(Path(str(resolved_cwd)).expanduser())
         self.cwd = resolved_cwd
+        self.task_id = getattr(terminal_env, "_hermes_task_id", "default")
         
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}
+
+    def _write_owner_label(self) -> str:
+        """Return a readable label for lock ownership diagnostics."""
+        owner = str(getattr(self, "task_id", "") or "").strip()
+        if owner:
+            return f"task:{owner}"
+        return f"thread:{threading.current_thread().name}"
+
+    @contextmanager
+    def _file_write_guard(self, path: str, operation: str):
+        """Serialize writes so only one task edits a file at a time."""
+        normalized = os.path.realpath(os.path.expanduser(path))
+        lock = _get_file_write_lock(normalized)
+        owner = self._write_owner_label()
+        previous_owner = _read_file_write_owner(normalized)
+        waiting = False
+        if previous_owner and previous_owner != owner:
+            waiting = True
+            logger.info(
+                "File write lock busy for %s during %s; waiting (requested_by=%s, owner=%s)",
+                normalized,
+                operation,
+                owner,
+                previous_owner,
+            )
+        lock.acquire()
+        _set_file_write_owner(normalized, owner)
+        try:
+            if waiting:
+                logger.info(
+                    "File write lock acquired for %s during %s by %s",
+                    normalized,
+                    operation,
+                    owner,
+                )
+            yield normalized
+        finally:
+            _set_file_write_owner(normalized, "")
+            lock.release()
+
+    @contextmanager
+    def _multi_file_write_guard(self, paths: List[str], operation: str):
+        """Acquire write locks for multiple files in a stable order."""
+        normalized_paths = sorted({
+            os.path.realpath(os.path.expanduser(path))
+            for path in paths
+            if str(path or "").strip()
+        })
+        with ExitStack() as stack:
+            for normalized in normalized_paths:
+                stack.enter_context(self._file_write_guard(normalized, operation))
+            yield normalized_paths
     
     def _exec(self, command: str, cwd: str = None, timeout: int = None,
               stdin_data: str = None) -> ExecuteResult:
@@ -888,49 +983,46 @@ class ShellFileOperations(FileOperations):
         Returns:
             WriteResult with bytes written or error
         """
-        # Windows local backend: avoid shell aliases (cat/Get-Content) and
-        # write directly with Python file APIs.
         if self._is_windows_local_backend():
-            return self._write_file_windows(path, content)
+            resolved = self._resolve_windows_path(path)
+            if _is_write_denied(resolved):
+                return WriteResult(error=f"Write denied: '{resolved}' is a protected system/credential file.")
+            with self._file_write_guard(resolved, "write_file"):
+                return self._write_file_windows(resolved, content)
 
-        # Expand ~ and other shell paths
         path = self._expand_path(path)
 
-        # Block writes to sensitive paths
         if _is_write_denied(path):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
-        # Create parent directories
-        parent = os.path.dirname(path)
-        dirs_created = False
-        
-        if parent:
-            mkdir_cmd = f"mkdir -p {self._escape_shell_arg(parent)}"
-            mkdir_result = self._exec(mkdir_cmd)
-            if mkdir_result.exit_code == 0:
-                dirs_created = True
-        
-        # Write via stdin pipe — content bypasses shell arg parsing entirely,
-        # so there's no ARG_MAX limit regardless of file size.
-        write_cmd = f"cat > {self._escape_shell_arg(path)}"
-        write_result = self._exec(write_cmd, stdin_data=content)
-        
-        if write_result.exit_code != 0:
-            return WriteResult(error=f"Failed to write file: {write_result.stdout}")
-        
-        # Get bytes written (wc -c is POSIX, works on Linux + macOS)
-        stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
-        
-        try:
-            bytes_written = int(stat_result.stdout.strip())
-        except ValueError:
-            bytes_written = len(content.encode('utf-8'))
-        
-        return WriteResult(
-            bytes_written=bytes_written,
-            dirs_created=dirs_created
-        )
+        with self._file_write_guard(path, "write_file"):
+            parent = os.path.dirname(path)
+            dirs_created = False
+
+            if parent:
+                mkdir_cmd = f"mkdir -p {self._escape_shell_arg(parent)}"
+                mkdir_result = self._exec(mkdir_cmd)
+                if mkdir_result.exit_code == 0:
+                    dirs_created = True
+
+            write_cmd = f"cat > {self._escape_shell_arg(path)}"
+            write_result = self._exec(write_cmd, stdin_data=content)
+
+            if write_result.exit_code != 0:
+                return WriteResult(error=f"Failed to write file: {write_result.stdout}")
+
+            stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
+            stat_result = self._exec(stat_cmd)
+
+            try:
+                bytes_written = int(stat_result.stdout.strip())
+            except ValueError:
+                bytes_written = len(content.encode('utf-8'))
+
+            return WriteResult(
+                bytes_written=bytes_written,
+                dirs_created=dirs_created
+            )
 
     def _write_file_windows(self, path: str, content: str) -> WriteResult:
         """Windows-native file write path for local backend."""
@@ -959,29 +1051,34 @@ class ShellFileOperations(FileOperations):
         makes targeted patch matching ambiguous.
         """
         if self._is_windows_local_backend():
-            return self._append_file_windows(path, content)
+            resolved = self._resolve_windows_path(path)
+            if _is_write_denied(resolved):
+                return WriteResult(error=f"Write denied: '{resolved}' is a protected system/credential file.")
+            with self._file_write_guard(resolved, "append_file"):
+                return self._append_file_windows(resolved, content)
 
         path = self._expand_path(path)
 
         if _is_write_denied(path):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
-        parent = os.path.dirname(path)
-        dirs_created = False
-        if parent:
-            mkdir_cmd = f"mkdir -p {self._escape_shell_arg(parent)}"
-            mkdir_result = self._exec(mkdir_cmd)
-            if mkdir_result.exit_code == 0:
-                dirs_created = True
+        with self._file_write_guard(path, "append_file"):
+            parent = os.path.dirname(path)
+            dirs_created = False
+            if parent:
+                mkdir_cmd = f"mkdir -p {self._escape_shell_arg(parent)}"
+                mkdir_result = self._exec(mkdir_cmd)
+                if mkdir_result.exit_code == 0:
+                    dirs_created = True
 
-        append_cmd = f"cat >> {self._escape_shell_arg(path)}"
-        append_result = self._exec(append_cmd, stdin_data=content)
+            append_cmd = f"cat >> {self._escape_shell_arg(path)}"
+            append_result = self._exec(append_cmd, stdin_data=content)
 
-        if append_result.exit_code != 0:
-            return WriteResult(error=f"Failed to append file: {append_result.stdout}")
+            if append_result.exit_code != 0:
+                return WriteResult(error=f"Failed to append file: {append_result.stdout}")
 
-        bytes_written = len(content.encode("utf-8"))
-        return WriteResult(bytes_written=bytes_written, dirs_created=dirs_created)
+            bytes_written = len(content.encode("utf-8"))
+            return WriteResult(bytes_written=bytes_written, dirs_created=dirs_created)
 
     def _append_file_windows(self, path: str, content: str) -> WriteResult:
         """Windows-native file append path for local backend."""
@@ -1026,56 +1123,58 @@ class ShellFileOperations(FileOperations):
         else:
             path = self._expand_path(path)
 
-        # Block writes to sensitive paths
         if _is_write_denied(path):
             return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
-        # Read current content
-        if os.name == "nt":
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-            except Exception:
-                return PatchResult(error=f"Failed to read file: {path}")
-        else:
-            read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-            read_result = self._exec(read_cmd)
-            
-            if read_result.exit_code != 0:
-                return PatchResult(error=f"Failed to read file: {path}")
-            
-            content = read_result.stdout
-        
-        # Import and use fuzzy matching
-        from tools.fuzzy_match import fuzzy_find_and_replace
-        
-        new_content, match_count, error = fuzzy_find_and_replace(
-            content, old_string, new_string, replace_all
-        )
-        
-        if error:
-            return PatchResult(error=error)
-        
-        if match_count == 0:
-            return PatchResult(error=f"Could not find match for old_string in {path}")
-        
-        # Write back
-        write_result = self.write_file(path, new_content)
-        if write_result.error:
-            return PatchResult(error=f"Failed to write changes: {write_result.error}")
-        
-        # Generate diff
-        diff = self._unified_diff(content, new_content, path)
-        
-        # Auto-lint
-        lint_result = self._check_lint(path)
-        
-        return PatchResult(
-            success=True,
-            diff=diff,
-            files_modified=[path],
-            lint=lint_result.to_dict() if lint_result else None
-        )
+        with self._file_write_guard(path, "patch_replace"):
+            if os.name == "nt":
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except Exception:
+                    return PatchResult(error=f"Failed to read file: {path}")
+            else:
+                read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+                read_result = self._exec(read_cmd)
+
+                if read_result.exit_code != 0:
+                    return PatchResult(error=f"Failed to read file: {path}")
+
+                content = read_result.stdout
+
+            from tools.fuzzy_match import fuzzy_find_and_replace
+
+            new_content, match_count, error = fuzzy_find_and_replace(
+                content, old_string, new_string, replace_all
+            )
+
+            if error:
+                if error == "old_string and new_string are identical":
+                    return PatchResult(
+                        success=True,
+                        status="identical",
+                        details="No changes needed; requested replacement already matches the file.",
+                    )
+                return PatchResult(error=error)
+
+            if match_count == 0:
+                return PatchResult(error=f"Could not find match for old_string in {path}")
+
+            write_result = self.write_file(path, new_content)
+            if write_result.error:
+                return PatchResult(error=f"Failed to write changes: {write_result.error}")
+
+            diff = self._unified_diff(content, new_content, path)
+            lint_result = self._check_lint(path)
+
+            return PatchResult(
+                success=True,
+                status="applied",
+                details=f"Replaced {match_count} match{'es' if match_count != 1 else ''} in {path}.",
+                diff=diff,
+                files_modified=[path],
+                lint=lint_result.to_dict() if lint_result else None
+            )
     
     def patch_v4a(self, patch_content: str) -> PatchResult:
         """
@@ -1102,9 +1201,18 @@ class ShellFileOperations(FileOperations):
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
             return PatchResult(error=f"Failed to parse patch: {parse_error}")
-        
-        # Apply operations
-        result = apply_v4a_operations(operations, self)
+
+        lock_paths: List[str] = []
+        for op in operations:
+            if str(op.file_path or "").strip():
+                lock_paths.append(op.file_path)
+            if str(op.new_path or "").strip():
+                lock_paths.append(op.new_path)
+
+        with self._multi_file_write_guard(lock_paths, "patch_v4a"):
+            result = apply_v4a_operations(operations, self)
+        if result.success and not result.status:
+            result.status = "applied"
         return result
     
     def _check_lint(self, path: str) -> LintResult:

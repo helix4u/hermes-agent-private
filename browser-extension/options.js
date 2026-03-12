@@ -586,7 +586,7 @@ function collectQuickPromptPayload() {
 }
 
 function buildSettingsPayload() {
-  const { prompts, skippedCount } = collectQuickPromptPayload();
+  const { prompts, skippedCount: skippedPromptCount } = collectQuickPromptPayload();
   const normalizedCustomThemes = window.HermesTheme?.normalizeCustomThemes?.(customThemeDrafts) ||
     customThemeDrafts.map((theme, index) => createCustomThemeDraft(theme, index));
   const themeSettings = window.HermesTheme?.normalizeThemeSettings({
@@ -599,7 +599,7 @@ function buildSettingsPayload() {
     customThemes: normalizedCustomThemes
   };
   return {
-    skippedCount,
+    skippedPromptCount,
     settings: {
       bridgeUrl: bridgeUrlInput.value.trim(),
       bridgeToken: bridgeTokenInput.value.trim(),
@@ -617,11 +617,22 @@ function buildSettingsPayload() {
   };
 }
 
+async function saveSidecarToolVisibility() {
+  await sendRuntimeMessage({
+    type: "hermes:save-settings",
+    settings: {
+      showQuickPrompts: showQuickPrompts.checked,
+      showChallengeMode: showChallengeMode.checked
+    }
+  });
+  setStatus("Sidecar tool visibility saved.");
+}
+
 async function saveSettings({
   checkBridgeAfterSave = true,
   savedPrefix = "Settings saved."
 } = {}) {
-  const { settings, skippedCount } = buildSettingsPayload();
+  const { settings, skippedPromptCount } = buildSettingsPayload();
   await sendRuntimeMessage({
     type: "hermes:save-settings",
     settings
@@ -629,9 +640,13 @@ async function saveSettings({
 
   await loadSettings();
 
-  const skippedMessage = skippedCount
-    ? ` Skipped ${skippedCount} incomplete quick prompt${skippedCount === 1 ? "" : "s"}.`
-    : "";
+  const skippedMessages = [];
+  if (skippedPromptCount) {
+    skippedMessages.push(
+      `Skipped ${skippedPromptCount} incomplete quick prompt${skippedPromptCount === 1 ? "" : "s"}.`
+    );
+  }
+  const skippedMessage = skippedMessages.length ? ` ${skippedMessages.join(" ")}` : "";
 
   if (!checkBridgeAfterSave) {
     setStatus(`${savedPrefix}${skippedMessage}`);
@@ -682,17 +697,11 @@ themeSelect.addEventListener("change", () => {
 });
 
 showQuickPrompts.addEventListener("change", () => {
-  saveSettings({
-    checkBridgeAfterSave: false,
-    savedPrefix: "Sidecar tool visibility saved."
-  }).catch((error) => setStatus(error.message || String(error)));
+  saveSidecarToolVisibility().catch((error) => setStatus(error.message || String(error)));
 });
 
 showChallengeMode.addEventListener("change", () => {
-  saveSettings({
-    checkBridgeAfterSave: false,
-    savedPrefix: "Sidecar tool visibility saved."
-  }).catch((error) => setStatus(error.message || String(error)));
+  saveSidecarToolVisibility().catch((error) => setStatus(error.message || String(error)));
 });
 
 document.getElementById("save-settings-button").addEventListener("click", () => {

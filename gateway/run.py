@@ -33,7 +33,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Callable
+from typing import Dict, Optional, Any, List, Callable, Tuple
+from urllib.parse import quote
 from urllib.request import urlopen
 
 # Add parent directory to path
@@ -167,8 +168,14 @@ from gateway.session import (
     build_session_key,
 )
 from gateway.delivery import DeliveryRouter, DeliveryTarget
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    cache_image_from_bytes,
+)
 from gateway.browser_bridge import (
+    BrowserBridgeConfig,
     BrowserBridgeServer,
     build_bridge_chat_id,
     build_browser_chat_message,
@@ -2019,6 +2026,326 @@ class GatewayRunner:
         return ""
 
     @staticmethod
+    def _guess_browser_bridge_image_extension(mime_type: str = "", filename: str = "") -> str:
+        suffix = Path(str(filename or "").strip()).suffix.lower()
+        if suffix == ".jpe":
+            suffix = ".jpg"
+        if suffix:
+            return suffix
+
+        normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+        guessed = mimetypes.guess_extension(normalized_mime) or ""
+        if guessed == ".jpe":
+            guessed = ".jpg"
+        if guessed:
+            return guessed.lower()
+        if normalized_mime == "image/png":
+            return ".png"
+        return ".jpg"
+
+    @staticmethod
+    def _looks_like_browser_bridge_image(
+        value: str = "",
+        *,
+        mime_type: str = "",
+        type_hint: str = "",
+        filename: str = "",
+    ) -> bool:
+        normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+        if normalized_mime.startswith("image/"):
+            return True
+
+        normalized_type = str(type_hint or "").strip().lower()
+        if normalized_type == "image" or normalized_type.startswith("image/"):
+            return True
+
+        candidates = [str(value or "").strip(), str(filename or "").strip()]
+        known_image_exts = {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
+            ".svg",
+            ".avif",
+        }
+        for candidate in candidates:
+            if not candidate:
+                continue
+            lowered = candidate.lower()
+            if lowered.startswith("data:image/"):
+                return True
+            guessed_mime = mimetypes.guess_type(candidate)[0] or ""
+            if guessed_mime.startswith("image/"):
+                return True
+            if Path(candidate).suffix.lower() in known_image_exts:
+                return True
+        return False
+
+    @staticmethod
+    def _decode_browser_bridge_base64(data: str) -> bytes:
+        value = re.sub(r"\s+", "", str(data or "").strip())
+        if not value:
+            raise ValueError("Attachment data is empty.")
+
+        if len(value) % 4:
+            value += "=" * (4 - (len(value) % 4))
+
+        try:
+            decoded = base64.b64decode(value, validate=False)
+        except Exception:
+            try:
+                decoded = base64.urlsafe_b64decode(value)
+            except Exception as exc:
+                raise ValueError("Attachment data is not valid base64.") from exc
+
+        if not decoded:
+            raise ValueError("Attachment data decoded to an empty payload.")
+        return decoded
+
+    def _cache_browser_bridge_image_attachment(
+        self,
+        attachment: Any,
+    ) -> Optional[Tuple[str, str]]:
+        mime_type = ""
+        filename = ""
+        type_hint = ""
+        payload = ""
+
+        if isinstance(attachment, str):
+            payload = attachment.strip()
+        elif isinstance(attachment, dict):
+            mime_type = str(
+                attachment.get("mimeType")
+                or attachment.get("mime_type")
+                or attachment.get("contentType")
+                or attachment.get("content_type")
+                or ""
+            ).strip()
+            filename = str(
+                attachment.get("filename")
+                or attachment.get("fileName")
+                or attachment.get("name")
+                or ""
+            ).strip()
+            type_hint = str(attachment.get("type") or attachment.get("kind") or "").strip()
+            for key in (
+                "dataUrl",
+                "data_url",
+                "imageDataUrl",
+                "image_data_url",
+                "data",
+                "base64",
+                "imageData",
+                "image_data",
+                "content",
+                "body",
+            ):
+                candidate = attachment.get(key)
+                if candidate is None:
+                    continue
+                candidate_text = str(candidate).strip()
+                if candidate_text:
+                    payload = candidate_text
+                    break
+        else:
+            return None
+
+        if not payload:
+            return None
+        if not self._looks_like_browser_bridge_image(
+            payload,
+            mime_type=mime_type,
+            type_hint=type_hint,
+            filename=filename,
+        ):
+            return None
+
+        if payload.lower().startswith("data:"):
+            match = re.match(
+                r"^data:(?P<mime>[^;,]+)?;base64,(?P<data>.+)$",
+                payload,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not match:
+                raise ValueError("Unsupported attachment data URL.")
+            mime_type = mime_type or str(match.group("mime") or "").strip()
+            payload = str(match.group("data") or "")
+
+        if not mime_type and filename:
+            mime_type = mimetypes.guess_type(filename)[0] or ""
+        if not mime_type and type_hint.startswith("image/"):
+            mime_type = type_hint
+        if not mime_type and str(type_hint).strip().lower() == "image":
+            mime_type = "image/png"
+        mime_type = str(mime_type or "image/png").split(";", 1)[0].strip().lower()
+        if not mime_type.startswith("image/"):
+            return None
+
+        image_bytes = self._decode_browser_bridge_base64(payload)
+        ext = self._guess_browser_bridge_image_extension(mime_type, filename)
+        cached_path = cache_image_from_bytes(image_bytes, ext=ext)
+        return cached_path, mime_type
+
+    def _extract_browser_bridge_image_attachments(
+        self,
+        payload: Dict[str, Any],
+    ) -> Tuple[List[str], List[str]]:
+        raw_attachments = payload.get("attachments") or payload.get("attachment") or []
+        if isinstance(raw_attachments, (dict, str)):
+            attachments = [raw_attachments]
+        elif isinstance(raw_attachments, list):
+            attachments = raw_attachments
+        else:
+            logger.warning(
+                "Ignoring unsupported browser bridge attachments payload type: %s",
+                type(raw_attachments).__name__,
+            )
+            return [], []
+
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        for index, attachment in enumerate(attachments, start=1):
+            try:
+                cached = self._cache_browser_bridge_image_attachment(attachment)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to decode browser bridge image attachment %s: %s",
+                    index,
+                    exc,
+                )
+                continue
+            if not cached:
+                continue
+            cached_path, mime_type = cached
+            media_urls.append(cached_path)
+            media_types.append(mime_type or mimetypes.guess_type(cached_path)[0] or "image/*")
+
+        return media_urls, media_types
+
+    def _get_browser_bridge_runtime_config(self) -> Optional[BrowserBridgeConfig]:
+        bridge = self._browser_bridge
+        if bridge and getattr(bridge, "config", None):
+            return bridge.config
+        try:
+            return BrowserBridgeConfig.from_env()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_browser_bridge_public_host(host: str) -> str:
+        value = str(host or "").strip() or "127.0.0.1"
+        if value in {"0.0.0.0", "::"}:
+            value = "127.0.0.1"
+        if ":" in value and not value.startswith("["):
+            return f"[{value}]"
+        return value
+
+    def _build_browser_bridge_media_url(self, media_path: str) -> str:
+        config = self._get_browser_bridge_runtime_config()
+        if not config or not str(config.token or "").strip():
+            return ""
+
+        try:
+            resolved_path = str(Path(media_path).expanduser().resolve())
+        except Exception:
+            resolved_path = str(media_path or "").strip()
+        if not resolved_path:
+            return ""
+
+        host = self._normalize_browser_bridge_public_host(config.host)
+        encoded_path = quote(resolved_path, safe="")
+        encoded_token = quote(str(config.token).strip(), safe="")
+        return f"http://{host}:{int(config.port)}/media?path={encoded_path}&token={encoded_token}"
+
+    @classmethod
+    def _is_browser_bridge_local_image_path(cls, media_path: str) -> bool:
+        raw_path = str(media_path or "").strip()
+        if not raw_path:
+            return False
+        try:
+            path = Path(raw_path).expanduser().resolve()
+        except Exception:
+            return False
+        if not path.exists() or not path.is_file():
+            return False
+        mime_type = mimetypes.guess_type(str(path))[0] or ""
+        if mime_type.startswith("image/"):
+            return True
+        return cls._looks_like_browser_bridge_image(str(path))
+
+    def _extract_browser_bridge_assistant_images(
+        self,
+        content: str,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        raw_content = str(content or "")
+        images: List[Dict[str, Any]] = []
+        cleaned = raw_content
+        seen: set[Tuple[str, str]] = set()
+
+        remote_images, cleaned = BasePlatformAdapter.extract_images(cleaned)
+        for url, alt_text in remote_images:
+            key = ("remote", url)
+            if key in seen:
+                continue
+            seen.add(key)
+            images.append(
+                {
+                    "source": "remote",
+                    "url": url,
+                    "media_url": url,
+                    "alt_text": alt_text,
+                    "mime_type": mimetypes.guess_type(url)[0] or "",
+                }
+            )
+
+        media_pattern = r"MEDIA:(\S+)"
+        extracted_local_paths: set[str] = set()
+        for match in re.finditer(media_pattern, cleaned):
+            raw_path = match.group(1).strip().rstrip('\",}')
+            if not self._is_browser_bridge_local_image_path(raw_path):
+                continue
+            try:
+                resolved_path = str(Path(raw_path).expanduser().resolve())
+            except Exception:
+                resolved_path = raw_path
+            media_url = self._build_browser_bridge_media_url(resolved_path)
+            if not media_url:
+                continue
+            key = ("local", resolved_path)
+            if key not in seen:
+                seen.add(key)
+                images.append(
+                    {
+                        "source": "local",
+                        "url": media_url,
+                        "media_url": media_url,
+                        "alt_text": "",
+                        "mime_type": mimetypes.guess_type(resolved_path)[0] or "",
+                        "local_path": resolved_path,
+                        "file_name": Path(resolved_path).name,
+                    }
+                )
+            extracted_local_paths.add(resolved_path)
+
+        if extracted_local_paths:
+            def _remove_extracted_media(match: re.Match[str]) -> str:
+                raw_path = match.group(1).strip().rstrip('\",}')
+                try:
+                    resolved_path = str(Path(raw_path).expanduser().resolve())
+                except Exception:
+                    resolved_path = raw_path
+                return "" if resolved_path in extracted_local_paths else match.group(0)
+
+            cleaned = re.sub(media_pattern, _remove_extracted_media, cleaned)
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+        return images, cleaned
+
+    @staticmethod
     def _extract_youtube_video_id(url_or_id: str) -> str:
         value = str(url_or_id or "").strip()
         patterns = [
@@ -2127,7 +2454,11 @@ class GatewayRunner:
             if role not in {"user", "assistant"}:
                 continue
             content = self._extract_browser_bridge_content(message.get("content"))
-            if not content:
+            images: List[Dict[str, Any]] = []
+            cleaned_content = content
+            if role == "assistant" and content:
+                images, cleaned_content = self._extract_browser_bridge_assistant_images(content)
+            if not content and not images:
                 continue
 
             entry: Dict[str, Any] = {
@@ -2153,7 +2484,12 @@ class GatewayRunner:
                     }
                 )
             else:
-                entry["display_content"] = content
+                display_content = cleaned_content
+                if images and not str(display_content or "").strip():
+                    display_content = " "
+                entry["display_content"] = display_content
+                if images:
+                    entry["images"] = images
 
             serialized.append(entry)
 
@@ -2536,10 +2872,26 @@ class GatewayRunner:
         if isinstance(page_payload, dict) and page_payload:
             normalized_page_payload = normalize_payload(page_payload)
 
-        message_text = build_browser_chat_message(
-            payload.get("message") or payload.get("text") or "",
-            normalized_page_payload,
-        )
+        attachment_media_urls, attachment_media_types = self._extract_browser_bridge_image_attachments(payload)
+        raw_message = str(payload.get("message") or payload.get("text") or "")
+        stripped_message = raw_message.strip()
+        if stripped_message.startswith("/"):
+            # Browser-side slash commands should stay as commands even if the
+            # user left "Use current page" enabled. Wrapping them in the
+            # browser context envelope hides the leading slash from command
+            # detection, which makes command buttons like `/cron list` look
+            # like they silently disappear.
+            message_text = stripped_message
+            normalized_page_payload = None
+        elif normalized_page_payload or stripped_message:
+            message_text = build_browser_chat_message(
+                raw_message,
+                normalized_page_payload,
+            )
+        elif attachment_media_urls:
+            message_text = ""
+        else:
+            raise ValueError("Chat messages need text, page context, or image attachments.")
 
         source = self._resolve_browser_bridge_source(
             browser_label=browser_label,
@@ -2550,8 +2902,10 @@ class GatewayRunner:
         event = MessageEvent(
             text=message_text,
             source=source,
-            message_type=MessageType.TEXT,
+            message_type=MessageType.PHOTO if attachment_media_urls else MessageType.TEXT,
             raw_message=payload,
+            media_urls=attachment_media_urls,
+            media_types=attachment_media_types,
         )
         transcript = (normalized_page_payload or {}).get("transcript") or {}
 
@@ -3998,6 +4352,7 @@ class GatewayRunner:
         
         # Try to load platform_toolsets from config
         platform_toolsets_config = {}
+        browser_sidecar_cfg = {}
         try:
             config_path = _hermes_home / 'config.yaml'
             if config_path.exists():
@@ -4005,6 +4360,7 @@ class GatewayRunner:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     user_config = yaml.safe_load(f) or {}
                 platform_toolsets_config = user_config.get("platform_toolsets", {})
+                browser_sidecar_cfg = user_config.get("browser_sidecar", {})
         except Exception as e:
             logger.debug("Could not load platform_toolsets config: %s", e)
         
@@ -4025,12 +4381,6 @@ class GatewayRunner:
             default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
             enabled_toolsets = [default_toolset]
 
-        # Browser sidecar turns should use injected page context directly.
-        # Disable Browserbase automation so we don't navigate/snapshot a
-        # separate remote browser session that is not logged in as the user.
-        if self._is_browser_bridge_source(source):
-            enabled_toolsets = ["hermes-sidecar"]
-        
         # Tool progress and log configuration
         _progress_cfg = {}
         try:
@@ -4053,6 +4403,52 @@ class GatewayRunner:
                 if v in {"0", "false", "no", "off"}:
                     return False
             return default
+
+        browser_sidecar_max_iterations = None
+        browser_sidecar_max_tool_calls = None
+        if self._is_browser_bridge_source(source):
+            configured_sidecar_toolsets = browser_sidecar_cfg.get("toolsets")
+            normalized_sidecar_toolsets = []
+            if isinstance(configured_sidecar_toolsets, list):
+                normalized_sidecar_toolsets = [
+                    str(toolset).strip()
+                    for toolset in configured_sidecar_toolsets
+                    if str(toolset).strip()
+                ]
+
+            if normalized_sidecar_toolsets:
+                enabled_toolsets = normalized_sidecar_toolsets
+            else:
+                allow_sidecar_delegation = _as_bool(
+                    browser_sidecar_cfg.get("allow_delegation"),
+                    default=False,
+                )
+                enabled_toolsets = [
+                    "hermes-sidecar-delegating" if allow_sidecar_delegation else "hermes-sidecar"
+                ]
+
+            raw_sidecar_max_turns = browser_sidecar_cfg.get("max_turns")
+            try:
+                parsed_sidecar_max_turns = int(raw_sidecar_max_turns)
+            except (TypeError, ValueError):
+                parsed_sidecar_max_turns = 0
+            if parsed_sidecar_max_turns > 0:
+                browser_sidecar_max_iterations = parsed_sidecar_max_turns
+
+            raw_sidecar_max_tool_calls = browser_sidecar_cfg.get("max_tool_calls")
+            try:
+                parsed_sidecar_max_tool_calls = int(raw_sidecar_max_tool_calls)
+            except (TypeError, ValueError):
+                parsed_sidecar_max_tool_calls = 0
+            if parsed_sidecar_max_tool_calls > 0:
+                browser_sidecar_max_tool_calls = parsed_sidecar_max_tool_calls
+
+            logger.info(
+                "Browser sidecar policy active: toolsets=%s max_turns=%s max_tool_calls=%s",
+                enabled_toolsets,
+                browser_sidecar_max_iterations if browser_sidecar_max_iterations is not None else "default",
+                browser_sidecar_max_tool_calls if browser_sidecar_max_tool_calls is not None else "default",
+            )
 
         progress_mode = (
             _progress_cfg.get("tool_progress")
@@ -4253,11 +4649,24 @@ class GatewayRunner:
 
             if isinstance(parsed, dict):
                 parts: list[str] = []
+                status = str(parsed.get("status") or "").strip()
+                details = str(parsed.get("details") or "").strip()
+                if status:
+                    parts.append(f"status={status}")
+                if details:
+                    parts.append(details)
                 if "exit_code" in parsed:
                     parts.append(f"exit={parsed.get('exit_code')}")
                 err = parsed.get("error")
                 if err:
                     parts.append(f"error={err}")
+                results = parsed.get("results")
+                if isinstance(results, list):
+                    completed = sum(1 for item in results if isinstance(item, dict) and item.get("status") == "completed")
+                    partial = sum(1 for item in results if isinstance(item, dict) and item.get("status") == "partial")
+                    failed = sum(1 for item in results if isinstance(item, dict) and item.get("status") in {"failed", "error"})
+                    interrupted = sum(1 for item in results if isinstance(item, dict) and item.get("status") == "interrupted")
+                    parts.append(f"delegated ok={completed} partial={partial} fail={failed} int={interrupted}")
                 stderr = parsed.get("stderr")
                 if not err and is_error and isinstance(stderr, str) and stderr.strip():
                     parts.append(f"stderr={stderr.strip()}")
@@ -4278,6 +4687,7 @@ class GatewayRunner:
                 completed_tool = str(payload.get("tool") or preview or "tool")
                 duration = payload.get("duration_seconds")
                 is_error = bool(payload.get("is_error"))
+                status_suffix = str(payload.get("status_suffix") or "").strip()
                 result_text = str(payload.get("result") or "").strip()
                 status_emoji = "❌" if is_error else "✅"
                 if isinstance(duration, (int, float)):
@@ -4286,11 +4696,15 @@ class GatewayRunner:
                     duration_text = ""
                 summary_suffix = _summarize_result_for_status(result_text, is_error)
                 done_msg = f"{status_emoji} {completed_tool} finished{duration_text}"
+                if status_suffix:
+                    done_msg = f"{done_msg} {status_suffix}"
                 if summary_suffix:
                     done_msg = f"{done_msg} | {summary_suffix}"
                 _set_progress_state(phase="tool", detail=done_msg, tool_call=False)
 
                 detail_payload = f"{status_emoji} RESULT {completed_tool}{duration_text}"
+                if status_suffix:
+                    detail_payload = f"{detail_payload} {status_suffix}"
                 if result_text:
                     detail_payload = f"{detail_payload}\n{result_text}"
                 ts = datetime.now().strftime("%H:%M:%S")
@@ -4340,6 +4754,7 @@ class GatewayRunner:
                 "remove_cronjob": "⏰",
                 "execute_code": "🐍",
                 "delegate_task": "🔀",
+                "subagent_progress": "🔀",
                 "clarify": "❓",
                 "skill_manage": "📝",
                 "_thinking": "💡",
@@ -4577,6 +4992,8 @@ class GatewayRunner:
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "60"))
+            if browser_sidecar_max_iterations is not None:
+                max_iterations = browser_sidecar_max_iterations
             max_tokens_env = os.getenv("HERMES_MAX_TOKENS", "").strip()
             if max_tokens_env == "0":
                 max_tokens = None  # use model default
@@ -4645,6 +5062,7 @@ class GatewayRunner:
                 **runtime_kwargs,
                 max_iterations=max_iterations,
                 max_tokens=max_tokens,
+                max_tool_calls_per_run=browser_sidecar_max_tool_calls,
                 quiet_mode=True,
                 verbose_logging=False,
                 enabled_toolsets=enabled_toolsets,

@@ -346,6 +346,19 @@ platform_toolsets:
   whatsapp: [hermes-whatsapp]
   slack: [hermes-slack]
 
+# =============================================================================
+# Browser Sidecar
+# =============================================================================
+# The browser extension sidecar uses its own local bridge session and should be
+# more conservative than the CLI by default. Delegated subagents are disabled
+# unless you opt in here.
+#
+# browser_sidecar:
+#   toolsets: [hermes-sidecar]   # Optional explicit override
+#   allow_delegation: false      # Default false; set true to use delegate_task
+#   max_turns: 80                # Optional sidecar-specific iteration budget
+#   max_tool_calls: 320          # Optional sidecar-specific soft tool budget
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)
 #
@@ -536,6 +549,7 @@ code_execution:
 # Supports single tasks and batch mode (up to 3 parallel).
 delegation:
   max_iterations: 50                          # Max tool-calling turns per child (default: 50)
+  max_concurrent_children: 2                  # Parallel child agents at once (default: 2, max: 3)
   default_toolsets: ["terminal", "file", "web"]  # Default toolsets for subagents
 
 # =============================================================================

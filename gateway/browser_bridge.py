@@ -14,11 +14,13 @@ import logging
 import os
 import re
 import secrets
+import mimetypes
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import Any, Callable, Optional
+from urllib.parse import parse_qs, urlparse, unquote
 
 logger = logging.getLogger(__name__)
 
@@ -378,19 +380,75 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.rstrip("/") != "/health":
+        parsed = urlparse(self.path)
+        route = parsed.path.rstrip("/")
+        if route == "/health":
+            bridge = self.server.bridge
+            self._json_response(
+                200,
+                {
+                    "ok": True,
+                    "service": "hermes-browser-bridge",
+                    "running": bool(bridge and bridge.is_running),
+                    "port": bridge.config.port if bridge else None,
+                },
+            )
+            return
+
+        if route == "/media":
+            bridge = self.server.bridge
+            if not bridge:
+                self._json_response(503, {"ok": False, "error": "Bridge unavailable"})
+                return
+
+            query = parse_qs(parsed.query or "")
+            token = str((query.get("token") or [""])[0] or "").strip()
+            if not token or not secrets.compare_digest(token, bridge.config.token):
+                self._json_response(401, {"ok": False, "error": "Unauthorized"})
+                return
+
+            raw_path = str((query.get("path") or [""])[0] or "").strip()
+            if not raw_path:
+                self._json_response(400, {"ok": False, "error": "Missing media path"})
+                return
+
+            try:
+                media_path = Path(unquote(raw_path)).expanduser().resolve()
+            except Exception:
+                self._json_response(400, {"ok": False, "error": "Invalid media path"})
+                return
+
+            if not media_path.exists() or not media_path.is_file():
+                self._json_response(404, {"ok": False, "error": "Media not found"})
+                return
+
+            mime_type = mimetypes.guess_type(str(media_path))[0] or "application/octet-stream"
+            if not mime_type.startswith("image/"):
+                self._json_response(403, {"ok": False, "error": "Only image media is available through this route"})
+                return
+
+            try:
+                data = media_path.read_bytes()
+            except Exception as exc:
+                logger.exception("Failed to read browser bridge media %s", media_path)
+                self._json_response(500, {"ok": False, "error": str(exc)})
+                return
+
+            self.send_response(200)
+            self._write_cors_headers()
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "private, max-age=300")
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError) as e:
+                logger.debug("Browser bridge media client disconnected before response: %s", e)
+            return
+
+        if route != "/health":
             self._json_response(404, {"ok": False, "error": "Not found"})
             return
-        bridge = self.server.bridge
-        self._json_response(
-            200,
-            {
-                "ok": True,
-                "service": "hermes-browser-bridge",
-                "running": bool(bridge and bridge.is_running),
-                "port": bridge.config.port if bridge else None,
-            },
-        )
 
     def do_POST(self) -> None:  # noqa: N802
         route = self.path.rstrip("/")

@@ -82,6 +82,25 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
             msg = msg[:17] + "..."
         return f"to {target}: \"{msg}\""
 
+    if tool_name == "delegate_task":
+        tasks = args.get("tasks")
+        if isinstance(tasks, list) and tasks:
+            goals = []
+            for task in tasks[:3]:
+                if not isinstance(task, dict):
+                    continue
+                goal = str(task.get("goal", "")).strip()
+                if goal:
+                    goals.append(goal[:18] + ("..." if len(goal) > 18 else ""))
+            if goals:
+                extra = f" +{len(tasks) - len(goals)}" if len(tasks) > len(goals) else ""
+                return f"{len(tasks)} task(s): " + "; ".join(goals) + extra
+            return f"{len(tasks)} parallel task(s)"
+        goal = str(args.get("goal", "")).strip()
+        if goal:
+            return goal[:max_len] + ("..." if len(goal) > max_len else "")
+        return None
+
     if tool_name.startswith("rl_"):
         rl_previews = {
             "rl_list_environments": "listing envs",
@@ -287,8 +306,8 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     """Inspect a tool result string for signs of failure.
 
     Returns ``(is_failure, suffix)`` where *suffix* is an informational tag
-    like ``" [exit 1]"`` for terminal failures, or ``" [error]"`` for generic
-    failures.  On success, returns ``(False, "")``.
+    like ``" [exit 1]"`` for terminal failures, ``" [identical]"`` for no-op
+    patches, or ``" [error]"`` for generic failures.
     """
     if result is None:
         return False, ""
@@ -309,6 +328,40 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
             data = json.loads(result)
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+    if tool_name == "patch":
+        try:
+            data = json.loads(result)
+            if isinstance(data, dict):
+                status = str(data.get("status") or "").strip().lower()
+                if status == "identical":
+                    return False, " [identical]"
+                if status:
+                    return False, f" [{status}]"
+                if data.get("success") is False and data.get("error"):
+                    return True, " [error]"
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+    if tool_name == "delegate_task":
+        try:
+            data = json.loads(result)
+            if isinstance(data, dict) and isinstance(data.get("results"), list):
+                results = data["results"]
+                completed = sum(1 for item in results if isinstance(item, dict) and item.get("status") == "completed")
+                partial = sum(1 for item in results if isinstance(item, dict) and item.get("status") == "partial")
+                failed = sum(1 for item in results if isinstance(item, dict) and item.get("status") in {"failed", "error"})
+                interrupted = sum(1 for item in results if isinstance(item, dict) and item.get("status") == "interrupted")
+                if failed:
+                    return True, f" [ok={completed} partial={partial} fail={failed} int={interrupted}]"
+                if partial:
+                    return False, f" [ok={completed} partial={partial} int={interrupted}]"
+                if interrupted:
+                    return False, f" [ok={completed} int={interrupted}]"
+                if results:
+                    return False, f" [ok={completed}]"
         except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
@@ -342,10 +395,10 @@ def get_cute_tool_message(
         return ("..." + p[-(n-3):]) if len(p) > n else p
 
     def _wrap(line: str) -> str:
-        """Append failure suffix when the tool failed."""
-        if not is_failure:
-            return line
-        return f"{line}{failure_suffix}"
+        """Append status suffixes for both failures and notable no-op outcomes."""
+        if failure_suffix:
+            return f"{line}{failure_suffix}"
+        return line
 
     if tool_name == "web_search":
         return _wrap(f"┊ 🔍 search    {_trunc(args.get('query', ''), 42)}  {dur}")

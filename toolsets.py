@@ -74,7 +74,14 @@ _HERMES_BROWSER_TOOLS = [
 ]
 
 _HERMES_SIDECAR_TOOLS = [
-    tool for tool in _HERMES_CORE_TOOLS if tool not in _HERMES_BROWSER_TOOLS
+    tool
+    for tool in _HERMES_CORE_TOOLS
+    if tool not in _HERMES_BROWSER_TOOLS and tool != "delegate_task"
+]
+
+_HERMES_SIDECAR_DELEGATING_TOOLS = [
+    *_HERMES_SIDECAR_TOOLS,
+    "delegate_task",
 ]
 
 
@@ -241,8 +248,14 @@ TOOLSETS = {
     },
 
     "hermes-sidecar": {
-        "description": "Browser sidecar toolset - Hermes core tools without Browserbase automation",
+        "description": "Browser sidecar toolset - Hermes core tools without Browserbase automation or delegated subagents",
         "tools": _HERMES_SIDECAR_TOOLS,
+        "includes": []
+    },
+
+    "hermes-sidecar-delegating": {
+        "description": "Browser sidecar toolset with delegated subagents enabled",
+        "tools": _HERMES_SIDECAR_DELEGATING_TOOLS,
         "includes": []
     },
     

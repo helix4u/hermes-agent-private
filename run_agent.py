@@ -170,6 +170,7 @@ class AIAgent:
         clarify_callback: callable = None,
         step_callback: callable = None,
         max_tokens: int = None,
+        max_tool_calls_per_run: int = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
@@ -206,6 +207,7 @@ class AIAgent:
             clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
                 Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
+            max_tool_calls_per_run (int): Soft tool-call budget used for guidance prompts (optional).
             reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
                 If None, defaults to {"enabled": True, "effort": "xhigh"} for OpenRouter. Set to disable/customize reasoning.
             prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
@@ -256,6 +258,7 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
+        self.max_tool_calls_per_run = max_tool_calls_per_run if isinstance(max_tool_calls_per_run, int) and max_tool_calls_per_run > 0 else None
         self._last_reported_tool = None  # Track for "new tool" mode
         
         # Interrupt mechanism for breaking out of tool loops
@@ -773,7 +776,19 @@ class AIAgent:
         return None
     
     def _cleanup_task_resources(self, task_id: str) -> None:
-        """Clean up VM and browser resources for a given task."""
+        """Clean up per-task runtime resources for a given task."""
+        try:
+            from tools.terminal_tool import clear_task_env_overrides
+            clear_task_env_overrides(task_id)
+        except Exception as e:
+            if self.verbose_logging:
+                logging.warning(f"Failed to clear terminal overrides for task {task_id}: {e}")
+        try:
+            from tools.process_registry import process_registry
+            process_registry.cleanup_expired()
+        except Exception as e:
+            if self.verbose_logging:
+                logging.warning(f"Failed to prune process registry for task {task_id}: {e}")
         try:
             cleanup_vm(task_id)
         except Exception as e:
@@ -3094,9 +3109,28 @@ class AIAgent:
 
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
-            _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            _is_error_result, _status_suffix = _detect_tool_failure(function_name, function_result)
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+
+            if self.tool_progress_callback:
+                progress_result = function_result
+                if len(progress_result) > 4000:
+                    progress_result = progress_result[:4000] + "\n...[truncated for progress]"
+                try:
+                    self.tool_progress_callback(
+                        "_tool_result",
+                        function_name,
+                        {
+                            "tool": function_name,
+                            "duration_seconds": tool_duration,
+                            "is_error": _is_error_result,
+                            "status_suffix": _status_suffix.strip(),
+                            "result": progress_result,
+                        },
+                    )
+                except Exception:
+                    logger.debug("tool_progress_callback completion emit failed for %s", function_name, exc_info=True)
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
@@ -3275,15 +3309,17 @@ class AIAgent:
         if enabled not in {"1", "true", "yes", "on"}:
             return api_messages
 
-        max_tool_calls = int(
-            (
-                os.getenv("HERMES_MAX_TOOL_CALLS_PER_RUN")
-                or os.getenv("HERMES_MAX_TOOL_CALLS_PER_RESPONSE")
-                or "0"
-            ).strip() or "0"
-        )
-        if max_tool_calls <= 0:
-            max_tool_calls = max(self.max_iterations * 4, 8)
+        max_tool_calls = self.max_tool_calls_per_run
+        if max_tool_calls is None:
+            max_tool_calls = int(
+                (
+                    os.getenv("HERMES_MAX_TOOL_CALLS_PER_RUN")
+                    or os.getenv("HERMES_MAX_TOOL_CALLS_PER_RESPONSE")
+                    or "0"
+                ).strip() or "0"
+            )
+            if max_tool_calls <= 0:
+                max_tool_calls = max(self.max_iterations * 4, 8)
 
         used_tool_calls = int(getattr(self, "_tool_calls_executed_total", 0))
         remaining_tool_calls = max(max_tool_calls - used_tool_calls, 0)
@@ -4555,8 +4591,12 @@ class AIAgent:
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
                     break
         
+        iteration_limit_reached = False
         if api_call_count >= self.max_iterations and final_response is None:
+            iteration_limit_reached = True
             final_response = self._handle_max_iterations(messages, api_call_count)
+        elif api_call_count >= self.max_iterations:
+            iteration_limit_reached = True
         
         # Determine if conversation completed successfully
         completed = final_response is not None and api_call_count < self.max_iterations
@@ -4580,10 +4620,11 @@ class AIAgent:
             "messages": messages,
             "api_calls": api_call_count,
             "completed": completed,
-            "partial": False,  # True only when stopped due to invalid tool calls
+            "partial": iteration_limit_reached,
             "interrupted": interrupted,
             "tool_events": list(self._tool_events),
             "session_log_file": str(self.session_log_file),
+            "stopped_reason": "iteration_limit" if iteration_limit_reached else "",
         }
         
         # Include interrupt message if one triggered the interrupt
