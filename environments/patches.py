@@ -62,7 +62,7 @@ class _AsyncWorker:
         self._started.set()
         self._loop.run_forever()
 
-    def run_coroutine(self, coro, timeout=600):
+    def run_coroutine(self, coro, timeout=900):
         """
         Submit a coroutine to the background loop and block until it completes.
 

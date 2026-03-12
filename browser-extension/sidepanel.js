@@ -481,7 +481,9 @@ function getMessageImages(message) {
 function getAttachmentPreviewImages() {
   return pendingAttachments.map((attachment) => ({
     source: "local",
-    media_url: attachment.previewUrl,
+    // Use data_url so optimistic message previews survive composer cleanup.
+    // previewUrl values are object URLs revoked after successful send.
+    media_url: attachment.data_url || attachment.previewUrl,
     mime_type: attachment.mime_type,
     alt_text: attachment.name,
     local_path: ""
@@ -1687,6 +1689,12 @@ async function sendChatMessage(messageOverride = null, options = {}) {
     setStatus(response.result?.detail || "Hermes is already working on this sidecar session.", { openActivity: true });
     schedulePolling();
     return;
+  }
+
+  if (attachments.length) {
+    // Clear composer chips right after a successful send so users do not need
+    // to manually click "x" for images that were already queued to Hermes.
+    clearPendingAttachments();
   }
 
   clearPendingIfAcknowledged();
