@@ -16,6 +16,15 @@ function clamp(text, maxLength) {
   return text.slice(0, maxLength).trim();
 }
 
+function isExtensionContextInvalidated(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("extension context invalidated") ||
+    message.includes("context invalidated") ||
+    message.includes("message port closed before a response was received")
+  );
+}
+
 function getMetaValue(selectors) {
   for (const selector of selectors) {
     const element = document.querySelector(selector);
@@ -990,21 +999,28 @@ async function collectPageContext(includeTranscriptText, waitForHydration = fals
   };
 }
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type !== "hermes:collect-page-context") {
-    return false;
-  }
+try {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type !== "hermes:collect-page-context") {
+      return false;
+    }
 
-  collectPageContext(
-    Boolean(message.includeTranscriptText),
-    Boolean(message.waitForHydration)
-  )
-    .then((result) => sendResponse(result))
-    .catch((error) => {
-      sendResponse({
-        error: error instanceof Error ? error.message : String(error)
+    collectPageContext(
+      Boolean(message.includeTranscriptText),
+      Boolean(message.waitForHydration)
+    )
+      .then((result) => sendResponse(result))
+      .catch((error) => {
+        sendResponse({
+          error: error instanceof Error ? error.message : String(error)
+        });
       });
-    });
 
-  return true;
-});
+    return true;
+  });
+} catch (error) {
+  if (!isExtensionContextInvalidated(error)) {
+    throw error;
+  }
+  console.debug("Hermes extension: skipped content listener registration after reload.");
+}

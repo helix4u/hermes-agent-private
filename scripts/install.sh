@@ -6,7 +6,7 @@
 # Uses uv for fast Python provisioning and package management.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/helix4u/hermes-agent-private/main/scripts/install.sh | bash
 #
 # Or with options:
 #   curl -fsSL ... | bash -s -- --no-venv --skip-setup
@@ -26,8 +26,8 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
-REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+REPO_URL_SSH="git@github.com:helix4u/hermes-agent-private.git"
+REPO_URL_HTTPS="https://github.com/helix4u/hermes-agent-private.git"
 HERMES_HOME="$HOME/.hermes"
 INSTALL_DIR="${HERMES_INSTALL_DIR:-$HERMES_HOME/hermes-agent}"
 PYTHON_VERSION="3.11"
@@ -140,7 +140,7 @@ detect_os() {
             OS="windows"
             DISTRO="windows"
             log_error "Windows detected. Please use the PowerShell installer:"
-            log_info "  irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex"
+            log_info "  irm https://raw.githubusercontent.com/helix4u/hermes-agent-private/main/scripts/install.ps1 | iex"
             exit 1
             ;;
         *)
@@ -540,7 +540,7 @@ show_manual_install_hint() {
 is_hermes_origin_ssh() {
     local origin_url="$1"
     case "$origin_url" in
-        git@github.com:NousResearch/hermes-agent|git@github.com:NousResearch/hermes-agent.git|ssh://git@github.com/NousResearch/hermes-agent|ssh://git@github.com/NousResearch/hermes-agent.git)
+        git@github.com:helix4u/hermes-agent-private|git@github.com:helix4u/hermes-agent-private.git|ssh://git@github.com/helix4u/hermes-agent-private|ssh://git@github.com/helix4u/hermes-agent-private.git)
             return 0
             ;;
     esac
@@ -559,6 +559,11 @@ clone_repo() {
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
             origin_url="$(git remote get-url origin 2>/dev/null || true)"
+            if [ -n "$origin_url" ] && [ "$origin_url" != "$REPO_URL_HTTPS" ] && ! is_hermes_origin_ssh "$origin_url"; then
+                log_info "Switching origin remote to private fork..."
+                git remote set-url origin "$REPO_URL_HTTPS"
+                origin_url="$REPO_URL_HTTPS"
+            fi
             if ! git fetch origin; then
                 if is_hermes_origin_ssh "$origin_url"; then
                     log_warn "SSH fetch failed, switching origin remote to HTTPS..."

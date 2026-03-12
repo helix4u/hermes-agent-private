@@ -786,6 +786,70 @@ def cmd_uninstall(args):
     run_uninstall(args)
 
 
+UPDATE_REPO_SLUG = "helix4u/hermes-agent-private"
+UPDATE_REPO_HTTPS = f"https://github.com/{UPDATE_REPO_SLUG}.git"
+UPDATE_REPO_ZIP = f"https://github.com/{UPDATE_REPO_SLUG}/archive/refs/heads"
+UPDATE_INSTALL_SH = f"https://raw.githubusercontent.com/{UPDATE_REPO_SLUG}/main/scripts/install.sh"
+UPDATE_REMOTE_NAME = "private"
+
+
+def _remote_points_to_update_repo(url: str) -> bool:
+    normalized = (url or "").strip().lower()
+    return "helix4u/hermes-agent-private" in normalized
+
+
+def _resolve_update_remote(git_cmd):
+    import subprocess
+
+    result = subprocess.run(
+        git_cmd + ["remote"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    remotes = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    remote_urls = {}
+    for remote in remotes:
+        url_result = subprocess.run(
+            git_cmd + ["remote", "get-url", remote],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        remote_urls[remote] = url_result.stdout.strip()
+
+    if UPDATE_REMOTE_NAME in remote_urls:
+        current_url = remote_urls[UPDATE_REMOTE_NAME]
+        if not _remote_points_to_update_repo(current_url):
+            subprocess.run(
+                git_cmd + ["remote", "set-url", UPDATE_REMOTE_NAME, UPDATE_REPO_HTTPS],
+                cwd=PROJECT_ROOT,
+                check=True,
+            )
+        return UPDATE_REMOTE_NAME
+
+    for remote, url in remote_urls.items():
+        if _remote_points_to_update_repo(url):
+            return remote
+
+    if "origin" in remote_urls:
+        subprocess.run(
+            git_cmd + ["remote", "add", UPDATE_REMOTE_NAME, UPDATE_REPO_HTTPS],
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
+        return UPDATE_REMOTE_NAME
+
+    subprocess.run(
+        git_cmd + ["remote", "add", "origin", UPDATE_REPO_HTTPS],
+        cwd=PROJECT_ROOT,
+        check=True,
+    )
+    return "origin"
+
+
 def _update_via_zip(args):
     """Update Hermes Agent by downloading a ZIP archive.
     
@@ -798,7 +862,7 @@ def _update_via_zip(args):
     from urllib.request import urlretrieve
     
     branch = "main"
-    zip_url = f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
+    zip_url = f"{UPDATE_REPO_ZIP}/{branch}.zip"
     
     print("→ Downloading latest version...")
     try:
@@ -894,7 +958,7 @@ def cmd_update(args):
             use_zip_update = True
         else:
             print("✗ Not a git repository. Please reinstall:")
-            print("  curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash")
+            print(f"  curl -fsSL {UPDATE_INSTALL_SH} | bash")
             sys.exit(1)
     
     # On Windows, git can fail with "unable to write loose object file: Invalid argument"
@@ -916,8 +980,9 @@ def cmd_update(args):
         git_cmd = ["git"]
         if sys.platform == "win32":
             git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+        remote_name = _resolve_update_remote(git_cmd)
         
-        subprocess.run(git_cmd + ["fetch", "origin"], cwd=PROJECT_ROOT, check=True)
+        subprocess.run(git_cmd + ["fetch", remote_name], cwd=PROJECT_ROOT, check=True)
         
         # Get current branch
         result = subprocess.run(
@@ -931,7 +996,7 @@ def cmd_update(args):
         
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{remote_name}/{branch}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -945,7 +1010,7 @@ def cmd_update(args):
         
         print(f"→ Found {commit_count} new commit(s)")
         print("→ Pulling updates...")
-        subprocess.run(git_cmd + ["pull", "origin", branch], cwd=PROJECT_ROOT, check=True)
+        subprocess.run(git_cmd + ["pull", remote_name, branch], cwd=PROJECT_ROOT, check=True)
         
         # Reinstall Python dependencies (prefer uv for speed, fall back to pip)
         print("→ Updating Python dependencies...")
