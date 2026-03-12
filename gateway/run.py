@@ -874,7 +874,10 @@ class GatewayRunner:
                 if m.get("role") in ("user", "assistant") and m.get("content")
             ]
 
-            # Give the agent a real turn to think about what to save
+            # Give the agent a real turn to think about what to save.
+            # IMPORTANT: It must still return a short, non-empty assistant
+            # message for this system-only turn so the upstream model never
+            # treats an empty string as the "correct" final answer.
             flush_prompt = (
                 "[System: This session is about to be automatically reset due to "
                 "inactivity or a scheduled daily reset. The conversation context "
@@ -885,8 +888,14 @@ class GatewayRunner:
                 "2. If you discovered a reusable workflow or solved a non-trivial "
                 "problem, consider saving it as a skill.\n"
                 "3. If nothing is worth saving, that's fine — just skip.\n\n"
-                "Do NOT respond to the user. Just use the memory and skill_manage "
-                "tools if needed, then stop.]"
+                "Do NOT send any message that will be shown to the user or any "
+                "messaging platform.\n"
+                "HOWEVER, you MUST still return a short, non-empty assistant "
+                "message to this system turn (for example: \"Done.\" or "
+                "\"Memories flushed.\") after you finish using tools.\n"
+                "Your assistant message MUST NOT be empty, and it MUST NOT contain "
+                "only hidden reasoning.\n"
+                "Use the memory and skill_manage tools if needed, then stop.]"
             )
 
             tmp_agent.run_conversation(
