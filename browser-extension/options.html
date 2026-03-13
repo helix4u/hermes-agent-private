@@ -56,6 +56,23 @@
       <section class="card">
         <div class="section-head">
           <div>
+            <h2>Voice input</h2>
+            <p class="section-copy">Grant microphone access once here so the sidecar can record without opening a recorder popup each time.</p>
+          </div>
+        </div>
+        <button id="enable-microphone-button" class="ghost-button" type="button">Enable microphone</button>
+        <p id="microphone-status-text" class="section-copy">Not enabled yet.</p>
+        <label class="field">
+          <span class="field-label">Audio input device</span>
+          <select id="audio-input-device-select">
+            <option value="">System default microphone</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
             <h2>Appearance</h2>
             <p class="section-copy">Choose from monochrome, sepia, restored classics, and retro-gamer palettes for the popup, sidecar, and options page.</p>
           </div>

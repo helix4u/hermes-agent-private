@@ -5,6 +5,7 @@
   "description": "Chat with a dedicated local Hermes session and share the current page context.",
   "permissions": [
     "activeTab",
+    "offscreen",
     "sidePanel",
     "scripting",
     "storage",

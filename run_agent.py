@@ -4131,6 +4131,11 @@ class AIAgent:
 
                         if len(messages) < original_len:
                             print(f"{self.log_prefix}   🗜️  Compressed {original_len} → {len(messages)} messages, retrying...")
+                            api_messages, total_chars, approx_tokens = self._prepare_api_messages(
+                                messages,
+                                active_system_prompt,
+                            )
+                            api_messages = self._append_tool_budget_guidance(api_messages, api_call_count)
                             continue  # Retry with compressed messages
                         else:
                             # Can't compress further

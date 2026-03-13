@@ -31,6 +31,10 @@ const presetStrip = document.getElementById("preset-strip");
 const attachmentInput = document.getElementById("attachment-input");
 const attachmentStrip = document.getElementById("attachment-strip");
 const attachButton = document.getElementById("attach-button");
+const voiceInputButton = document.getElementById("voice-input-button");
+const voiceRecorderSheet = document.getElementById("voice-recorder-sheet");
+const voiceRecorderSheetStatus = document.getElementById("voice-recorder-sheet-status");
+const voiceRecorderCloseButton = document.getElementById("voice-recorder-close-button");
 const composer = chatInput?.closest(".composer");
 const STATUS_INLINE_MAX_CHARS = 220;
 const STATUS_INLINE_MAX_LINES = 3;
@@ -74,6 +78,11 @@ let activeReplyAudio = null;
 let activeReplyAudioUrl = "";
 let pendingAttachments = [];
 let previewPollingEnabled = false;
+let voiceRecordingActive = false;
+let voiceTranscriptionPending = false;
+const voiceInputChannel = typeof BroadcastChannel !== "undefined"
+  ? new BroadcastChannel("hermes-sidecar-voice-input")
+  : null;
 let sidebarSettings = {
   showQuickPrompts: false,
   showChallengeMode: false,
@@ -235,6 +244,27 @@ function updateComposerAvailability() {
   if (attachmentInput) {
     attachmentInput.disabled = !canSend;
   }
+  if (voiceInputButton) {
+    const voiceSupported = Boolean(chrome?.runtime?.id);
+    const canUseVoice = Boolean(voiceSupported && selectedSessionCanSend && !isBusy && !voiceTranscriptionPending);
+    voiceInputButton.disabled = !canUseVoice;
+    voiceInputButton.classList.toggle("is-recording", voiceRecordingActive);
+    voiceInputButton.classList.toggle("is-transcribing", voiceTranscriptionPending);
+    voiceInputButton.textContent = voiceRecordingActive
+      ? "Stop recording"
+      : voiceTranscriptionPending
+        ? "Transcribing..."
+        : "Voice input";
+    voiceInputButton.title = !voiceSupported
+      ? "Voice input is not supported in this browser."
+      : voiceRecordingActive
+        ? "Stop recording and transcribe this voice note"
+      : voiceTranscriptionPending
+        ? "Hermes is transcribing your voice note"
+      : selectedSessionCanSend
+        ? "Record a short voice note directly from the sidecar"
+        : "This session is read-only in the side panel";
+  }
   sendButton.textContent = isBusy ? "Working..." : "Send";
   sendButton.title = isBusy
     ? "Hermes is working on the current turn"
@@ -254,6 +284,57 @@ function updateComposerAvailability() {
         ? "Interrupt already requested for the current turn"
         : "Ask Hermes to stop the current response chain";
   }
+}
+
+function setVoiceRecorderSheetVisible(visible, message = "") {
+  if (!voiceRecorderSheet) {
+    return;
+  }
+  voiceRecorderSheet.hidden = !visible;
+  if (voiceRecorderSheetStatus && message) {
+    voiceRecorderSheetStatus.textContent = String(message);
+  }
+}
+
+function appendTranscriptToComposer(value) {
+  const text = String(value || "").trim();
+  if (!text || !chatInput) {
+    return;
+  }
+  const current = String(chatInput.value || "").trim();
+  chatInput.value = current ? `${current}\n\n${text}` : text;
+  chatInput.focus();
+  chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
+}
+
+async function toggleVoiceRecording() {
+  if (voiceTranscriptionPending) {
+    return;
+  }
+
+  if (voiceRecordingActive) {
+    await sendRuntimeMessage({ type: "hermes:stop-voice-recording" });
+    voiceInputChannel?.postMessage({ type: "hermes:stop-recording" });
+    setVoiceRecorderSheetVisible(true, "Voice note captured. Hermes is transcribing it now...");
+    setStatus("Stopping voice recording...", { openActivity: true });
+    return;
+  }
+
+  setVoiceRecorderSheetVisible(
+    true,
+    "Recording will start as soon as microphone access is available. If needed, enable microphone access from the Sidecar options page first."
+  );
+  const settingsResponse = await sendRuntimeMessage({ type: "hermes:get-settings" });
+  const selectedDeviceId = String(settingsResponse.settings?.audioInputDeviceId || "").trim();
+  await sendRuntimeMessage({ type: "hermes:ensure-offscreen-voice-recorder" });
+  voiceInputChannel?.postMessage({
+    type: "hermes:start-recording",
+    deviceId: selectedDeviceId,
+    captureMode: "raw"
+  });
+  voiceRecordingActive = true;
+  updateComposerAvailability();
+  setStatus("Recording voice note from the sidecar...", { openActivity: true });
 }
 
 function clearReplyAudioState() {
@@ -2047,6 +2128,94 @@ if (attachButton) {
     if (attachmentInput && !attachmentInput.disabled) {
       attachmentInput.click();
     }
+  });
+}
+
+if (voiceInputButton) {
+  voiceInputButton.addEventListener("click", () => {
+    toggleVoiceRecording().catch((error) => {
+      setStatus(explainBackgroundMismatch(error), { openActivity: true });
+    });
+  });
+}
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type !== "hermes:voice-input-broadcast") {
+    return;
+  }
+  const payload = message.event && typeof message.event === "object" ? message.event : {};
+  const type = String(payload.type || "");
+  if (!type) {
+    return;
+  }
+
+  if (type === "recording") {
+    voiceRecordingActive = true;
+    voiceTranscriptionPending = false;
+    setVoiceRecorderSheetVisible(true, "Recording in progress. Press Voice input again to stop.");
+    updateComposerAvailability();
+    setStatus("Recording voice note from the sidecar...", { openActivity: true });
+    return;
+  }
+
+  if (type === "transcribing") {
+    voiceRecordingActive = false;
+    voiceTranscriptionPending = true;
+    setVoiceRecorderSheetVisible(true, "Voice note captured. Hermes is transcribing it now...");
+    updateComposerAvailability();
+    setStatus("Uploading voice note to Hermes for transcription...", { openActivity: true });
+    return;
+  }
+
+  if (type === "transcript") {
+    voiceRecordingActive = false;
+    voiceTranscriptionPending = false;
+    setVoiceRecorderSheetVisible(false);
+    appendTranscriptToComposer(payload.transcript || "");
+    updateComposerAvailability();
+    setStatus("Voice note transcribed into the composer.");
+    return;
+  }
+
+  if (type === "error") {
+    voiceRecordingActive = false;
+    voiceTranscriptionPending = false;
+    setVoiceRecorderSheetVisible(true, String(payload.error || "Voice input failed."));
+    updateComposerAvailability();
+    setStatus(String(payload.error || "Voice input failed."), { openActivity: true });
+  }
+});
+
+if (voiceInputChannel) {
+  voiceInputChannel.addEventListener("message", (event) => {
+    const payload = event?.data && typeof event.data === "object" ? event.data : {};
+    const type = String(payload.type || "");
+    if (!type) {
+      return;
+    }
+
+    if (type === "recording") {
+      voiceRecordingActive = true;
+      voiceTranscriptionPending = false;
+      setVoiceRecorderSheetVisible(true, "Recording in progress. Press Voice input again to stop.");
+      updateComposerAvailability();
+      setStatus("Recording voice note from the sidecar...", { openActivity: true });
+      return;
+    }
+
+    if (type === "error") {
+      voiceRecordingActive = false;
+      voiceTranscriptionPending = false;
+      setVoiceRecorderSheetVisible(true, String(payload.error || "Voice input failed."));
+      updateComposerAvailability();
+      setStatus(String(payload.error || "Voice input failed."), { openActivity: true });
+    }
+  });
+}
+
+if (voiceRecorderCloseButton) {
+  voiceRecorderCloseButton.addEventListener("click", () => {
+    setVoiceRecorderSheetVisible(false);
   });
 }
 

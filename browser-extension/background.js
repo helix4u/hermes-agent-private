@@ -11,6 +11,7 @@ const LEGACY_BROWSER_LABEL = "Chrome Extension";
 const ACTIVE_LABEL_KEY = "activeBrowserLabel";
 const PAGE_CONTEXT_CACHE_TTL_MS = 90000;
 const TRANSCRIPT_TEXT_CACHE_TTL_MS = 10 * 60 * 1000;
+const OFFSCREEN_RECORDER_PATH = "offscreen-recorder.html";
 const DEFAULT_CHALLENGE_MODE_LABEL = "Challenge my framing";
 const DEFAULT_CHALLENGE_MODE_PROMPT =
   "Before answering, briefly challenge my framing. " +
@@ -68,6 +69,7 @@ const REQUIRED_HOST_ORIGINS = new Set([
 ]);
 const pageContextCache = new Map();
 const transcriptTextCache = new Map();
+let offscreenRecorderCreation = null;
 
 function cloneContext(value) {
   try {
@@ -146,6 +148,8 @@ function normalizeStoredSettings(settings) {
   return {
     bridgeUrl: String(next.bridgeUrl || "").trim() || DEFAULT_BRIDGE_URL,
     bridgeToken: String(next.bridgeToken || "").trim(),
+    audioInputDeviceId: String(next.audioInputDeviceId || "").trim(),
+    audioCaptureMode: String(next.audioCaptureMode || "").trim().toLowerCase() === "speech" ? "speech" : "raw",
     includeTranscriptByDefault: next.includeTranscriptByDefault !== false,
     sharePageByDefault: next.sharePageByDefault !== false,
     enablePreviewPolling: next.enablePreviewPolling === true,
@@ -171,6 +175,13 @@ function buildSettingsPatch(settings) {
   }
   if (Object.prototype.hasOwnProperty.call(settings, "bridgeToken")) {
     patch.bridgeToken = String(settings.bridgeToken || "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "audioInputDeviceId")) {
+    patch.audioInputDeviceId = String(settings.audioInputDeviceId || "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "audioCaptureMode")) {
+    patch.audioCaptureMode =
+      String(settings.audioCaptureMode || "").trim().toLowerCase() === "speech" ? "speech" : "raw";
   }
   if (Object.prototype.hasOwnProperty.call(settings, "includeTranscriptByDefault")) {
     patch.includeTranscriptByDefault = settings.includeTranscriptByDefault !== false;
@@ -645,6 +656,8 @@ async function getSettings() {
   const stored = await chrome.storage.sync.get({
     bridgeUrl: DEFAULT_BRIDGE_URL,
     bridgeToken: "",
+    audioInputDeviceId: "",
+    audioCaptureMode: "raw",
     includeTranscriptByDefault: true,
     sharePageByDefault: true,
     enablePreviewPolling: false,
@@ -1545,6 +1558,75 @@ async function generateChatSpeech(text) {
   });
 }
 
+async function transcribeChatAudio(audioBase64, mimeType = "audio/webm") {
+  const token = await getBridgeToken();
+  return callBridge("/session", {
+    token,
+    timeoutMs: Math.max(TTS_BRIDGE_TIMEOUT_MS, 120000),
+    body: {
+      action: "transcribe_audio",
+      audio_base64: String(audioBase64 || ""),
+      mime_type: String(mimeType || "audio/webm")
+    }
+  });
+}
+
+async function openVoiceRecorderWindow() {
+  const url = chrome.runtime.getURL("voice-recorder.html");
+  return chrome.windows.create({
+    url,
+    type: "popup",
+    width: 420,
+    height: 560,
+    focused: true
+  });
+}
+
+async function hasOffscreenRecorderDocument() {
+  if (!chrome.runtime.getContexts) {
+    return false;
+  }
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: ["OFFSCREEN_DOCUMENT"],
+    documentUrls: [chrome.runtime.getURL(OFFSCREEN_RECORDER_PATH)]
+  });
+  return Array.isArray(contexts) && contexts.length > 0;
+}
+
+async function ensureOffscreenRecorderDocument() {
+  if (!chrome.offscreen?.createDocument) {
+    throw new Error("Offscreen recording is not supported in this browser.");
+  }
+  if (await hasOffscreenRecorderDocument()) {
+    return;
+  }
+  if (offscreenRecorderCreation) {
+    return offscreenRecorderCreation;
+  }
+
+  offscreenRecorderCreation = chrome.offscreen.createDocument({
+    url: OFFSCREEN_RECORDER_PATH,
+    reasons: ["USER_MEDIA"],
+    justification: "Record short voice notes for Hermes sidecar voice input."
+  });
+  try {
+    await offscreenRecorderCreation;
+  } finally {
+    offscreenRecorderCreation = null;
+  }
+}
+
+async function dispatchVoiceInputEvent(event) {
+  try {
+    await chrome.runtime.sendMessage({
+      type: "hermes:voice-input-broadcast",
+      event
+    });
+  } catch (_error) {
+    // Ignore if no sidecar/options page is actively listening.
+  }
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   configureSidePanelBehavior().catch((error) => {
     console.debug("Hermes extension: failed to configure side panel behavior", error);
@@ -1659,6 +1741,61 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.type === "hermes:speak-chat-message") {
       const result = await generateChatSpeech(message.text || "");
       sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:transcribe-chat-audio") {
+      const result = await transcribeChatAudio(
+        message.audioBase64 || "",
+        message.mimeType || "audio/webm"
+      );
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:open-voice-recorder") {
+      const result = await openVoiceRecorderWindow();
+      sendResponse({ ok: true, result: { windowId: result?.id || null } });
+      return;
+    }
+
+    if (message.type === "hermes:ensure-offscreen-voice-recorder") {
+      await ensureOffscreenRecorderDocument();
+      sendResponse({ ok: true, result: { ready: true } });
+      return;
+    }
+
+    if (message.type === "hermes:start-voice-recording") {
+      await ensureOffscreenRecorderDocument();
+      const result = { ready: true };
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:stop-voice-recording") {
+      await ensureOffscreenRecorderDocument();
+      const result = { ready: true };
+      sendResponse({ ok: true, result });
+      return;
+    }
+
+    if (message.type === "hermes:voice-recording-audio") {
+      await dispatchVoiceInputEvent({ type: "transcribing" });
+      try {
+        const result = await transcribeChatAudio(
+          message.audioBase64 || "",
+          message.mimeType || "audio/webm"
+        );
+        await dispatchVoiceInputEvent({
+          type: "transcript",
+          transcript: String(result?.transcript || "")
+        });
+        sendResponse({ ok: true, result });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        await dispatchVoiceInputEvent({ type: "error", error: msg });
+        throw error;
+      }
       return;
     }
 

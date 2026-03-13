@@ -2879,6 +2879,54 @@ class GatewayRunner:
                 "audio_base64": audio_base64,
             }
 
+        if action == "transcribe_audio":
+            audio_base64 = str(payload.get("audio_base64") or "").strip()
+            if not audio_base64:
+                raise ValueError("Audio payload is required for transcription.")
+
+            mime_type = str(payload.get("mime_type") or "audio/webm").split(";", 1)[0].strip().lower()
+            ext = mimetypes.guess_extension(mime_type) or ".webm"
+            if ext == ".jpe":
+                ext = ".jpg"
+            if ext not in {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg"}:
+                ext = ".webm"
+
+            try:
+                audio_bytes = base64.b64decode(audio_base64, validate=True)
+            except Exception as exc:
+                raise ValueError("Invalid base64 audio payload.") from exc
+
+            if not audio_bytes:
+                raise ValueError("Audio payload was empty.")
+
+            audio_dir = _hermes_home / "audio_cache"
+            audio_dir.mkdir(parents=True, exist_ok=True)
+            debug_audio_path = audio_dir / f"browser_voice_last{ext}"
+            for candidate in audio_dir.glob("browser_voice_last.*"):
+                if candidate != debug_audio_path:
+                    try:
+                        candidate.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            debug_audio_path.write_bytes(audio_bytes)
+
+            from tools.transcription_tools import transcribe_audio
+
+            result = await asyncio.to_thread(transcribe_audio, str(debug_audio_path))
+
+            if not result.get("success"):
+                raise ValueError(str(result.get("error") or "Audio transcription failed."))
+
+            transcript = str(result.get("transcript") or "").strip()
+            if not transcript:
+                raise ValueError("Transcription returned no text.")
+
+            return {
+                "ok": True,
+                "transcript": transcript,
+                "mime_type": mime_type or "audio/webm",
+            }
+
         if selected_session_key:
             sidebar_snapshot = None
             try:
@@ -2994,6 +3042,11 @@ class GatewayRunner:
             if action == "tts":
                 raise ValueError(
                     "TTS (Read aloud) is not available. Restart the Hermes gateway "
+                    "('hermes gateway') so it loads the latest code, then try again."
+                )
+            if action == "transcribe_audio":
+                raise ValueError(
+                    "Audio transcription is not available. Restart the Hermes gateway "
                     "('hermes gateway') so it loads the latest code, then try again."
                 )
             raise ValueError(f"Unsupported browser bridge action: {action}")

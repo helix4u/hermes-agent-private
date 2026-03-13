@@ -2,6 +2,9 @@ const bridgeUrlInput = document.getElementById("bridge-url");
 const bridgeTokenInput = document.getElementById("bridge-token");
 const sharePageByDefault = document.getElementById("share-page-by-default");
 const includeTranscript = document.getElementById("include-transcript");
+const enableMicrophoneButton = document.getElementById("enable-microphone-button");
+const microphoneStatusText = document.getElementById("microphone-status-text");
+const audioInputDeviceSelect = document.getElementById("audio-input-device-select");
 const themeSelect = document.getElementById("theme-select");
 const themeDescription = document.getElementById("theme-description");
 const customThemeList = document.getElementById("custom-theme-list");
@@ -39,6 +42,12 @@ function setStatus(message) {
 
 function setBridgeStatus(message) {
   bridgeStatusText.textContent = message;
+}
+
+function setMicrophoneStatus(message) {
+  if (microphoneStatusText) {
+    microphoneStatusText.textContent = message;
+  }
 }
 
 function isExtensionContextInvalidated(error) {
@@ -531,6 +540,7 @@ async function loadSettings() {
   };
   bridgeUrlInput.value = settings.bridgeUrl || "";
   bridgeTokenInput.value = settings.bridgeToken || "";
+  await loadAudioInputDevices(settings.audioInputDeviceId || "");
   sharePageByDefault.checked = settings.sharePageByDefault !== false;
   includeTranscript.checked = settings.includeTranscriptByDefault !== false;
   customThemeDrafts = Array.isArray(themeSettings.customThemes)
@@ -557,6 +567,42 @@ async function checkBridge() {
     return `Bridge is reachable on port ${result.port}.`;
   }
   return "Bridge health check returned an unexpected response.";
+}
+
+async function requestMicrophoneAccess() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("This browser does not support microphone capture from extension pages.");
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  for (const track of stream.getTracks()) {
+    track.stop();
+  }
+}
+
+async function loadAudioInputDevices(selectedDeviceId = "") {
+  if (!audioInputDeviceSelect || !navigator.mediaDevices?.enumerateDevices) {
+    return;
+  }
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const audioInputs = devices.filter((device) => device.kind === "audioinput");
+  audioInputDeviceSelect.textContent = "";
+
+  const defaultOption = document.createElement("option");
+  defaultOption.value = "";
+  defaultOption.textContent = "System default microphone";
+  audioInputDeviceSelect.appendChild(defaultOption);
+
+  audioInputs.forEach((device, index) => {
+    const option = document.createElement("option");
+    option.value = device.deviceId || "";
+    option.textContent = device.label || `Microphone ${index + 1}`;
+    audioInputDeviceSelect.appendChild(option);
+  });
+
+  const hasSelectedValue =
+    selectedDeviceId &&
+    Array.from(audioInputDeviceSelect.options).some((option) => option.value === selectedDeviceId);
+  audioInputDeviceSelect.value = hasSelectedValue ? selectedDeviceId : "";
 }
 
 function collectQuickPromptPayload() {
@@ -603,6 +649,7 @@ function buildSettingsPayload() {
     settings: {
       bridgeUrl: bridgeUrlInput.value.trim(),
       bridgeToken: bridgeTokenInput.value.trim(),
+      audioInputDeviceId: audioInputDeviceSelect?.value || "",
       includeTranscriptByDefault: includeTranscript.checked,
       sharePageByDefault: sharePageByDefault.checked,
       themeName: themeSettings.themeName,
@@ -671,6 +718,33 @@ document.getElementById("health-button").addEventListener("click", () => {
     .then((message) => setBridgeStatus(message))
     .catch((error) => setBridgeStatus(error.message || String(error)));
 });
+
+if (enableMicrophoneButton) {
+  enableMicrophoneButton.addEventListener("click", () => {
+    setMicrophoneStatus("Requesting microphone access...");
+    requestMicrophoneAccess()
+      .then(() => {
+        return loadAudioInputDevices(audioInputDeviceSelect?.value || "").then(() => {
+          setMicrophoneStatus("Microphone enabled for Hermes voice input.");
+          setStatus("Microphone access granted.");
+        });
+      })
+      .catch((error) => {
+        const message = error.message || String(error);
+        setMicrophoneStatus(message);
+        setStatus(message);
+      });
+  });
+}
+
+if (audioInputDeviceSelect) {
+  audioInputDeviceSelect.addEventListener("change", () => {
+    saveSettings({
+      checkBridgeAfterSave: false,
+      savedPrefix: "Audio input device saved."
+    }).catch((error) => setStatus(error.message || String(error)));
+  });
+}
 
 addThemeButton.addEventListener("click", () => {
   const nextTheme = createCustomThemeDraft({}, customThemeDrafts.length);

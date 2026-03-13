@@ -60,6 +60,7 @@
                   <span>Site polling</span>
                 </label>
                 <button id="refresh-button" class="ghost-button compact-action-button" type="button" title="Refresh the current page preview once right now">Refresh now</button>
+                <button id="voice-input-button" class="ghost-button compact-action-button" type="button" title="Record a short voice note and transcribe it into the composer">Voice input</button>
                 <button id="attach-button" class="ghost-button compact-action-button" type="button" title="Attach image files, or paste or drop images here">Attach image</button>
                 <button id="challenge-mode-button" class="ghost-button chip-button mode-button" type="button" aria-pressed="false" title="Tell Hermes to challenge your assumptions before answering" hidden>Challenge my framing</button>
                 <button id="interrupt-button" class="interrupt-button compact-action-button" type="button" title="Ask Hermes to stop the current response chain" hidden>Interrupt</button>
@@ -68,6 +69,20 @@
             </div>
             <span id="quick-prompts-label" class="tool-label" hidden>Quick prompts</span>
             <div id="preset-strip" class="preset-strip" aria-label="Prompt presets" hidden></div>
+          </div>
+          <div id="voice-recorder-sheet" class="voice-recorder-sheet" hidden>
+            <div class="voice-recorder-sheet-card">
+              <div class="voice-recorder-sheet-head">
+                <div>
+                  <p class="voice-recorder-sheet-eyebrow">Hermes Voice Input</p>
+                  <h3>Recorder ready</h3>
+                </div>
+                <button id="voice-recorder-close-button" class="ghost-button small-button" type="button">Dismiss</button>
+              </div>
+              <p id="voice-recorder-sheet-status" class="voice-recorder-sheet-status">
+                Hermes opened a recorder window. Use it to allow mic access and capture a short voice note.
+              </p>
+            </div>
           </div>
           <div class="toggle-cluster">
             <label class="checkbox-row compact-row">
