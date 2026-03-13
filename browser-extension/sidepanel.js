@@ -31,6 +31,7 @@ const presetStrip = document.getElementById("preset-strip");
 const attachmentInput = document.getElementById("attachment-input");
 const attachmentStrip = document.getElementById("attachment-strip");
 const attachButton = document.getElementById("attach-button");
+const screengrabButton = document.getElementById("screengrab-button");
 const voiceInputButton = document.getElementById("voice-input-button");
 const voiceRecorderSheet = document.getElementById("voice-recorder-sheet");
 const voiceRecorderSheetStatus = document.getElementById("voice-recorder-sheet-status");
@@ -240,6 +241,9 @@ function updateComposerAvailability() {
   chatInput.disabled = !selectedSessionCanSend;
   if (attachButton) {
     attachButton.disabled = !canSend;
+  }
+  if (screengrabButton) {
+    screengrabButton.disabled = !canSend;
   }
   if (attachmentInput) {
     attachmentInput.disabled = !canSend;
@@ -624,7 +628,7 @@ function removePendingAttachment(attachmentId) {
   const nextAttachments = [];
   for (const attachment of pendingAttachments) {
     if (attachment.id === attachmentId) {
-      if (attachment.previewUrl) {
+      if (attachment.previewUrl && attachment.previewUrlRevocable) {
         URL.revokeObjectURL(attachment.previewUrl);
       }
       continue;
@@ -637,7 +641,7 @@ function removePendingAttachment(attachmentId) {
 
 function clearPendingAttachments() {
   for (const attachment of pendingAttachments) {
-    if (attachment.previewUrl) {
+    if (attachment.previewUrl && attachment.previewUrlRevocable) {
       URL.revokeObjectURL(attachment.previewUrl);
     }
   }
@@ -682,11 +686,79 @@ async function addAttachmentFiles(fileList) {
       mime_type: mimeType || "image/png",
       size_bytes: Number(file.size || 0),
       data_url: dataUrl,
-      previewUrl: URL.createObjectURL(file)
+      previewUrl: URL.createObjectURL(file),
+      previewUrlRevocable: true
     });
   }
 
   renderAttachmentStrip();
+}
+
+function estimateDataUrlByteLength(dataUrl) {
+  const value = String(dataUrl || "");
+  const marker = "base64,";
+  const index = value.indexOf(marker);
+  if (index === -1) {
+    return 0;
+  }
+  const base64 = value.slice(index + marker.length);
+  if (!base64) {
+    return 0;
+  }
+  const paddingMatch = base64.match(/=+$/);
+  const paddingLength = paddingMatch ? paddingMatch[0].length : 0;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - paddingLength);
+}
+
+function addAttachmentDataUrl({
+  dataUrl,
+  name = "image.png",
+  mimeType = "image/png",
+  sizeBytes = 0
+}) {
+  const normalizedDataUrl = String(dataUrl || "").trim();
+  const normalizedMimeType = String(mimeType || "").toLowerCase();
+  if (!normalizedDataUrl) {
+    throw new Error("No screenshot data was returned.");
+  }
+  if (!SUPPORTED_IMAGE_MIME_TYPES.has(normalizedMimeType)) {
+    throw new Error("This screenshot format is not supported.");
+  }
+  if (pendingAttachments.length >= MAX_IMAGE_ATTACHMENTS) {
+    throw new Error(`You can attach up to ${MAX_IMAGE_ATTACHMENTS} images per turn.`);
+  }
+
+  const resolvedSizeBytes = Number(sizeBytes || 0) || estimateDataUrlByteLength(normalizedDataUrl);
+  if (resolvedSizeBytes > MAX_IMAGE_ATTACHMENT_BYTES) {
+    throw new Error(`Screenshot is larger than ${formatAttachmentSize(MAX_IMAGE_ATTACHMENT_BYTES)}.`);
+  }
+
+  pendingAttachments.push({
+    id: crypto.randomUUID(),
+    name: String(name || "image.png").trim() || "image.png",
+    mime_type: normalizedMimeType,
+    size_bytes: resolvedSizeBytes,
+    data_url: normalizedDataUrl,
+    previewUrl: normalizedDataUrl,
+    previewUrlRevocable: false
+  });
+  renderAttachmentStrip();
+}
+
+async function captureCurrentTabScreengrab() {
+  const tab = await getActiveTab();
+  const response = await sendRuntimeMessage({
+    type: "hermes:capture-visible-tab",
+    tabId: tab.id
+  });
+  const result = response.result || {};
+  addAttachmentDataUrl({
+    dataUrl: result.data_url,
+    name: result.name || "page-screengrab.png",
+    mimeType: result.mime_type || "image/png",
+    sizeBytes: result.size_bytes || 0
+  });
+  return result;
 }
 
 function buildAttachmentPayloads() {
@@ -974,6 +1046,15 @@ function isExtensionContextInvalidated(error) {
   );
 }
 
+function isExtensionsPolicyBlockedMessage(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("cannot be scripted due to an extensionssettings policy") ||
+    message.includes("cannot be scripted because the browser blocked extension injection with an extensionssettings policy") ||
+    message.includes("extensionssettings policy")
+  );
+}
+
 function getExtensionContextInvalidatedMessage() {
   return (
     "Hermes Sidecar was reloaded or updated. Reload the side panel to reconnect."
@@ -1126,6 +1207,12 @@ function explainBackgroundMismatch(error) {
     return (
       "This tab is using an old or unavailable Hermes page bridge. " +
       "Reload this tab and try again."
+    );
+  }
+  if (lower.includes("capturevisibletab")) {
+    return (
+      "Hermes could not capture the visible tab image. " +
+      "Make sure the page is visible in the current window and try again."
     );
   }
   return message;
@@ -1558,6 +1645,18 @@ function renderPreview(result) {
     return;
   }
 
+  if (isExtensionsPolicyBlockedMessage(result?.unavailableReason || "")) {
+    pageContextUnavailable = true;
+    sharePageCheckbox.checked = false;
+    sharePageCheckbox.disabled = true;
+    includeTranscript.checked = false;
+    includeTranscript.disabled = true;
+    includeTranscriptLabel.textContent = "Transcript unavailable on policy-blocked pages";
+    transcriptStatus.textContent = "Blocked by browser policy";
+    renderContextBundle();
+    return;
+  }
+
   sharePageCheckbox.disabled = false;
 
   if (result.transcriptAvailable) {
@@ -1617,6 +1716,16 @@ async function refreshPreview({ quiet = false } = {}) {
     });
     const preview = response.result || {};
     renderPreview(preview);
+    if (isExtensionsPolicyBlockedMessage(preview.unavailableReason || "")) {
+      if (previewPollingEnabled) {
+        await setPreviewPollingEnabled(false, { persist: true, quiet: true });
+      }
+      setStatus(
+        "This page blocks scripted scraping due to browser policy.",
+        { openActivity: true }
+      );
+      return;
+    }
     if (!quiet) {
       if (preview.contentKind === "restricted-page") {
         setStatus(
@@ -1750,7 +1859,7 @@ async function sendChatMessage(messageOverride = null, options = {}) {
   const message = messageOverride === null
     ? chatInput.value.trim()
     : String(messageOverride || "").trim();
-  const outgoingMessage = buildOutgoingMessage(message);
+  let outgoingMessage = buildOutgoingMessage(message);
   const forceIncludeTranscript = Boolean(options.forceIncludeTranscript);
   const sharePage = forceIncludeTranscript || sharePageCheckbox.checked;
   const includeTranscriptForSend = forceIncludeTranscript || includeTranscript.checked;
@@ -1760,11 +1869,12 @@ async function sendChatMessage(messageOverride = null, options = {}) {
       "Current tab context is unavailable. Switch to a normal webpage tab, or turn off page sharing for this turn."
     );
   }
-  if (!message && !sharePage && !attachments.length) {
+  const effectiveSharePage = sharePage;
+  if (!outgoingMessage && !effectiveSharePage && !attachments.length) {
     throw new Error("Type a message, attach an image, or enable page sharing before sending.");
   }
 
-  pendingUserMessage = buildOptimisticUserMessage(message, sharePage);
+  pendingUserMessage = buildOptimisticUserMessage(message || outgoingMessage, effectiveSharePage);
   pendingQueuedAt = Date.now();
   renderMessages(
     currentMessages,
@@ -1773,7 +1883,12 @@ async function sendChatMessage(messageOverride = null, options = {}) {
     { forceScroll: true }
   );
   setBusyState(true);
-  setStatus(sharePage ? "Sending your message with current page context..." : "Sending your message...", { openActivity: true });
+  setStatus(
+    effectiveSharePage
+      ? "Sending your message with current page context..."
+      : "Sending your message...",
+    { openActivity: true }
+  );
   const targetSessionKey = String(selectedSessionKey || expectedSessionKey || "").trim();
 
   let response;
@@ -1782,10 +1897,10 @@ async function sendChatMessage(messageOverride = null, options = {}) {
       type: "hermes:start-chat-message",
       tabId: activeTabId,
       message: outgoingMessage,
-      sharePage,
+      sharePage: effectiveSharePage,
       includeTranscript: includeTranscriptForSend,
       sessionKey: targetSessionKey,
-      contextOptions: sharePage ? getContextOptionsForSend() : null,
+      contextOptions: effectiveSharePage ? getContextOptionsForSend() : null,
       attachments
     });
   } catch (error) {
@@ -1794,10 +1909,10 @@ async function sendChatMessage(messageOverride = null, options = {}) {
         type: "hermes:send-chat-message",
         tabId: activeTabId,
         message: outgoingMessage,
-        sharePage,
+        sharePage: effectiveSharePage,
         includeTranscript: includeTranscriptForSend,
         sessionKey: targetSessionKey,
-        contextOptions: sharePage ? getContextOptionsForSend() : null,
+        contextOptions: effectiveSharePage ? getContextOptionsForSend() : null,
         attachments
       });
     } else {
@@ -2127,6 +2242,19 @@ if (attachButton) {
   attachButton.addEventListener("click", () => {
     if (attachmentInput && !attachmentInput.disabled) {
       attachmentInput.click();
+    }
+  });
+}
+
+if (screengrabButton) {
+  screengrabButton.addEventListener("click", async () => {
+    try {
+      setStatus("Capturing the current tab as an image attachment...");
+      const result = await captureCurrentTabScreengrab();
+      const label = String(result.name || "page screenshot");
+      setStatus(`Attached ${label}.`);
+    } catch (error) {
+      setStatus(explainBackgroundMismatch(error), { openActivity: true });
     }
   });
 }

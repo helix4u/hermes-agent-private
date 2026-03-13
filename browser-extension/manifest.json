@@ -12,6 +12,7 @@
     "tabs"
   ],
   "host_permissions": [
+    "<all_urls>",
     "http://127.0.0.1/*",
     "http://localhost/*",
     "https://x.com/*",
@@ -20,10 +21,6 @@
     "https://www.twitter.com/*",
     "https://www.youtube.com/*",
     "https://youtube.com/*"
-  ],
-  "optional_host_permissions": [
-    "http://*/*",
-    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js"

@@ -783,14 +783,76 @@ function canRetryContentScript(error) {
   );
 }
 
+function isScriptingBlockedByPolicy(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("cannot be scripted due to an extensionssettings policy") ||
+    message.includes("this page cannot be scripted due to an extensionssettings policy") ||
+    message.includes("extensionssettings policy")
+  );
+}
+
+function createEmptyTranscriptState() {
+  return {
+    available: false,
+    shared: false,
+    sharedPreviously: false,
+    source: "",
+    key: ""
+  };
+}
+
+async function buildPolicyBlockedContext(tabId, reason = "") {
+  const tab = await getTabSnapshot(tabId);
+  const tabUrl = String(tab?.url || "").trim();
+  const cachedContext = readCachedPageContext(tabId, tabUrl) || {};
+  const cachedMetadata =
+    cachedContext?.metadata && typeof cachedContext.metadata === "object"
+      ? cachedContext.metadata
+      : {};
+  const captureReason =
+    String(reason || "").trim() ||
+    "This page cannot be scripted due to an ExtensionsSettings policy.";
+
+  return {
+    url: tabUrl || String(cachedContext?.url || "").trim(),
+    title: String(tab?.title || cachedContext?.title || "").trim(),
+    description: String(cachedContext?.description || "").trim(),
+    canonicalUrl: String(cachedContext?.canonicalUrl || "").trim(),
+    siteName: String(cachedContext?.siteName || "").trim(),
+    selection: String(cachedContext?.selection || "").trim(),
+    pageText: String(cachedContext?.pageText || "").trim(),
+    contentKind: String(cachedContext?.contentKind || "").trim() || "web-page",
+    metadata: {
+      ...cachedMetadata,
+      pageCaptureBlocked: true,
+      pageCaptureBlockedReason: captureReason,
+      pageTextSource:
+        String(cachedMetadata.pageTextSource || "").trim() || "script-policy-blocked"
+    },
+    transcript:
+      cachedContext?.transcript && typeof cachedContext.transcript === "object"
+        ? cachedContext.transcript
+        : createEmptyTranscriptState()
+  };
+}
+
 async function ensureContentScript(tabId) {
   if (!chrome.scripting?.executeScript) {
-    return;
+    return false;
   }
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ["content.js"]
-  });
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content.js"]
+    });
+    return true;
+  } catch (error) {
+    if (isScriptingBlockedByPolicy(error)) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 async function captureRenderedPageTextFallback(tabId) {
@@ -926,9 +988,10 @@ async function collectPageContextFallback(tabId) {
     throw new Error("Page context fallback is unavailable in this browser.");
   }
 
-  const [{ result }] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
       const collapse = (text) => (text || "")
         .replace(/\u00a0/g, " ")
         .replace(/[ \t]+\n/g, "\n")
@@ -1049,26 +1112,26 @@ async function collectPageContextFallback(tabId) {
         }
       };
     }
-  });
+    });
 
-  return result || {
-    url: "",
-    title: "",
-    description: "",
-    canonicalUrl: "",
-    siteName: "",
-    selection: "",
-    pageText: "",
-    contentKind: "web-page",
-    metadata: {},
-    transcript: {
-      available: false,
-      shared: false,
-      sharedPreviously: false,
-      source: "",
-      key: ""
+    return result || {
+      url: "",
+      title: "",
+      description: "",
+      canonicalUrl: "",
+      siteName: "",
+      selection: "",
+      pageText: "",
+      contentKind: "web-page",
+      metadata: {},
+      transcript: createEmptyTranscriptState()
+    };
+  } catch (error) {
+    if (isScriptingBlockedByPolicy(error)) {
+      return buildPolicyBlockedContext(tabId, error?.message || String(error));
     }
-  };
+    throw error;
+  }
 }
 
 async function requestPageContext(tabId, includeTranscriptText, waitForHydration = false) {
@@ -1087,6 +1150,9 @@ async function collectPageContext(tabId, includeTranscriptText, waitForHydration
     }
     return result;
   } catch (error) {
+    if (isScriptingBlockedByPolicy(error)) {
+      return buildPolicyBlockedContext(tabId, error?.message || String(error));
+    }
     if (canRetryContentScript(error)) {
       try {
         await ensureContentScript(tabId);
@@ -1095,7 +1161,10 @@ async function collectPageContext(tabId, includeTranscriptText, waitForHydration
           throw new Error(retried.error);
         }
         return retried;
-      } catch (_retryError) {
+      } catch (retryError) {
+        if (isScriptingBlockedByPolicy(retryError)) {
+          return buildPolicyBlockedContext(tabId, retryError?.message || String(retryError));
+        }
         return collectPageContextFallback(tabId);
       }
     }
@@ -1220,7 +1289,8 @@ async function previewPageContext(tabId) {
     transcriptAlreadyShared,
     transcriptLanguage: transcript.language || "",
     transcriptKey,
-    bundle: buildContextBundlePreview(context, transcriptAlreadyShared)
+    bundle: buildContextBundlePreview(context, transcriptAlreadyShared),
+    unavailableReason: String(context?.metadata?.pageCaptureBlockedReason || "").trim()
   };
 }
 
@@ -1249,7 +1319,7 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
   let context = await collectPageContext(tabId, shouldIncludeTranscript, true);
   if (shouldIncludeTranscript && onYouTubeWatch) {
     context = await ensurePreviewTranscriptText(tabId, context, true, tabUrl || preview.url || "");
-    if (!String(context?.transcript?.text || "").trim()) {
+    if (!String(context?.transcript?.text || "").trim() && context?.metadata?.pageCaptureBlocked !== true) {
       throw new Error(
         "YouTube transcript was requested but no transcript text was retrieved. " +
         "Click Refresh now and send again."
@@ -1271,17 +1341,18 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
     context = applyRenderedTextFallback(context, fallbackText, "dom-fallback-background");
   }
   context = applyCachedContextFallback(context, cachedPreviewContext, "preview-cache-fallback-background");
+  const pageCaptureBlocked = context?.metadata?.pageCaptureBlocked === true;
 
   const previewPageTextLength = Number(preview.pageTextLength || 0);
   const preparedPageTextLength = getTextLength(context.pageText);
-  if (previewPageTextLength > 900 && preparedPageTextLength + 300 < previewPageTextLength) {
+  if (!pageCaptureBlocked && previewPageTextLength > 900 && preparedPageTextLength + 300 < previewPageTextLength) {
     const fallbackText = await captureRenderedPageTextFallback(tabId);
     context = applyRenderedTextFallback(context, fallbackText, "dom-fallback-send");
     context = applyCachedContextFallback(context, cachedPreviewContext, "preview-cache-fallback-background");
   }
 
   const finalPreparedPageTextLength = getTextLength(context.pageText);
-  if (previewPageTextLength > 900 && finalPreparedPageTextLength + 300 < previewPageTextLength) {
+  if (!pageCaptureBlocked && previewPageTextLength > 900 && finalPreparedPageTextLength + 300 < previewPageTextLength) {
     throw new Error(
       `Prepared ${finalPreparedPageTextLength} chars of page text, but preview showed ${previewPageTextLength}. ` +
       "Refresh page context and send again."
@@ -1292,7 +1363,7 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
   const contextKind = String(context.contentKind || "");
   const selectionLength = (context.selection || "").length;
   const pageTextLength = (context.pageText || "").length;
-  if (contextKind === "x-feed" && pageTextLength < 300 && selectionLength < 300) {
+  if (contextKind === "x-feed" && pageTextLength < 300 && selectionLength < 300 && context?.metadata?.pageCaptureBlocked !== true) {
     throw new Error(
       "Could not capture enough rendered X timeline text yet. " +
       "Scroll briefly to let the feed hydrate, then send again."
@@ -1582,6 +1653,50 @@ async function openVoiceRecorderWindow() {
   });
 }
 
+function estimateDataUrlByteLength(dataUrl) {
+  const value = String(dataUrl || "");
+  const marker = "base64,";
+  const index = value.indexOf(marker);
+  if (index === -1) {
+    return 0;
+  }
+  const base64 = value.slice(index + marker.length);
+  if (!base64) {
+    return 0;
+  }
+  const paddingMatch = base64.match(/=+$/);
+  const paddingLength = paddingMatch ? paddingMatch[0].length : 0;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - paddingLength);
+}
+
+async function captureVisibleTabImage(tabId) {
+  const tab = await getTabSnapshot(tabId);
+  if (!tab?.windowId) {
+    throw new Error("No active browser tab is available for screen capture.");
+  }
+
+  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+    format: "png"
+  });
+  const url = String(tab.url || "").trim();
+  let host = "page";
+  try {
+    host = new URL(url).hostname.replace(/^www\./i, "") || host;
+  } catch (_error) {
+    host = "page";
+  }
+
+  return {
+    data_url: dataUrl,
+    mime_type: "image/png",
+    size_bytes: estimateDataUrlByteLength(dataUrl),
+    name: `${host}-screengrab.png`,
+    tab_id: tab.id || null,
+    tab_title: String(tab.title || "").trim(),
+    tab_url: url
+  };
+}
+
 async function hasOffscreenRecorderDocument() {
   if (!chrome.runtime.getContexts) {
     return false;
@@ -1762,6 +1877,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.type === "hermes:ensure-offscreen-voice-recorder") {
       await ensureOffscreenRecorderDocument();
       sendResponse({ ok: true, result: { ready: true } });
+      return;
+    }
+
+    if (message.type === "hermes:capture-visible-tab") {
+      const result = await captureVisibleTabImage(message.tabId);
+      sendResponse({ ok: true, result });
       return;
     }
 
