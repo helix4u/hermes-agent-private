@@ -759,6 +759,67 @@ class TestRunConversation:
             result = agent.run_conversation("search something")
         mock_compress.assert_called_once()
 
+    def test_length_finish_reason_triggers_compression_retry(self, agent):
+        """Truncated output should compact history and retry the same turn."""
+        self._setup_agent(agent)
+        first = _mock_response(content="Partial answer", finish_reason="length")
+        second = _mock_response(content="Recovered final answer", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}],
+                "compressed system prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_compress.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered final answer"
+
+    def test_length_finish_reason_requests_continuation_when_no_compression_possible(self, agent):
+        """If truncation can't be fixed by compression, preserve partial text and continue."""
+        self._setup_agent(agent)
+        first = _mock_response(content="Partial answer", finish_reason="length")
+        second = _mock_response(content="Finished answer", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}],
+                "same system prompt",
+            )
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Finished answer"
+        assert any(
+            msg.get("role") == "assistant"
+            and msg.get("finish_reason") == "length"
+            and msg.get("content") == "Partial answer"
+            for msg in result["messages"]
+        )
+        assert any(
+            msg.get("role") == "user"
+            and "previous response was truncated by the output limit" in (msg.get("content") or "")
+            for msg in result["messages"]
+        )
+
 
 class TestRetryExhaustion:
     """Regression: retry_count > max_retries was dead code (off-by-one).
