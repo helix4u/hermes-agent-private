@@ -190,6 +190,23 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MODEL = "google/gemini-2.0-flash-001:free"
 
 
+class BrowserBridgeTranscriptUnavailable(Exception):
+    """Raised when a YouTube transcript exists but can't be fetched usefully."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        video_id: str = "",
+        requested_language: str = "",
+        available_languages: Optional[List[str]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.video_id = video_id
+        self.requested_language = requested_language
+        self.available_languages = list(available_languages or [])
+
+
 def _resolve_gateway_model() -> str:
     """
     Resolve the model for gateway agents. Same priority as CLI so gateway and
@@ -2383,6 +2400,75 @@ class GatewayRunner:
 
             return YouTubeTranscriptApi
 
+        def _clean_language(value: str) -> str:
+            return str(value or "").strip().replace("_", "-")
+
+        def _build_language_preferences(requested_language: str, available_codes: List[str]) -> List[str]:
+            requested = _clean_language(requested_language)
+            lowered_available = {_clean_language(code).lower(): _clean_language(code) for code in available_codes if code}
+            preferred: List[str] = []
+
+            def _append(code: str) -> None:
+                cleaned = _clean_language(code)
+                if not cleaned:
+                    return
+                for existing in preferred:
+                    if existing.lower() == cleaned.lower():
+                        return
+                preferred.append(cleaned)
+
+            if requested:
+                base = requested.split("-", 1)[0].lower()
+                if base == "en":
+                    _append("en")
+                    if "en-us" in lowered_available:
+                        _append(lowered_available["en-us"])
+                    elif requested.lower() == "en-us":
+                        _append("en-US")
+                    for code in available_codes:
+                        cleaned = _clean_language(code)
+                        if cleaned.lower().split("-", 1)[0] == "en":
+                            _append(cleaned)
+                    if requested.lower() != "en":
+                        _append(requested)
+                else:
+                    _append(requested)
+                    for code in available_codes:
+                        cleaned = _clean_language(code)
+                        if cleaned.lower() == requested.lower():
+                            _append(cleaned)
+                    base_matches = [
+                        _clean_language(code)
+                        for code in available_codes
+                        if _clean_language(code).lower().split("-", 1)[0] == base
+                    ]
+                    for code in base_matches:
+                        _append(code)
+            else:
+                if "en" in lowered_available:
+                    _append(lowered_available["en"])
+                if "en-us" in lowered_available:
+                    _append(lowered_available["en-us"])
+                for code in available_codes:
+                    cleaned = _clean_language(code)
+                    if cleaned.lower().split("-", 1)[0] == "en":
+                        _append(cleaned)
+                for code in available_codes:
+                    _append(code)
+
+            return preferred
+
+        def _extract_segments(fetched: Any) -> List[str]:
+            segments: List[str] = []
+            for segment in fetched:
+                if isinstance(segment, dict):
+                    text = str(segment.get("text") or "").strip()
+                else:
+                    text = str(getattr(segment, "text", "") or "").strip()
+                if text:
+                    segments.append(text)
+            return segments
+
         try:
             YouTubeTranscriptApi = _load_transcript_api()
         except Exception:
@@ -2392,7 +2478,7 @@ class GatewayRunner:
                 "pip",
                 "install",
                 "--disable-pip-version-check",
-                "youtube-transcript-api",
+                "youtube-transcript-api>=1.2.0",
             ]
             install = subprocess.run(
                 install_cmd,
@@ -2415,36 +2501,58 @@ class GatewayRunner:
                     "youtube-transcript-api install completed but import still failed."
                 ) from exc
 
-        languages = [language.strip()] if language and language.strip() else None
+        requested_language = _clean_language(language)
         api = YouTubeTranscriptApi()
-        kwargs = {"languages": languages} if languages else {}
+        transcript_list = api.list(video_id) if hasattr(api, "list") else None
+        available_codes: List[str] = []
+        if transcript_list is not None:
+            try:
+                available_codes = [
+                    str(getattr(transcript, "language_code", "") or "").strip()
+                    for transcript in list(transcript_list)
+                    if str(getattr(transcript, "language_code", "") or "").strip()
+                ]
+            except Exception:
+                available_codes = []
 
-        if hasattr(api, "fetch"):
-            fetched = api.fetch(video_id, **kwargs)
-            segments = []
-            for segment in fetched:
-                if isinstance(segment, dict):
-                    text = str(segment.get("text") or "").strip()
-                else:
-                    text = str(getattr(segment, "text", "") or "").strip()
-                if text:
-                    segments.append(text)
-        else:
-            raw_segments = (
-                YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
-                if languages
-                else YouTubeTranscriptApi.get_transcript(video_id)
-            )
-            segments = [
-                str(segment.get("text") or "").strip()
-                for segment in raw_segments
-                if isinstance(segment, dict) and str(segment.get("text") or "").strip()
-            ]
+        languages = _build_language_preferences(requested_language, available_codes)
+
+        matched_language = ""
+        try:
+            if transcript_list is not None:
+                lookup_languages = languages or available_codes
+                chosen_transcript = transcript_list.find_transcript(lookup_languages)
+                matched_language = str(getattr(chosen_transcript, "language_code", "") or "").strip()
+                segments = _extract_segments(chosen_transcript.fetch())
+            elif hasattr(api, "fetch"):
+                kwargs = {"languages": languages} if languages else {}
+                fetched = api.fetch(video_id, **kwargs)
+                segments = _extract_segments(fetched)
+            else:
+                raw_segments = (
+                    YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+                    if languages
+                    else YouTubeTranscriptApi.get_transcript(video_id)
+                )
+                segments = [
+                    str(segment.get("text") or "").strip()
+                    for segment in raw_segments
+                    if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+                ]
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            raise BrowserBridgeTranscriptUnavailable(
+                message,
+                video_id=video_id,
+                requested_language=requested_language,
+                available_languages=available_codes,
+            ) from exc
 
         full_text = " ".join(segments).strip()
+        resolved_language = matched_language or (languages[0] if languages else (available_codes[0] if available_codes else requested_language))
         return {
             "video_id": video_id,
-            "language": (languages[0] if languages else ""),
+            "language": resolved_language,
             "segment_count": len(segments),
             "transcript_text": full_text,
             "char_count": len(full_text),
@@ -2646,13 +2754,27 @@ class GatewayRunner:
             if not target:
                 raise ValueError("fetch_transcript requires a YouTube URL or video_id.")
 
-            result = await asyncio.to_thread(
-                self._fetch_bridge_youtube_transcript,
-                target,
-                language,
-            )
+            try:
+                result = await asyncio.to_thread(
+                    self._fetch_bridge_youtube_transcript,
+                    target,
+                    language,
+                )
+            except BrowserBridgeTranscriptUnavailable as exc:
+                return {
+                    "ok": True,
+                    "available": False,
+                    "video_id": exc.video_id or self._extract_youtube_video_id(target),
+                    "language": exc.requested_language,
+                    "transcript_text": "",
+                    "char_count": 0,
+                    "segment_count": 0,
+                    "error": str(exc),
+                    "available_languages": exc.available_languages,
+                }
             return {
                 "ok": True,
+                "available": True,
                 **result,
             }
 
