@@ -3638,6 +3638,7 @@ class AIAgent:
         interrupted = False
         codex_ack_continuations = 0
         final_answer_guard_retries = 0
+        length_recovery_attempts = 0
         
         # Clear any stale interrupt state at start
         self.clear_interrupt()
@@ -3857,38 +3858,84 @@ class AIAgent:
                     else:
                         finish_reason = response.choices[0].finish_reason
                     
-                    # Handle "length" finish_reason - response was truncated
+                    # Handle "length" finish_reason - response was truncated.
+                    # Prefer recovering the turn over rolling it back:
+                    # 1. Compact history and retry the same request.
+                    # 2. If the model emitted partial assistant content, keep it
+                    #    and explicitly ask the model to continue from there.
                     if finish_reason == "length":
                         print(f"{self.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens")
-                        
-                        # If we have prior messages, roll back to last complete state
-                        if len(messages) > 1:
-                            print(f"{self.log_prefix}   ⏪ Rolling back to last complete assistant turn")
-                            rolled_back_messages = self._get_messages_up_to_last_assistant(messages)
-                            
-                            self._cleanup_task_resources(effective_task_id)
-                            self._persist_session(messages, conversation_history)
-                            
-                            return {
-                                "final_response": None,
-                                "messages": rolled_back_messages,
-                                "api_calls": api_call_count,
-                                "completed": False,
-                                "partial": True,
-                                "error": "Response truncated due to output length limit"
+
+                        partial_assistant = None
+                        if self.api_mode == "codex_responses":
+                            partial_assistant, _ = self._normalize_codex_response(response)
+                        elif response.choices and response.choices[0].message:
+                            partial_assistant = response.choices[0].message
+
+                        partial_msg = (
+                            self._build_assistant_message(partial_assistant, finish_reason)
+                            if partial_assistant is not None
+                            else None
+                        )
+                        partial_has_content = bool((partial_msg or {}).get("content", "").strip())
+                        partial_has_tool_calls = bool((partial_msg or {}).get("tool_calls"))
+
+                        if len(messages) > 1 and length_recovery_attempts < 2:
+                            original_len = len(messages)
+                            compressed_messages, compressed_system_prompt = self._compress_context(
+                                messages,
+                                system_message,
+                                approx_tokens=approx_tokens,
+                            )
+
+                            if len(compressed_messages) < original_len:
+                                length_recovery_attempts += 1
+                                messages = compressed_messages
+                                active_system_prompt = compressed_system_prompt
+                                print(
+                                    f"{self.log_prefix}   🗜️  Compressed {original_len} → {len(messages)} messages after truncation; retrying..."
+                                )
+                                continue
+
+                        if partial_has_content and not partial_has_tool_calls and length_recovery_attempts < 3:
+                            length_recovery_attempts += 1
+                            last_msg = messages[-1] if messages else None
+                            duplicate_partial = (
+                                isinstance(last_msg, dict)
+                                and last_msg.get("role") == "assistant"
+                                and last_msg.get("finish_reason") == "length"
+                                and (last_msg.get("content") or "") == (partial_msg.get("content") or "")
+                            )
+                            if not duplicate_partial:
+                                messages.append(partial_msg)
+                                self._log_msg_to_db(partial_msg)
+
+                            continuation_note = {
+                                "role": "user",
+                                "content": (
+                                    "[System: Your previous response was truncated by the output limit. "
+                                    "Continue exactly where you left off and finish the answer. "
+                                    "Do not restart from the beginning, and avoid repeating earlier text "
+                                    "except for a brief overlap if needed.]"
+                                ),
                             }
-                        else:
-                            # First message was truncated - mark as failed
-                            print(f"{self.log_prefix}❌ First response truncated - cannot recover")
-                            self._persist_session(messages, conversation_history)
-                            return {
-                                "final_response": None,
-                                "messages": messages,
-                                "api_calls": api_call_count,
-                                "completed": False,
-                                "failed": True,
-                                "error": "First response truncated due to output length limit"
-                            }
+                            messages.append(continuation_note)
+                            self._log_msg_to_db(continuation_note)
+                            print(f"{self.log_prefix}   ↻ Requesting continuation after truncated output...")
+                            continue
+
+                        print(f"{self.log_prefix}❌ Response truncated and automatic recovery was exhausted")
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": None,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "partial": True,
+                            "error": "Response truncated due to output length limit",
+                        }
+                    else:
+                        length_recovery_attempts = 0
                     
                     # Track actual token usage from response for context management
                     if hasattr(response, 'usage') and response.usage:
@@ -4417,8 +4464,9 @@ class AIAgent:
                     # No tool calls - this is the final response
                     final_response = assistant_message.content or ""
                     
-                    # Retry only when the model returned truly empty content.
-                    if not final_response.strip():
+                    # Retry when the model returned no user-visible content,
+                    # including reasoning-only <think> blocks.
+                    if not self._has_content_after_think_block(final_response):
                         # Track retries for empty-after-think responses
                         if not hasattr(self, '_empty_content_retries'):
                             self._empty_content_retries = 0
