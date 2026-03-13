@@ -55,6 +55,11 @@
           <div class="composer-tools">
             <div class="tool-row tool-row-top">
               <div class="tool-row-actions">
+                <label class="checkbox-row compact-row" title="When enabled, Hermes will keep refreshing this page preview automatically.">
+                  <input id="enable-preview-polling" type="checkbox">
+                  <span>Site polling</span>
+                </label>
+                <button id="refresh-button" class="ghost-button compact-action-button" type="button" title="Refresh the current page preview once right now">Refresh now</button>
                 <button id="attach-button" class="ghost-button compact-action-button" type="button" title="Attach image files, or paste or drop images here">Attach image</button>
                 <button id="challenge-mode-button" class="ghost-button chip-button mode-button" type="button" aria-pressed="false" title="Tell Hermes to challenge your assumptions before answering" hidden>Challenge my framing</button>
                 <button id="interrupt-button" class="interrupt-button compact-action-button" type="button" title="Ask Hermes to stop the current response chain" hidden>Interrupt</button>
@@ -106,7 +111,6 @@
               <span id="page-text-length" class="summary-chip">0 chars page text</span>
               <span id="transcript-status" class="summary-chip">Checking transcript...</span>
             </div>
-            <button id="refresh-button" class="ghost-button compact-action-button" type="button" title="Refresh the current page preview">Refresh now</button>
           </div>
           <p id="page-title" class="page-title">Loading page context...</p>
           <p id="page-url" class="page-url"></p>

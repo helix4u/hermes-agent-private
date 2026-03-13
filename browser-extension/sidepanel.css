@@ -352,9 +352,11 @@ textarea::placeholder {
 .tool-row-actions {
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
   margin-left: auto;
+  max-width: 100%;
 }
 
 .tool-label {
@@ -794,6 +796,7 @@ button:disabled {
   }
 
   .tool-row-actions {
+    justify-content: flex-start;
     width: 100%;
   }
 

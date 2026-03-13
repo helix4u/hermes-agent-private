@@ -6,6 +6,7 @@ const contentKind = document.getElementById("content-kind");
 const selectionLength = document.getElementById("selection-length");
 const pageTextLength = document.getElementById("page-text-length");
 const transcriptStatus = document.getElementById("transcript-status");
+const enablePreviewPolling = document.getElementById("enable-preview-polling");
 const chatMessages = document.getElementById("chat-messages");
 const chatInput = document.getElementById("chat-input");
 const sharePageCheckbox = document.getElementById("share-page");
@@ -72,9 +73,11 @@ let activeAudioMessageKey = "";
 let activeReplyAudio = null;
 let activeReplyAudioUrl = "";
 let pendingAttachments = [];
+let previewPollingEnabled = false;
 let sidebarSettings = {
   showQuickPrompts: false,
   showChallengeMode: false,
+  enablePreviewPolling: false,
   quickPrompts: [],
   challengeModeLabel: "Challenge my framing",
   challengeModePrompt: "",
@@ -704,6 +707,7 @@ function applySidebarSettings(settings, { preserveBusyState = false } = {}) {
   sidebarSettings = {
     showQuickPrompts: nextSettings.showQuickPrompts === true,
     showChallengeMode: nextSettings.showChallengeMode === true,
+    enablePreviewPolling: nextSettings.enablePreviewPolling === true,
     quickPrompts: Array.isArray(nextSettings.quickPrompts) ? nextSettings.quickPrompts : [],
     challengeModeLabel: String(nextSettings.challengeModeLabel || "").trim() || "Challenge my framing",
     challengeModePrompt: String(nextSettings.challengeModePrompt || "").trim(),
@@ -718,8 +722,16 @@ function applySidebarSettings(settings, { preserveBusyState = false } = {}) {
   window.HermesTheme?.applyThemeToDocument(sidebarSettings);
   includeTranscript.checked = nextSettings.includeTranscriptByDefault !== false;
   sharePageByDefault = nextSettings.sharePageByDefault !== false;
+  previewPollingEnabled = sidebarSettings.enablePreviewPolling === true;
+  syncPreviewPollingUi();
   if (!preserveBusyState || !isBusy) {
     sharePageCheckbox.checked = sharePageByDefault;
+  }
+
+  if (previewPollingEnabled) {
+    startPreviewLoop();
+  } else {
+    stopPreviewLoop();
   }
 
   renderPromptControls();
@@ -928,7 +940,7 @@ function schedulePolling() {
 }
 
 function startPreviewLoop() {
-  if (extensionContextInvalidated) {
+  if (extensionContextInvalidated || !previewPollingEnabled) {
     stopPreviewLoop();
     return;
   }
@@ -941,6 +953,42 @@ function startPreviewLoop() {
       setStatus(message, { openActivity: true });
     });
   }, AUTO_REFRESH_MS);
+}
+
+function syncPreviewPollingUi() {
+  if (!enablePreviewPolling) {
+    return;
+  }
+  enablePreviewPolling.checked = previewPollingEnabled;
+  enablePreviewPolling.disabled = extensionContextInvalidated;
+}
+
+async function setPreviewPollingEnabled(enabled, { persist = true, quiet = false } = {}) {
+  previewPollingEnabled = Boolean(enabled);
+  syncPreviewPollingUi();
+
+  if (previewPollingEnabled) {
+    startPreviewLoop();
+    if (!quiet) {
+      setStatus("Site polling enabled. Hermes will keep refreshing the current page preview.", { openActivity: true });
+    }
+  } else {
+    stopPreviewLoop();
+    if (!quiet) {
+      setStatus("Site polling disabled. Use Refresh now when you want a one-shot page update.");
+    }
+  }
+
+  if (!persist) {
+    return;
+  }
+
+  await sendRuntimeMessage({
+    type: "hermes:save-settings",
+    settings: {
+      enablePreviewPolling: previewPollingEnabled
+    }
+  });
 }
 
 async function sendRuntimeMessage(payload) {
@@ -1834,7 +1882,7 @@ async function resetChatSession() {
 }
 
 function scheduleRefresh() {
-  if (extensionContextInvalidated) {
+  if (extensionContextInvalidated || !previewPollingEnabled) {
     return;
   }
   if (refreshDebounceTimer) {
@@ -1855,6 +1903,16 @@ document.getElementById("refresh-button").addEventListener("click", () => {
     .then(() => refreshDomainPermissionStatus({ quiet: true }))
     .catch((error) => setStatus(error.message, { openActivity: true }));
 });
+
+if (enablePreviewPolling) {
+  enablePreviewPolling.addEventListener("change", () => {
+    setPreviewPollingEnabled(enablePreviewPolling.checked).catch((error) => {
+      previewPollingEnabled = !enablePreviewPolling.checked;
+      syncPreviewPollingUi();
+      setStatus(explainBackgroundMismatch(error), { openActivity: true });
+    });
+  });
+}
 
 if (domainPermissionButton) {
   domainPermissionButton.addEventListener("click", async () => {
@@ -2114,6 +2172,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   const watchedKeys = [
     "includeTranscriptByDefault",
     "sharePageByDefault",
+    "enablePreviewPolling",
     "showQuickPrompts",
     "showChallengeMode",
     "quickPrompts",
@@ -2149,6 +2208,7 @@ window.addEventListener("unhandledrejection", (event) => {
 
 renderAttachmentStrip();
 updateComposerAvailability();
+syncPreviewPollingUi();
 
 (async () => {
   const startupWarnings = [];
@@ -2207,5 +2267,4 @@ updateComposerAvailability();
   }
 
   setChallengeModeEnabled(false);
-  startPreviewLoop();
 })();

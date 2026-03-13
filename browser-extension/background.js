@@ -148,6 +148,7 @@ function normalizeStoredSettings(settings) {
     bridgeToken: String(next.bridgeToken || "").trim(),
     includeTranscriptByDefault: next.includeTranscriptByDefault !== false,
     sharePageByDefault: next.sharePageByDefault !== false,
+    enablePreviewPolling: next.enablePreviewPolling === true,
     showQuickPrompts: next.showQuickPrompts === true,
     showChallengeMode: next.showChallengeMode === true,
     quickPrompts: normalizeQuickPrompts(next.quickPrompts),
@@ -176,6 +177,9 @@ function buildSettingsPatch(settings) {
   }
   if (Object.prototype.hasOwnProperty.call(settings, "sharePageByDefault")) {
     patch.sharePageByDefault = settings.sharePageByDefault !== false;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "enablePreviewPolling")) {
+    patch.enablePreviewPolling = settings.enablePreviewPolling === true;
   }
   if (Object.prototype.hasOwnProperty.call(settings, "showQuickPrompts")) {
     patch.showQuickPrompts = settings.showQuickPrompts === true;
@@ -643,6 +647,7 @@ async function getSettings() {
     bridgeToken: "",
     includeTranscriptByDefault: true,
     sharePageByDefault: true,
+    enablePreviewPolling: false,
     showQuickPrompts: false,
     showChallengeMode: false,
     quickPrompts: createDefaultQuickPrompts(),
