@@ -35,6 +35,7 @@ ENABLED_ENV_VAR = "HERMES_BROWSER_BRIDGE_ENABLED"
 TOKEN_FILE = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "browser_bridge_token"
 DEFAULT_BROWSER_LABEL = "Chrome Extension"
 PDF_TEXT_CACHE: dict[str, str] = {}
+PDF_BYTES_CACHE: dict[str, bytes] = {}
 
 
 @dataclass
@@ -351,7 +352,10 @@ def fetch_pdf_text(pdf_url: str, *, max_chars: int = 24000) -> str:
         except Exception:
             return ""
 
-    try:
+    def _fetch_pdf_bytes() -> bytes:
+        cached_bytes = PDF_BYTES_CACHE.get(normalized_url)
+        if cached_bytes:
+            return cached_bytes
         request = Request(
             normalized_url,
             headers={
@@ -363,6 +367,13 @@ def fetch_pdf_text(pdf_url: str, *, max_chars: int = 24000) -> str:
             content_type = str(response.headers.get("Content-Type") or "").lower()
             payload_bytes = response.read(12 * 1024 * 1024)
         if "pdf" not in content_type and not payload_bytes.startswith(b"%PDF"):
+            return b""
+        PDF_BYTES_CACHE[normalized_url] = payload_bytes
+        return payload_bytes
+
+    try:
+        payload_bytes = _fetch_pdf_bytes()
+        if not payload_bytes:
             return ""
         text = _extract_pdf_text_from_bytes(payload_bytes)
         if text:
@@ -371,6 +382,46 @@ def fetch_pdf_text(pdf_url: str, *, max_chars: int = 24000) -> str:
     except Exception as exc:
         logger.debug("Failed to fetch or parse PDF %s: %s", normalized_url, exc)
         return ""
+
+
+def fetch_pdf_page_images(pdf_url: str, *, max_pages: int = 2, dpi: int = 144) -> list[bytes]:
+    """Fetch a remote PDF URL and render a few page previews as PNG bytes."""
+    normalized_url = str(pdf_url or "").strip()
+    if not normalized_url or normalized_url.startswith("blob:"):
+        return []
+
+    try:
+        cached_bytes = PDF_BYTES_CACHE.get(normalized_url)
+        if cached_bytes:
+            payload_bytes = cached_bytes
+        else:
+            request = Request(
+                normalized_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 HermesBrowserBridge/1.0",
+                    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
+                },
+            )
+            with urlopen(request, timeout=20) as response:
+                content_type = str(response.headers.get("Content-Type") or "").lower()
+                payload_bytes = response.read(12 * 1024 * 1024)
+            if "pdf" not in content_type and not payload_bytes.startswith(b"%PDF"):
+                return []
+            PDF_BYTES_CACHE[normalized_url] = payload_bytes
+
+        import fitz  # type: ignore
+
+        doc = fitz.open(stream=payload_bytes, filetype="pdf")
+        scale = max(1.0, float(dpi) / 72.0)
+        matrix = fitz.Matrix(scale, scale)
+        images: list[bytes] = []
+        for page_index in range(min(len(doc), max_pages)):
+            pix = doc.load_page(page_index).get_pixmap(matrix=matrix, alpha=False)
+            images.append(pix.tobytes("png"))
+        return images
+    except Exception as exc:
+        logger.debug("Failed to render PDF page images for %s: %s", normalized_url, exc)
+        return []
 
 
 def build_browser_context_message(payload: dict[str, Any]) -> str:

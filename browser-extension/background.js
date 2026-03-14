@@ -301,14 +301,63 @@ function applySelectionFallback(context, sourceLabel = "selection-fallback-backg
   return context;
 }
 
+function isLikelyPdfNoiseText(text) {
+  const value = String(text || "").trim();
+  if (!value) {
+    return false;
+  }
+  const lowered = value.toLowerCase();
+  const noiseSignals = [
+    ".mwd-content-iframe",
+    ".mwd-review-iframe",
+    "@keyframes",
+    "position: fixed",
+    "border-radius:",
+    "z-index:",
+    "opacity:",
+    "visibility: hidden",
+    "min-height:",
+    "max-width:",
+    "pointer-events:",
+    "transform:",
+    "background-color:",
+    "iframe {",
+    "html, body, iframe",
+    "sandbox=",
+    "allow-popups",
+    "allow-downloads"
+  ];
+  const noiseHits = noiseSignals.filter((token) => lowered.includes(token)).length;
+  if (noiseHits >= 2) {
+    return true;
+  }
+  const lineCount = value.split(/\r?\n/).length;
+  const cssishLines = value
+    .split(/\r?\n/)
+    .filter((line) => /[:;{}]/.test(line) && !/[.!?]\s*$/.test(line.trim()))
+    .length;
+  if (lineCount >= 4 && cssishLines >= Math.max(3, Math.floor(lineCount * 0.5))) {
+    return true;
+  }
+  return false;
+}
+
 function applyRenderedTextFallback(context, fallbackText, sourceLabel = "dom-fallback-background") {
   const currentLength = getTextLength(context?.pageText);
-  const fallbackLength = getTextLength(fallbackText);
+  const fallbackValue = String(fallbackText || "");
+  const fallbackLength = getTextLength(fallbackValue);
+  const contentKind = String(context?.contentKind || "").trim();
+  if (
+    (contentKind === "pdf-document" || contentKind === "pdf-embed") &&
+    isLikelyPdfNoiseText(fallbackValue)
+  ) {
+    return context;
+  }
   if (fallbackLength > currentLength) {
     return withPageTextSource(
       {
         ...context,
-        pageText: String(fallbackText || "")
+        pageText: fallbackValue
       },
       sourceLabel
     );
@@ -431,6 +480,10 @@ function buildContextBundlePreview(context, transcriptAlreadyShared = false) {
   const transcriptReady = transcriptLength > 0;
   const transcriptChunkAvailable = transcriptReady || transcriptAlreadyShared;
   const metadataPreview = summarizeMetadataPreview(context);
+  const contentKind = String(context?.contentKind || "").trim();
+  const pdfPreviewImageCount = Math.max(0, Number(context?.metadata?.pdfPreviewImageCount || 0));
+  const pdfImagesAvailable =
+    pdfPreviewImageCount > 0 || contentKind === "pdf-document" || contentKind === "pdf-embed";
   return {
     chunks: {
       title: {
@@ -477,6 +530,22 @@ function buildContextBundlePreview(context, transcriptAlreadyShared = false) {
         length: getTextLength(context?.pageText),
         preview: clampPreviewText(context?.pageText, 220),
         reason: "Gives Hermes the surrounding page context beyond the exact selection."
+      },
+      pdfImages: {
+        key: "pdfImages",
+        label: "PDF page images",
+        available: pdfImagesAvailable,
+        includedByDefault: pdfImagesAvailable,
+        length: pdfPreviewImageCount,
+        metricText: pdfPreviewImageCount > 0
+          ? `${pdfPreviewImageCount} image${pdfPreviewImageCount === 1 ? "" : "s"}`
+          : "Auto",
+        preview: pdfPreviewImageCount > 0
+          ? `Rendered preview images from the first ${pdfPreviewImageCount} PDF page${pdfPreviewImageCount === 1 ? "" : "s"} will be attached automatically.`
+          : pdfImagesAvailable
+            ? "Hermes will try to attach rendered PDF page images automatically for this document."
+            : "",
+        reason: "Useful when the PDF contains diagrams, charts, scanned pages, or other visual content."
       },
       transcript: {
         key: "transcript",
@@ -1142,6 +1211,35 @@ async function fetchPdfTextViaBridge(context, urlHint = "") {
   }
 }
 
+async function fetchPdfPreviewInfoViaBridge(context, urlHint = "") {
+  const targetUrl = String(
+    context?.metadata?.pdfUrl ||
+    context?.metadata?.embeddedPdfUrl ||
+    context?.url ||
+    urlHint ||
+    ""
+  ).trim();
+  if (!targetUrl || /^blob:/i.test(targetUrl)) {
+    return { imageCount: 0 };
+  }
+
+  try {
+    const token = await getBridgeToken();
+    const response = await callBridge("/session", {
+      token,
+      body: {
+        action: "fetch_pdf_preview_info",
+        url: targetUrl
+      }
+    });
+    return {
+      imageCount: Math.max(0, Number(response?.image_count || 0))
+    };
+  } catch (_error) {
+    return { imageCount: 0 };
+  }
+}
+
 async function ensurePreviewPdfText(tabId, context, urlHint = "") {
   const contentKind = String(context?.contentKind || "").trim();
   if (contentKind !== "pdf-document" && contentKind !== "pdf-embed") {
@@ -1152,6 +1250,7 @@ async function ensurePreviewPdfText(tabId, context, urlHint = "") {
   const pageTextSource = String(context?.metadata?.pageTextSource || "").trim();
   const looksLikeFallbackNoise =
     !pageText ||
+    isLikelyPdfNoiseText(pageText) ||
     pageText.startsWith("Direct PDF document detected.") ||
     pageText.startsWith("Embedded PDF detected.") ||
     pageTextSource.includes("pdf-url-fallback") ||
@@ -1163,6 +1262,19 @@ async function ensurePreviewPdfText(tabId, context, urlHint = "") {
 
   const extractedPdfText = await fetchPdfTextViaBridge(context, urlHint);
   if (!extractedPdfText) {
+    if (isLikelyPdfNoiseText(pageText)) {
+      return applyPdfUrlFallback(
+        {
+          ...context,
+          pageText: "",
+          metadata: {
+            ...(context?.metadata || {}),
+            pageTextSource: ""
+          }
+        },
+        urlHint || context?.url || ""
+      );
+    }
     return context;
   }
 
@@ -1172,6 +1284,35 @@ async function ensurePreviewPdfText(tabId, context, urlHint = "") {
     metadata: {
       ...(context?.metadata || {}),
       pageTextSource: "pdf-direct-extract"
+    }
+  };
+}
+
+async function ensurePreviewPdfAssets(tabId, context, urlHint = "") {
+  let nextContext = context;
+  nextContext = await ensurePreviewPdfText(tabId, nextContext, urlHint);
+
+  const contentKind = String(nextContext?.contentKind || "").trim();
+  if (contentKind !== "pdf-document" && contentKind !== "pdf-embed") {
+    return nextContext;
+  }
+
+  const metadata = nextContext?.metadata || {};
+  const existingCount = Math.max(0, Number(metadata.pdfPreviewImageCount || 0));
+  if (existingCount > 0) {
+    return nextContext;
+  }
+
+  const previewInfo = await fetchPdfPreviewInfoViaBridge(nextContext, urlHint);
+  if (!previewInfo.imageCount) {
+    return nextContext;
+  }
+
+  return {
+    ...nextContext,
+    metadata: {
+      ...metadata,
+      pdfPreviewImageCount: previewInfo.imageCount
     }
   };
 }
@@ -1494,7 +1635,7 @@ async function previewPageContext(tabId) {
       };
     }
   }
-  context = await ensurePreviewPdfText(tabId, context, tabUrl);
+  context = await ensurePreviewPdfAssets(tabId, context, tabUrl);
   context = await ensurePreviewTranscriptText(tabId, context, onYouTubeWatch, tabUrl);
   if ((context.pageText || "").length < 300) {
     const retried = await collectPageContext(tabId, wantTranscriptForPreview, true);
@@ -1525,6 +1666,7 @@ async function previewPageContext(tabId) {
     contentKind: context.contentKind || "",
     selectionLength: (context.selection || "").length,
     pageTextLength: (context.pageText || "").length,
+    pdfPreviewImageCount: Math.max(0, Number(context?.metadata?.pdfPreviewImageCount || 0)),
     transcriptAvailable: transcriptReady,
     transcriptAlreadyShared,
     transcriptLanguage: transcript.language || "",
@@ -1570,7 +1712,7 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
       };
     }
   }
-  context = await ensurePreviewPdfText(tabId, context, tabUrl || preview.url || "");
+  context = await ensurePreviewPdfAssets(tabId, context, tabUrl || preview.url || "");
   if (shouldIncludeTranscript && onYouTubeWatch) {
     context = await ensurePreviewTranscriptText(tabId, context, true, tabUrl || preview.url || "");
     if (!String(context?.transcript?.text || "").trim() && context?.metadata?.pageCaptureBlocked !== true) {

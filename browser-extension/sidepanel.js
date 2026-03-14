@@ -5,6 +5,7 @@ const pageUrl = document.getElementById("page-url");
 const contentKind = document.getElementById("content-kind");
 const selectionLength = document.getElementById("selection-length");
 const pageTextLength = document.getElementById("page-text-length");
+const pdfImageStatus = document.getElementById("pdf-image-status");
 const transcriptStatus = document.getElementById("transcript-status");
 const enablePreviewPolling = document.getElementById("enable-preview-polling");
 const chatMessages = document.getElementById("chat-messages");
@@ -529,10 +530,36 @@ function listEnabledBundleChunks() {
   if (chunks.pageText?.available && state.includePageText) {
     enabled.push(chunks.pageText.label || "Page text");
   }
+  if (chunks.pdfImages?.available) {
+    enabled.push(chunks.pdfImages.label || "PDF page images");
+  }
   if (chunks.transcript?.available && includeTranscript.checked && !includeTranscript.disabled) {
     enabled.push(chunks.transcript.label || "YouTube transcript");
   }
   return enabled;
+}
+
+function renderPdfImageStatus(result) {
+  if (!pdfImageStatus) {
+    return;
+  }
+  const contentKindValue = String(result?.contentKind || "").trim();
+  const imageCount = Math.max(
+    0,
+    Number(result?.pdfPreviewImageCount || result?.bundle?.chunks?.pdfImages?.length || 0)
+  );
+  if (imageCount > 0) {
+    pdfImageStatus.hidden = false;
+    pdfImageStatus.textContent = `${imageCount} PDF image${imageCount === 1 ? "" : "s"}`;
+    return;
+  }
+  if (contentKindValue === "pdf-document" || contentKindValue === "pdf-embed") {
+    pdfImageStatus.hidden = false;
+    pdfImageStatus.textContent = "PDF images auto";
+    return;
+  }
+  pdfImageStatus.hidden = true;
+  pdfImageStatus.textContent = "0 PDF images";
 }
 
 function applyPresetTemplate(template) {
@@ -924,6 +951,7 @@ function renderContextBundle() {
     { chunkKey: "metadata", stateKey: "includeMetadata" },
     { chunkKey: "selection", stateKey: "includeSelection" },
     { chunkKey: "pageText", stateKey: "includePageText" },
+    { chunkKey: "pdfImages", stateKey: null },
     { chunkKey: "transcript", stateKey: null }
   ];
 
@@ -949,6 +977,9 @@ function renderContextBundle() {
         includeTranscript.checked = toggle.checked;
         renderContextBundle();
       });
+    } else if (row.stateKey === null) {
+      checked = true;
+      disabled = true;
     } else {
       checked = bundleSelectionState?.[row.stateKey] !== false;
       toggle.addEventListener("change", () => {
@@ -977,7 +1008,7 @@ function renderContextBundle() {
 
     const metric = document.createElement("span");
     metric.className = "bundle-metric";
-    metric.textContent = formatCharCount(chunk.length || 0);
+    metric.textContent = chunk.metricText || formatCharCount(chunk.length || 0);
     top.appendChild(metric);
     body.appendChild(top);
 
@@ -1632,6 +1663,7 @@ function renderPreview(result) {
   contentKind.textContent = result.contentKind || "web-page";
   selectionLength.textContent = `${result.selectionLength || 0} chars selected`;
   pageTextLength.textContent = `${result.pageTextLength || 0} chars page text`;
+  renderPdfImageStatus(result);
 
   if (result.contentKind === "restricted-page") {
     pageContextUnavailable = true;
@@ -1684,6 +1716,7 @@ function renderUnavailablePreview(message) {
   contentKind.textContent = "unavailable";
   selectionLength.textContent = "0 chars selected";
   pageTextLength.textContent = "0 chars page text";
+  renderPdfImageStatus(null);
   transcriptStatus.textContent = "No transcript";
   sharePageCheckbox.checked = false;
   sharePageCheckbox.disabled = true;

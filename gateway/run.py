@@ -180,6 +180,7 @@ from gateway.browser_bridge import (
     build_bridge_chat_id,
     build_browser_chat_message,
     build_browser_context_message,
+    fetch_pdf_page_images,
     fetch_pdf_text,
     get_bridge_session_key,
     normalize_payload,
@@ -2253,6 +2254,40 @@ class GatewayRunner:
 
         return media_urls, media_types
 
+    def _build_browser_bridge_pdf_preview_attachments(
+        self,
+        page_payload: Optional[Dict[str, Any]],
+    ) -> Tuple[List[str], List[str]]:
+        payload = page_payload if isinstance(page_payload, dict) else {}
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        content_kind = str(payload.get("content_kind") or payload.get("contentKind") or "").strip().lower()
+        pdf_url = str(
+            metadata.get("pdfUrl") or
+            metadata.get("embeddedPdfUrl") or
+            payload.get("url") or
+            ""
+        ).strip()
+        if content_kind not in {"pdf-document", "pdf-embed"} or not pdf_url or pdf_url.startswith("blob:"):
+            return [], []
+
+        try:
+            image_bytes_list = fetch_pdf_page_images(pdf_url)
+        except Exception as exc:
+            logger.warning("Failed to build PDF preview attachments for %s: %s", pdf_url, exc)
+            return [], []
+
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        for image_bytes in image_bytes_list:
+            try:
+                cached_path = cache_image_from_bytes(image_bytes, ext=".png")
+            except Exception as exc:
+                logger.warning("Failed to cache PDF preview image for %s: %s", pdf_url, exc)
+                continue
+            media_urls.append(cached_path)
+            media_types.append("image/png")
+        return media_urls, media_types
+
     def _get_browser_bridge_runtime_config(self) -> Optional[BrowserBridgeConfig]:
         bridge = self._browser_bridge
         if bridge and getattr(bridge, "config", None):
@@ -2792,6 +2827,18 @@ class GatewayRunner:
                 "url": target,
             }
 
+        if action == "fetch_pdf_preview_info":
+            target = str(payload.get("url") or payload.get("pdf_url") or "").strip()
+            if not target:
+                raise ValueError("fetch_pdf_preview_info requires a PDF URL.")
+            image_bytes_list = await asyncio.to_thread(fetch_pdf_page_images, target)
+            return {
+                "ok": True,
+                "available": bool(image_bytes_list),
+                "image_count": len(image_bytes_list),
+                "url": target,
+            }
+
         if action == "list":
             raw_limit = payload.get("limit", 20)
             try:
@@ -3071,6 +3118,10 @@ class GatewayRunner:
             normalized_page_payload = normalize_payload(page_payload)
 
         attachment_media_urls, attachment_media_types = self._extract_browser_bridge_image_attachments(payload)
+        pdf_media_urls, pdf_media_types = self._build_browser_bridge_pdf_preview_attachments(normalized_page_payload)
+        if pdf_media_urls:
+            attachment_media_urls.extend(pdf_media_urls)
+            attachment_media_types.extend(pdf_media_types)
         raw_message = str(payload.get("message") or payload.get("text") or "")
         stripped_message = raw_message.strip()
         if stripped_message.startswith("/"):
