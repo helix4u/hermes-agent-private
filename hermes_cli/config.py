@@ -99,7 +99,7 @@ DEFAULT_CONFIG = {
     
     # Text-to-speech configuration
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai"
+        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "f5"
         "edge": {
             "voice": "en-US-AvaMultilingualNeural",
             "rate": "125%",
@@ -113,6 +113,12 @@ DEFAULT_CONFIG = {
             "model": "gpt-4o-mini-tts",
             "voice": "alloy",
             # Voices: alloy, echo, fable, onyx, nova, shimmer
+        },
+        "f5": {
+            "base_url": "http://localhost:8081",
+            "voice_profile": "",
+            "token_ttl_minutes": 30,
+            "request_timeout_seconds": 300,
         },
     },
     
@@ -149,7 +155,7 @@ DEFAULT_CONFIG = {
     "command_allowlist": [],
     
     # Config schema version - bump this when adding new required fields
-    "_config_version": 5,
+    "_config_version": 6,
 }
 
 # =============================================================================
@@ -229,6 +235,14 @@ OPTIONAL_ENV_VARS = {
         "prompt": "OpenAI API Key (for Whisper STT + TTS)",
         "url": "https://platform.openai.com/api-keys",
         "tools": ["voice_transcription", "openai_tts"],
+        "password": True,
+        "category": "tool",
+    },
+    "F5TTS_SECRET_KEY": {
+        "description": "Secret key used to mint JWTs for a local F5TTS-FASTAPI service",
+        "prompt": "F5 TTS secret key",
+        "url": None,
+        "tools": ["f5_tts"],
         "password": True,
         "category": "tool",
     },
@@ -384,6 +398,9 @@ def _is_optional_env_var_enabled(var_name: str, config: Optional[Dict[str, Any]]
 
     if var_name == "VOICE_TOOLS_OPENAI_KEY":
         return tts_provider == "openai"
+
+    if var_name == "F5TTS_SECRET_KEY":
+        return tts_provider == "f5"
 
     # Other optional integrations are opt-in via setup checklists; they should
     # not block setup completion when unset.
@@ -765,6 +782,7 @@ def show_config():
         ("OPENROUTER_API_KEY", "OpenRouter"),
         ("ANTHROPIC_API_KEY", "Anthropic"),
         ("VOICE_TOOLS_OPENAI_KEY", "OpenAI (STT/TTS)"),
+        ("F5TTS_SECRET_KEY", "F5 TTS"),
         ("FIRECRAWL_API_KEY", "Firecrawl"),
         ("BROWSERBASE_API_KEY", "Browserbase"),
         ("FAL_KEY", "FAL"),
@@ -871,7 +889,7 @@ def set_config_value(key: str, value: str):
     # Check if it's an API key (goes to .env)
     api_keys = [
         'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
-        'FIRECRAWL_API_KEY', 'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID',
+        'F5TTS_SECRET_KEY', 'FIRECRAWL_API_KEY', 'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
         'SUDO_PASSWORD', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',

@@ -25,11 +25,17 @@ import datetime
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import wave
 from pathlib import Path
 from typing import Dict, Any, Optional
+from urllib.parse import urljoin
+
+import jwt
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +72,11 @@ DEFAULT_ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
 DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
 DEFAULT_OPENAI_VOICE = "alloy"
+DEFAULT_F5_BASE_URL = "http://localhost:8081"
+DEFAULT_F5_TOKEN_TTL_MINUTES = 30
+DEFAULT_F5_HEALTH_TIMEOUT = 10
+DEFAULT_F5_REQUEST_TIMEOUT = 300
+DEFAULT_F5_MAX_TEXT_LENGTH = 1000
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/.hermes/audio_cache")
 MAX_TEXT_LENGTH = 4000
 
@@ -101,12 +112,12 @@ def _has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def _convert_to_opus(mp3_path: str) -> Optional[str]:
+def _convert_to_opus(audio_path: str) -> Optional[str]:
     """
-    Convert an MP3 file to OGG Opus format for Telegram voice bubbles.
+    Convert an audio file to OGG Opus format for Telegram voice bubbles.
 
     Args:
-        mp3_path: Path to the input MP3 file.
+        audio_path: Path to the input audio file.
 
     Returns:
         Path to the .ogg file, or None if conversion fails.
@@ -114,10 +125,10 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
     if not _has_ffmpeg():
         return None
 
-    ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
+    ogg_path = audio_path.rsplit(".", 1)[0] + ".ogg"
     try:
         subprocess.run(
-            ["ffmpeg", "-i", mp3_path, "-acodec", "libopus",
+            ["ffmpeg", "-i", audio_path, "-acodec", "libopus",
              "-ac", "1", "-b:a", "64k", "-vbr", "off", ogg_path, "-y"],
             capture_output=True, timeout=30,
         )
@@ -126,6 +137,132 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
     except Exception as e:
         logger.warning("ffmpeg OGG conversion failed: %s", e)
     return None
+
+
+def _normalize_base_url(base_url: str) -> str:
+    """Normalize a configured API base URL."""
+    value = (base_url or DEFAULT_F5_BASE_URL).strip()
+    return value.rstrip("/")
+
+
+def _build_f5_bearer_token(secret_key: str, ttl_minutes: int) -> str:
+    """Create a short-lived bearer token for the F5 FastAPI service."""
+    now = datetime.datetime.utcnow()
+    payload = {
+        "sub": "hermes-agent",
+        "iat": now,
+        "exp": now + datetime.timedelta(minutes=max(1, ttl_minutes)),
+        "scope": "tts",
+    }
+    token = jwt.encode(payload, secret_key, algorithm="HS256")
+    if isinstance(token, bytes):
+        return token.decode("utf-8", errors="replace")
+    return token
+
+
+def _split_long_token(token: str, max_length: int) -> list[str]:
+    """Split a single oversized token into max-length chunks."""
+    return [token[i:i + max_length] for i in range(0, len(token), max_length)]
+
+
+def _chunk_text_for_f5(text: str, max_length: int = DEFAULT_F5_MAX_TEXT_LENGTH) -> list[str]:
+    """
+    Split text into sentence-aware chunks that fit the F5 API limit.
+
+    Falls back to whitespace or hard splits when a sentence/token alone exceeds
+    the limit. Empty chunks are never returned.
+    """
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+    if len(normalized) <= max_length:
+        return [normalized]
+
+    sentence_parts = re.split(r"(?<=[.!?])\s+", normalized)
+    chunks: list[str] = []
+    current = ""
+
+    def flush_current() -> None:
+        nonlocal current
+        value = current.strip()
+        if value:
+            chunks.append(value)
+        current = ""
+
+    for sentence in sentence_parts:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        if len(sentence) > max_length:
+            flush_current()
+            words = sentence.split(" ")
+            word_chunk = ""
+            for word in words:
+                if not word:
+                    continue
+                if len(word) > max_length:
+                    if word_chunk:
+                        chunks.append(word_chunk)
+                        word_chunk = ""
+                    chunks.extend(_split_long_token(word, max_length))
+                    continue
+
+                candidate = f"{word_chunk} {word}".strip()
+                if len(candidate) <= max_length:
+                    word_chunk = candidate
+                else:
+                    if word_chunk:
+                        chunks.append(word_chunk)
+                    word_chunk = word
+            if word_chunk:
+                chunks.append(word_chunk)
+            continue
+
+        candidate = f"{current} {sentence}".strip()
+        if len(candidate) <= max_length:
+            current = candidate
+        else:
+            flush_current()
+            current = sentence
+
+    flush_current()
+    return chunks
+
+
+def _concatenate_wav_files(input_paths: list[str], output_path: str) -> str:
+    """
+    Concatenate PCM WAV files with matching parameters into one WAV file.
+    """
+    if not input_paths:
+        raise ValueError("No WAV inputs were provided for concatenation")
+
+    reference_params = None
+    frames: list[bytes] = []
+
+    for path in input_paths:
+        with wave.open(path, "rb") as wav_file:
+            params = wav_file.getparams()
+            if reference_params is None:
+                reference_params = params
+            elif (
+                params.nchannels != reference_params.nchannels
+                or params.sampwidth != reference_params.sampwidth
+                or params.framerate != reference_params.framerate
+                or params.comptype != reference_params.comptype
+            ):
+                raise ValueError("F5 chunk WAV parameters did not match for concatenation")
+            frames.append(wav_file.readframes(wav_file.getnframes()))
+
+    with wave.open(output_path, "wb") as out_file:
+        out_file.setnchannels(reference_params.nchannels)
+        out_file.setsampwidth(reference_params.sampwidth)
+        out_file.setframerate(reference_params.framerate)
+        out_file.setcomptype(reference_params.comptype, reference_params.compname)
+        for frame_chunk in frames:
+            out_file.writeframes(frame_chunk)
+
+    return output_path
 
 
 # ===========================================================================
@@ -246,6 +383,91 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     return output_path
 
 
+def _generate_f5_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """
+    Generate audio using a locally hosted F5 TTS FastAPI service.
+
+    The FastAPI service returns WAV bytes; Hermes saves them directly and
+    optionally converts them to OGG Opus for Telegram voice bubbles.
+    """
+    f5_config = tts_config.get("f5", {})
+    base_url = _normalize_base_url(f5_config.get("base_url", DEFAULT_F5_BASE_URL))
+    voice_profile = str(f5_config.get("voice_profile", "")).strip()
+    token_ttl_minutes = int(f5_config.get("token_ttl_minutes", DEFAULT_F5_TOKEN_TTL_MINUTES))
+    request_timeout = int(f5_config.get("request_timeout_seconds", DEFAULT_F5_REQUEST_TIMEOUT))
+
+    if not voice_profile:
+        raise ValueError(
+            "F5 TTS provider selected but no voice profile is configured. "
+            "Set tts.f5.voice_profile in ~/.hermes/config.yaml."
+        )
+
+    secret_key = os.getenv("F5TTS_SECRET_KEY", "").strip()
+    if not secret_key:
+        raise ValueError(
+            "F5 TTS provider selected but F5TTS_SECRET_KEY is not set. "
+            "Use the same SECRET_KEY as the F5TTS-FASTAPI container."
+        )
+
+    token = _build_f5_bearer_token(secret_key, token_ttl_minutes)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    health_url = urljoin(f"{base_url}/", "health")
+    voices_url = urljoin(f"{base_url}/", "api/v1/voices/list")
+    synth_url = urljoin(f"{base_url}/", "api/v1/tts/synthesize")
+
+    health_response = requests.get(health_url, timeout=DEFAULT_F5_HEALTH_TIMEOUT)
+    health_response.raise_for_status()
+
+    voices_response = requests.get(voices_url, headers=headers, timeout=DEFAULT_F5_HEALTH_TIMEOUT)
+    voices_response.raise_for_status()
+    voices_payload = voices_response.json()
+    profiles = voices_payload.get("profiles", [])
+    if voice_profile not in profiles:
+        available = ", ".join(sorted(str(p) for p in profiles)) or "(none found)"
+        raise ValueError(
+            f"Configured F5 voice profile '{voice_profile}' was not found. "
+            f"Available profiles: {available}"
+        )
+
+    text_chunks = _chunk_text_for_f5(text, DEFAULT_F5_MAX_TEXT_LENGTH)
+    if not text_chunks:
+        raise ValueError("F5 TTS received empty text after normalization")
+
+    if len(text_chunks) > 1:
+        logger.info("F5 TTS splitting long input into %d chunks", len(text_chunks))
+
+    chunk_paths: list[str] = []
+    try:
+        for index, chunk in enumerate(text_chunks, start=1):
+            synth_response = requests.post(
+                synth_url,
+                headers=headers,
+                json={"text": chunk, "voice_profile": voice_profile},
+                timeout=request_timeout,
+            )
+            synth_response.raise_for_status()
+
+            if len(text_chunks) == 1:
+                with open(output_path, "wb") as f:
+                    f.write(synth_response.content)
+                return output_path
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".chunk{index:03d}.wav") as temp_file:
+                temp_file.write(synth_response.content)
+                chunk_paths.append(temp_file.name)
+
+        _concatenate_wav_files(chunk_paths, output_path)
+    finally:
+        for path in chunk_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    return output_path
+
+
 # ===========================================================================
 # Main tool function
 # ===========================================================================
@@ -308,9 +530,11 @@ def text_to_speech_tool(
         out_dir = Path(DEFAULT_OUTPUT_DIR)
         out_dir.mkdir(parents=True, exist_ok=True)
         # Use .ogg for Telegram with providers that support native Opus output,
-        # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
+        # .wav for F5's native response, otherwise fall back to .mp3.
         if want_opus and provider in ("openai", "elevenlabs"):
             file_path = out_dir / f"tts_{timestamp}.ogg"
+        elif provider == "f5":
+            file_path = out_dir / f"tts_{timestamp}.wav"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
 
@@ -337,6 +561,10 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with OpenAI TTS...")
             _generate_openai_tts(text, file_str, tts_config)
+
+        elif provider == "f5":
+            logger.info("Generating speech with local F5 TTS...")
+            _generate_f5_tts(text, file_str, tts_config)
 
         else:
             # Default: Edge TTS (free)
@@ -366,7 +594,7 @@ def text_to_speech_tool(
 
         # Try Opus conversion for Telegram compatibility (Edge TTS only outputs MP3)
         voice_compatible = False
-        if provider == "edge" and file_str.endswith(".mp3"):
+        if provider in ("edge", "f5") and want_opus:
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
@@ -411,6 +639,8 @@ def check_tts_requirements() -> bool:
         bool: True if at least one provider can work.
     """
     if _HAS_EDGE_TTS:
+        return True
+    if os.getenv("F5TTS_SECRET_KEY"):
         return True
     if _HAS_ELEVENLABS and os.getenv("ELEVENLABS_API_KEY"):
         return True

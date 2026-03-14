@@ -10,11 +10,12 @@ Hermes Agent supports both text-to-speech output and voice message transcription
 
 ## Text-to-Speech
 
-Convert text to speech with three providers:
+Convert text to speech with four providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
 | **Edge TTS** (default) | Good | Free | None needed |
+| **Local F5 FastAPI** | High, voice-cloned | Local GPU | `F5TTS_SECRET_KEY` |
 | **ElevenLabs** | Excellent | Paid | `ELEVENLABS_API_KEY` |
 | **OpenAI TTS** | Good | Paid | `VOICE_TOOLS_OPENAI_KEY` |
 
@@ -23,16 +24,16 @@ Convert text to speech with three providers:
 | Platform | Delivery | Format |
 |----------|----------|--------|
 | Telegram | Voice bubble (plays inline) | Opus `.ogg` |
-| Discord | Audio file attachment | MP3 |
-| WhatsApp | Audio file attachment | MP3 |
-| CLI | Saved to `~/.hermes/audio_cache/` | MP3 |
+| Discord | Audio file attachment | MP3 or WAV |
+| WhatsApp | Audio file attachment | MP3 or WAV |
+| CLI | Saved to `~/.hermes/audio_cache/` | MP3 or WAV |
 
 ### Configuration
 
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "f5"
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
   elevenlabs:
@@ -41,6 +42,17 @@ tts:
   openai:
     model: "gpt-4o-mini-tts"
     voice: "alloy"              # alloy, echo, fable, onyx, nova, shimmer
+  f5:
+    base_url: "http://localhost:8081"
+    voice_profile: "Tim"
+    token_ttl_minutes: 30
+    request_timeout_seconds: 300
+```
+
+For the local F5 provider, put the FastAPI container's shared secret in `~/.hermes/.env`:
+
+```bash
+F5TTS_SECRET_KEY=your-secret-key-here
 ```
 
 ### Telegram Voice Bubbles & ffmpeg
@@ -48,6 +60,7 @@ tts:
 Telegram voice bubbles require Opus/OGG audio format:
 
 - **OpenAI and ElevenLabs** produce Opus natively — no extra setup
+- **Local F5 FastAPI** returns WAV and needs **ffmpeg** for Telegram voice bubbles
 - **Edge TTS** (default) outputs MP3 and needs **ffmpeg** to convert:
 
 ```bash

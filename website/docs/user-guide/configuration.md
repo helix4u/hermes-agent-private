@@ -83,6 +83,7 @@ Even when using Nous Portal, Codex, or a custom endpoint, some tools (vision, we
 | Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
 | Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
 | OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
+| Local F5 FastAPI TTS | Local Docker service | `F5TTS_SECRET_KEY` |
 | RL Training | [Tinker](https://tinker-console.thinkingmachines.ai/) + [WandB](https://wandb.ai/) | `TINKER_API_KEY`, `WANDB_API_KEY` |
 | Cross-session user modeling | [Honcho](https://honcho.dev/) | `HONCHO_API_KEY` |
 
@@ -195,7 +196,7 @@ When unset (default), the model's own default reasoning level is used. Setting a
 
 ```yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "f5"
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
   elevenlabs:
@@ -204,7 +205,14 @@ tts:
   openai:
     model: "gpt-4o-mini-tts"
     voice: "alloy"              # alloy, echo, fable, onyx, nova, shimmer
+  f5:
+    base_url: "http://localhost:8081"
+    voice_profile: "Tim"
+    token_ttl_minutes: 30
+    request_timeout_seconds: 300
 ```
+
+For the local F5 provider, add the FastAPI service's `SECRET_KEY` to `~/.hermes/.env` as `F5TTS_SECRET_KEY`.
 
 ## Display Settings
 
