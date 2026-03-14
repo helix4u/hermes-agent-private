@@ -802,6 +802,49 @@ function createEmptyTranscriptState() {
   };
 }
 
+function getPdfContentKindFromUrl(tabUrl = "") {
+  const url = String(tabUrl || "").trim();
+  if (!url) {
+    return "";
+  }
+  if (/\.pdf(?:[?#]|$)/i.test(url) || /^data:application\/pdf/i.test(url) || /^blob:/i.test(url)) {
+    return "pdf-document";
+  }
+  return "";
+}
+
+function applyPdfUrlFallback(context, tabUrl = "") {
+  const nextContext = context && typeof context === "object" ? { ...context } : {};
+  const metadata =
+    nextContext.metadata && typeof nextContext.metadata === "object"
+      ? { ...nextContext.metadata }
+      : {};
+  const normalizedUrl = String(tabUrl || nextContext.url || metadata.pdfUrl || "").trim();
+  const contentKind = String(nextContext.contentKind || getPdfContentKindFromUrl(normalizedUrl) || "").trim();
+  const embeddedPdfUrl = String(metadata.embeddedPdfUrl || "").trim();
+  let pageText = String(nextContext.pageText || "").trim();
+
+  if (contentKind === "pdf-document" && normalizedUrl) {
+    metadata.pdfUrl = normalizedUrl;
+    if (!pageText) {
+      pageText = `Direct PDF document detected.\nPDF URL: ${normalizedUrl}`;
+      metadata.pageTextSource = String(metadata.pageTextSource || "").trim() || "pdf-url-fallback-background";
+    }
+  } else if (contentKind === "pdf-embed" && embeddedPdfUrl) {
+    if (!pageText) {
+      pageText = `Embedded PDF detected.\nEmbedded PDF URL: ${embeddedPdfUrl}`;
+      metadata.pageTextSource = String(metadata.pageTextSource || "").trim() || "pdf-embed-url-fallback-background";
+    }
+  }
+
+  return {
+    ...nextContext,
+    contentKind: contentKind || nextContext.contentKind || "",
+    metadata,
+    pageText
+  };
+}
+
 async function buildPolicyBlockedContext(tabId, reason = "") {
   const tab = await getTabSnapshot(tabId);
   const tabUrl = String(tab?.url || "").trim();
@@ -879,6 +922,62 @@ async function captureRenderedPageTextFallback(tabId) {
           }
           return value.slice(0, maxLength).trim();
         };
+        const collectTextFromSelectors = (selectors, perNodeMax = 2000, totalMax = 24000) => {
+          const parts = [];
+          const seen = new Set();
+          for (const selector of selectors) {
+            const nodes = document.querySelectorAll(selector);
+            for (const node of nodes) {
+              const text = clamp(node?.innerText || node?.textContent || "", perNodeMax);
+              if (!text || seen.has(text)) {
+                continue;
+              }
+              seen.add(text);
+              parts.push(text);
+              const joined = parts.join("\n\n");
+              if (joined.length >= totalMax) {
+                return clamp(joined, totalMax);
+              }
+            }
+          }
+          return clamp(parts.join("\n\n"), totalMax);
+        };
+        const collectShadowDomText = (root, totalMax = 24000) => {
+          const parts = [];
+          const seen = new Set();
+          const stack = [root];
+          while (stack.length) {
+            const current = stack.pop();
+            if (!current) {
+              continue;
+            }
+            if (current.nodeType === Node.ELEMENT_NODE) {
+              const element = current;
+              const text = clamp(element.innerText || element.textContent || "", 1800);
+              if (text && text.length >= 40 && !seen.has(text) && !/^\d+\s*\/\s*\d+$/.test(text)) {
+                seen.add(text);
+                parts.push(text);
+                const joined = parts.join("\n\n");
+                if (joined.length >= totalMax) {
+                  return clamp(joined, totalMax);
+                }
+              }
+              if (element.shadowRoot) {
+                stack.push(element.shadowRoot);
+              }
+              for (const child of Array.from(element.children || [])) {
+                stack.push(child);
+              }
+              continue;
+            }
+            if (current.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+              for (const child of Array.from(current.childNodes || [])) {
+                stack.push(child);
+              }
+            }
+          }
+          return clamp(parts.join("\n\n"), totalMax);
+        };
 
         let host = "";
         try {
@@ -887,6 +986,39 @@ async function captureRenderedPageTextFallback(tabId) {
           host = "";
         }
         const isX = host === "x.com" || host.endsWith(".x.com") || host === "twitter.com" || host.endsWith(".twitter.com");
+        const isPdfDocument =
+          document.contentType === "application/pdf" ||
+          /\.pdf(?:[?#]|$)/i.test(window.location.href) ||
+          /^data:application\/pdf/i.test(window.location.href) ||
+          /^blob:/i.test(window.location.href);
+
+        if (isPdfDocument) {
+          const pdfSelectorText = collectTextFromSelectors(
+            [
+              ".textLayer",
+              ".textLayer span",
+              "#viewer .page",
+              "#viewer .textLayer",
+              "viewer-pdf-page",
+              "viewer-pdf-page .textLayer",
+              "pdf-viewer",
+              "pdf-viewer .page",
+              "pdf-viewer .textLayer",
+              "#mainContainer",
+              "#scroller",
+              "[role='document']"
+            ],
+            2000,
+            24000
+          );
+          if (pdfSelectorText) {
+            return pdfSelectorText;
+          }
+          const pdfShadowText = collectShadowDomText(document.documentElement, 24000);
+          if (pdfShadowText) {
+            return pdfShadowText;
+          }
+        }
 
         const parts = [];
         const seen = new Set();
@@ -983,6 +1115,67 @@ async function fetchTranscriptTextViaBridge(context, urlHint = "") {
   }
 }
 
+async function fetchPdfTextViaBridge(context, urlHint = "") {
+  const targetUrl = String(
+    context?.metadata?.pdfUrl ||
+    context?.metadata?.embeddedPdfUrl ||
+    context?.url ||
+    urlHint ||
+    ""
+  ).trim();
+  if (!targetUrl || /^blob:/i.test(targetUrl)) {
+    return "";
+  }
+
+  try {
+    const token = await getBridgeToken();
+    const response = await callBridge("/session", {
+      token,
+      body: {
+        action: "fetch_pdf_text",
+        url: targetUrl
+      }
+    });
+    return String(response?.pdf_text || "").trim();
+  } catch (_error) {
+    return "";
+  }
+}
+
+async function ensurePreviewPdfText(tabId, context, urlHint = "") {
+  const contentKind = String(context?.contentKind || "").trim();
+  if (contentKind !== "pdf-document" && contentKind !== "pdf-embed") {
+    return context;
+  }
+
+  const pageText = String(context?.pageText || "").trim();
+  const pageTextSource = String(context?.metadata?.pageTextSource || "").trim();
+  const looksLikeFallbackNoise =
+    !pageText ||
+    pageText.startsWith("Direct PDF document detected.") ||
+    pageText.startsWith("Embedded PDF detected.") ||
+    pageTextSource.includes("pdf-url-fallback") ||
+    pageTextSource.includes("dom-fallback");
+
+  if (!looksLikeFallbackNoise && pageText.length >= 500) {
+    return context;
+  }
+
+  const extractedPdfText = await fetchPdfTextViaBridge(context, urlHint);
+  if (!extractedPdfText) {
+    return context;
+  }
+
+  return {
+    ...context,
+    pageText: extractedPdfText.slice(0, 24000),
+    metadata: {
+      ...(context?.metadata || {}),
+      pageTextSource: "pdf-direct-extract"
+    }
+  };
+}
+
 async function collectPageContextFallback(tabId) {
   if (!chrome.scripting?.executeScript) {
     throw new Error("Page context fallback is unavailable in this browser.");
@@ -1027,10 +1220,39 @@ async function collectPageContextFallback(tabId) {
       }
       const isX = host === "x.com" || host.endsWith(".x.com") || host === "twitter.com" || host.endsWith(".twitter.com");
       const isYoutubeWatch = /(^|\.)youtube\.com$/i.test(host) && window.location.pathname === "/watch";
+      const embeddedPdfNode =
+        document.querySelector("embed[type='application/pdf'][src]") ||
+        document.querySelector("object[type='application/pdf'][data]") ||
+        Array.from(document.querySelectorAll("embed[src], iframe[src], object[data]")).find((node) => {
+          const rawUrl =
+            node.getAttribute("src") ||
+            node.getAttribute("data") ||
+            node.src ||
+            node.data ||
+            "";
+          return /\.pdf(?:[?#]|$)/i.test(String(rawUrl || "").trim());
+        }) ||
+        null;
+      const embeddedPdfUrl = String(
+        embeddedPdfNode?.getAttribute?.("src") ||
+        embeddedPdfNode?.getAttribute?.("data") ||
+        embeddedPdfNode?.src ||
+        embeddedPdfNode?.data ||
+        ""
+      ).trim();
+      const isPdfDocument =
+        document.contentType === "application/pdf" ||
+        /\.pdf(?:[?#]|$)/i.test(url) ||
+        /^data:application\/pdf/i.test(url) ||
+        /^blob:/i.test(url);
       if (isX) {
         contentKind = "x-feed";
       } else if (isYoutubeWatch) {
         contentKind = "youtube-watch";
+      } else if (isPdfDocument) {
+        contentKind = "pdf-document";
+      } else if (embeddedPdfUrl) {
+        contentKind = "pdf-embed";
       }
 
       const selection = clamp(window.getSelection?.().toString() || "", 8000);
@@ -1101,7 +1323,10 @@ async function collectPageContextFallback(tabId) {
             "meta[property='article:author']",
             "meta[itemprop='author']"
           ]),
-          timelineItems: isX ? document.querySelectorAll("article").length : undefined
+          timelineItems: isX ? document.querySelectorAll("article").length : undefined,
+          embeddedPdfUrl: embeddedPdfUrl || undefined,
+          embeddedPdfTag: embeddedPdfNode?.tagName?.toLowerCase?.() || undefined,
+          pdfUrl: isPdfDocument ? url : undefined
         },
         transcript: {
           available: false,
@@ -1256,6 +1481,20 @@ async function previewPageContext(tabId) {
   }
   const wantTranscriptForPreview = onYouTubeWatch;
   let context = await collectPageContext(tabId, wantTranscriptForPreview, wantTranscriptForPreview);
+  if (!context?.contentKind) {
+    const pdfContentKind = getPdfContentKindFromUrl(tabUrl);
+    if (pdfContentKind) {
+      context = {
+        ...context,
+        contentKind: pdfContentKind,
+        metadata: {
+          ...(context?.metadata || {}),
+          pdfUrl: tabUrl || String(context?.metadata?.pdfUrl || "").trim()
+        }
+      };
+    }
+  }
+  context = await ensurePreviewPdfText(tabId, context, tabUrl);
   context = await ensurePreviewTranscriptText(tabId, context, onYouTubeWatch, tabUrl);
   if ((context.pageText || "").length < 300) {
     const retried = await collectPageContext(tabId, wantTranscriptForPreview, true);
@@ -1270,6 +1509,7 @@ async function previewPageContext(tabId) {
   }
   const cachedContext = readCachedPageContext(tabId, tabUrl || context.url || "");
   context = applyCachedContextFallback(context, cachedContext, "preview-cache-fallback-background");
+  context = applyPdfUrlFallback(context, tabUrl);
   rememberPageContext(tabId, context);
 
   const transcript = context.transcript || {};
@@ -1317,6 +1557,20 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
   }
 
   let context = await collectPageContext(tabId, shouldIncludeTranscript, true);
+  if (!context?.contentKind) {
+    const pdfContentKind = getPdfContentKindFromUrl(tabUrl);
+    if (pdfContentKind) {
+      context = {
+        ...context,
+        contentKind: pdfContentKind,
+        metadata: {
+          ...(context?.metadata || {}),
+          pdfUrl: tabUrl || String(context?.metadata?.pdfUrl || "").trim()
+        }
+      };
+    }
+  }
+  context = await ensurePreviewPdfText(tabId, context, tabUrl || preview.url || "");
   if (shouldIncludeTranscript && onYouTubeWatch) {
     context = await ensurePreviewTranscriptText(tabId, context, true, tabUrl || preview.url || "");
     if (!String(context?.transcript?.text || "").trim() && context?.metadata?.pageCaptureBlocked !== true) {
@@ -1341,6 +1595,7 @@ async function buildPageContextPayload(tabId, message, includeTranscript, browse
     context = applyRenderedTextFallback(context, fallbackText, "dom-fallback-background");
   }
   context = applyCachedContextFallback(context, cachedPreviewContext, "preview-cache-fallback-background");
+  context = applyPdfUrlFallback(context, tabUrl);
   const pageCaptureBlocked = context?.metadata?.pageCaptureBlocked === true;
 
   const previewPageTextLength = Number(preview.pageTextLength || 0);

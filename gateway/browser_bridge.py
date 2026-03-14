@@ -15,12 +15,14 @@ import os
 import re
 import secrets
 import mimetypes
+from io import BytesIO
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlparse, unquote
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,7 @@ PORT_ENV_VAR = "HERMES_BROWSER_BRIDGE_PORT"
 ENABLED_ENV_VAR = "HERMES_BROWSER_BRIDGE_ENABLED"
 TOKEN_FILE = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "browser_bridge_token"
 DEFAULT_BROWSER_LABEL = "Chrome Extension"
+PDF_TEXT_CACHE: dict[str, str] = {}
 
 
 @dataclass
@@ -141,6 +144,120 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         },
     }
 
+    def _normalize_pdf_url(value: Any) -> str:
+        text = _string(value, 4096)
+        return text if text.lower().endswith(".pdf") or ".pdf?" in text.lower() or text.startswith("blob:") else text
+
+    metadata["pdfUrl"] = _normalize_pdf_url(metadata.get("pdfUrl"))
+    metadata["embeddedPdfUrl"] = _normalize_pdf_url(metadata.get("embeddedPdfUrl"))
+
+    def _looks_like_pdf_url(url: str) -> bool:
+        value = str(url or "").strip().lower()
+        return (
+            value.endswith(".pdf") or
+            ".pdf?" in value or
+            value.startswith("data:application/pdf")
+        )
+
+    def _extract_pdf_text_from_bytes(data: bytes, max_chars: int = 24000, max_pages: int = 12) -> str:
+        if not data:
+            return ""
+
+        try:
+            import fitz  # type: ignore
+
+            doc = fitz.open(stream=data, filetype="pdf")
+            parts = []
+            for page_index in range(min(len(doc), max_pages)):
+                page_text = str(doc.load_page(page_index).get_text("text") or "").strip()
+                if page_text:
+                    parts.append(page_text)
+                combined = "\n\n".join(parts).strip()
+                if len(combined) >= max_chars:
+                    return combined[:max_chars].rstrip()
+            return "\n\n".join(parts).strip()[:max_chars].rstrip()
+        except Exception:
+            pass
+
+        try:
+            from pypdf import PdfReader  # type: ignore
+
+            reader = PdfReader(BytesIO(data))
+            parts = []
+            for page in reader.pages[:max_pages]:
+                page_text = str(page.extract_text() or "").strip()
+                if page_text:
+                    parts.append(page_text)
+                combined = "\n\n".join(parts).strip()
+                if len(combined) >= max_chars:
+                    return combined[:max_chars].rstrip()
+            return "\n\n".join(parts).strip()[:max_chars].rstrip()
+        except Exception:
+            pass
+
+        try:
+            from PyPDF2 import PdfReader  # type: ignore
+
+            reader = PdfReader(BytesIO(data))
+            parts = []
+            for page in reader.pages[:max_pages]:
+                page_text = str(page.extract_text() or "").strip()
+                if page_text:
+                    parts.append(page_text)
+                combined = "\n\n".join(parts).strip()
+                if len(combined) >= max_chars:
+                    return combined[:max_chars].rstrip()
+            return "\n\n".join(parts).strip()[:max_chars].rstrip()
+        except Exception:
+            return ""
+
+    def _fetch_pdf_text(pdf_url: str) -> str:
+        normalized_url = str(pdf_url or "").strip()
+        if not normalized_url or normalized_url.startswith("blob:"):
+            return ""
+        cached = PDF_TEXT_CACHE.get(normalized_url)
+        if cached:
+            return cached
+
+        try:
+            request = Request(
+                normalized_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 HermesBrowserBridge/1.0",
+                    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
+                },
+            )
+            with urlopen(request, timeout=20) as response:
+                content_type = str(response.headers.get("Content-Type") or "").lower()
+                payload_bytes = response.read(12 * 1024 * 1024)
+            if "pdf" not in content_type and not payload_bytes.startswith(b"%PDF"):
+                return ""
+            text = _extract_pdf_text_from_bytes(payload_bytes)
+            if text:
+                PDF_TEXT_CACHE[normalized_url] = text
+            return text
+        except Exception as exc:
+            logger.debug("Failed to fetch or parse PDF %s: %s", normalized_url, exc)
+            return ""
+
+    pdf_url = str(metadata.get("pdfUrl") or "").strip()
+    embedded_pdf_url = str(metadata.get("embeddedPdfUrl") or "").strip()
+    fallback_pdf_text = normalized["page_text"].startswith("Direct PDF document detected.\nPDF URL:") or normalized["page_text"].startswith("Embedded PDF detected.\nEmbedded PDF URL:")
+    if (
+        normalized["content_kind"] in {"pdf-document", "pdf-embed"} or
+        _looks_like_pdf_url(normalized["url"]) or
+        _looks_like_pdf_url(pdf_url) or
+        _looks_like_pdf_url(embedded_pdf_url)
+    ):
+        target_pdf_url = pdf_url or embedded_pdf_url or normalized["url"]
+        if target_pdf_url and (fallback_pdf_text or len(normalized["page_text"]) < 500):
+            extracted_pdf_text = _fetch_pdf_text(target_pdf_url)
+            if extracted_pdf_text:
+                normalized["page_text"] = extracted_pdf_text
+                metadata["pageTextSource"] = metadata.get("pageTextSource") or "pdf-direct-extract"
+                if not normalized["content_kind"]:
+                    normalized["content_kind"] = "pdf-document"
+
     # Some dynamic pages (notably X/Twitter) can report a short pageText while
     # selection captures the rendered timeline. Prefer selection when it is
     # clearly richer so injected turns include meaningful context.
@@ -170,6 +287,90 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Payload must include some page context.")
 
     return normalized
+
+
+def fetch_pdf_text(pdf_url: str, *, max_chars: int = 24000) -> str:
+    """Fetch and extract text from a remote PDF URL."""
+    normalized_url = str(pdf_url or "").strip()
+    if not normalized_url or normalized_url.startswith("blob:"):
+        return ""
+
+    cached = PDF_TEXT_CACHE.get(normalized_url)
+    if cached:
+        return cached[:max_chars].rstrip()
+
+    def _extract_pdf_text_from_bytes(data: bytes, max_pages: int = 12) -> str:
+        if not data:
+            return ""
+
+        try:
+            import fitz  # type: ignore
+
+            doc = fitz.open(stream=data, filetype="pdf")
+            parts = []
+            for page_index in range(min(len(doc), max_pages)):
+                page_text = str(doc.load_page(page_index).get_text("text") or "").strip()
+                if page_text:
+                    parts.append(page_text)
+                combined = "\n\n".join(parts).strip()
+                if len(combined) >= max_chars:
+                    return combined[:max_chars].rstrip()
+            return "\n\n".join(parts).strip()[:max_chars].rstrip()
+        except Exception:
+            pass
+
+        try:
+            from pypdf import PdfReader  # type: ignore
+
+            reader = PdfReader(BytesIO(data))
+            parts = []
+            for page in reader.pages[:max_pages]:
+                page_text = str(page.extract_text() or "").strip()
+                if page_text:
+                    parts.append(page_text)
+                combined = "\n\n".join(parts).strip()
+                if len(combined) >= max_chars:
+                    return combined[:max_chars].rstrip()
+            return "\n\n".join(parts).strip()[:max_chars].rstrip()
+        except Exception:
+            pass
+
+        try:
+            from PyPDF2 import PdfReader  # type: ignore
+
+            reader = PdfReader(BytesIO(data))
+            parts = []
+            for page in reader.pages[:max_pages]:
+                page_text = str(page.extract_text() or "").strip()
+                if page_text:
+                    parts.append(page_text)
+                combined = "\n\n".join(parts).strip()
+                if len(combined) >= max_chars:
+                    return combined[:max_chars].rstrip()
+            return "\n\n".join(parts).strip()[:max_chars].rstrip()
+        except Exception:
+            return ""
+
+    try:
+        request = Request(
+            normalized_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 HermesBrowserBridge/1.0",
+                "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
+            },
+        )
+        with urlopen(request, timeout=20) as response:
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            payload_bytes = response.read(12 * 1024 * 1024)
+        if "pdf" not in content_type and not payload_bytes.startswith(b"%PDF"):
+            return ""
+        text = _extract_pdf_text_from_bytes(payload_bytes)
+        if text:
+            PDF_TEXT_CACHE[normalized_url] = text
+        return text
+    except Exception as exc:
+        logger.debug("Failed to fetch or parse PDF %s: %s", normalized_url, exc)
+        return ""
 
 
 def build_browser_context_message(payload: dict[str, Any]) -> str:
@@ -215,6 +416,10 @@ def build_browser_context_message(payload: dict[str, Any]) -> str:
             "publishedTime",
             "duration",
             "byline",
+            "pdfUrl",
+            "embeddedPdfUrl",
+            "embeddedPdfTag",
+            "pageTextSource",
         ):
             value = metadata.get(key)
             if value:

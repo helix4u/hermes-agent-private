@@ -180,6 +180,7 @@ from gateway.browser_bridge import (
     build_bridge_chat_id,
     build_browser_chat_message,
     build_browser_context_message,
+    fetch_pdf_text,
     get_bridge_session_key,
     normalize_payload,
 )
@@ -2776,6 +2777,19 @@ class GatewayRunner:
                 "ok": True,
                 "available": True,
                 **result,
+            }
+
+        if action == "fetch_pdf_text":
+            target = str(payload.get("url") or payload.get("pdf_url") or "").strip()
+            if not target:
+                raise ValueError("fetch_pdf_text requires a PDF URL.")
+            extracted_text = await asyncio.to_thread(fetch_pdf_text, target)
+            return {
+                "ok": True,
+                "available": bool(extracted_text),
+                "pdf_text": extracted_text,
+                "char_count": len(extracted_text),
+                "url": target,
             }
 
         if action == "list":

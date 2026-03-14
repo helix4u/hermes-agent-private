@@ -54,6 +54,50 @@ function isXOrTwitterHost() {
   return host === "x.com" || host.endsWith(".x.com") || host === "twitter.com" || host.endsWith(".twitter.com");
 }
 
+function isPdfUrlLike(value) {
+  const source = String(value || "").trim();
+  if (!source) {
+    return false;
+  }
+  return /\.pdf(?:[?#]|$)/i.test(source) || source.startsWith("blob:") || source.startsWith("data:application/pdf");
+}
+
+function getEmbeddedPdfInfo() {
+  const candidates = [
+    ...document.querySelectorAll("embed[src], iframe[src], object[data]")
+  ];
+
+  for (const node of candidates) {
+    const rawUrl =
+      node.getAttribute("src") ||
+      node.getAttribute("data") ||
+      node.src ||
+      node.data ||
+      "";
+    const type = String(node.getAttribute("type") || "").toLowerCase();
+    if (type === "application/pdf" || isPdfUrlLike(rawUrl)) {
+      return {
+        url: String(rawUrl || "").trim(),
+        tagName: String(node.tagName || "").toLowerCase()
+      };
+    }
+  }
+
+  return null;
+}
+
+function isPdfDocumentPage() {
+  const url = window.location.href;
+  const mimeType = String(document.contentType || "").toLowerCase();
+  if (mimeType === "application/pdf" || isPdfUrlLike(url)) {
+    return true;
+  }
+
+  return Boolean(
+    document.querySelector("embed[type='application/pdf'], object[type='application/pdf']")
+  );
+}
+
 function isProbablyReadableText(text) {
   const value = collapseWhitespace(text || "");
   if (!value || value.length < 120) {
@@ -143,6 +187,18 @@ function getXTimelineText() {
 }
 
 function getVisiblePageText() {
+  const embeddedPdf = getEmbeddedPdfInfo();
+  if (embeddedPdf) {
+    const viewerRoot =
+      document.querySelector("main") ||
+      document.querySelector("[role='main']") ||
+      document.body;
+    const text = clamp(collapseWhitespace(viewerRoot?.innerText || ""), 12000);
+    if (text) {
+      return text;
+    }
+  }
+
   // On X, prefer timeline-specific extraction so we send tweet content, not nav/sidebar chrome.
   if (isXOrTwitterHost()) {
     const timelineText = getXTimelineText();
@@ -940,10 +996,15 @@ async function collectPageContext(includeTranscriptText, waitForHydration = fals
   const selection = getSelectedText();
   let pageText = await getVisiblePageTextWithRetry();
   let contentKind = "web-page";
+  const embeddedPdf = getEmbeddedPdfInfo();
   if (isYouTubeWatchPage()) {
     contentKind = "youtube-watch";
   } else if (isXOrTwitterHost()) {
     contentKind = "x-feed";
+  } else if (isPdfDocumentPage()) {
+    contentKind = "pdf-document";
+  } else if (embeddedPdf) {
+    contentKind = "pdf-embed";
   }
 
   const metadata = {
@@ -976,6 +1037,20 @@ async function collectPageContext(includeTranscriptText, waitForHydration = fals
     transcript = await fetchYouTubeTranscript(includeTranscriptText);
   } else if (isXOrTwitterHost()) {
     metadata.timelineItems = document.querySelectorAll("article").length;
+  } else if (embeddedPdf) {
+    metadata.embeddedPdfUrl = embeddedPdf.url;
+    metadata.embeddedPdfTag = embeddedPdf.tagName;
+  } else if (contentKind === "pdf-document") {
+    metadata.pdfUrl = window.location.href;
+    metadata.pdfTitle = clamp(document.title || "", 512);
+  }
+
+  if (contentKind === "pdf-document" && !(pageText || "").trim()) {
+    pageText = `Direct PDF document detected.\nPDF URL: ${window.location.href}`;
+    metadata.pageTextSource = metadata.pageTextSource || "pdf-url-fallback";
+  } else if (contentKind === "pdf-embed" && !(pageText || "").trim() && embeddedPdf?.url) {
+    pageText = `Embedded PDF detected.\nEmbedded PDF URL: ${embeddedPdf.url}`;
+    metadata.pageTextSource = metadata.pageTextSource || "pdf-embed-url-fallback";
   }
 
   // X can render sparse/virtualized text nodes while selection still contains rich text.
