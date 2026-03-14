@@ -14,8 +14,8 @@ Use this skill when the task is specifically about the user's local F5 TTS serve
 
 1. Check the service first with `GET /health`.
 2. Read the base URL from `tts.f5.base_url` in `~/.hermes/config.yaml` when available. Default to `http://localhost:8081`.
-3. Read `F5TTS_SECRET_KEY` from `~/.hermes/.env` when you need to authenticate directly.
-4. Generate a short-lived HS256 bearer token from that secret.
+3. Use the already-loaded environment variable `F5TTS_SECRET_KEY` when you need to authenticate directly.
+4. Generate a short-lived HS256 bearer token from that env value.
 5. Call `GET /api/v1/voices/list` to discover valid `voice_profile` names instead of guessing.
 6. Call `POST /api/v1/tts/synthesize` with exact user text plus the selected `voice_profile`.
 7. Save the returned WAV bytes to disk and return the file path or `MEDIA:` tag as needed.
@@ -26,6 +26,7 @@ Use this skill when the task is specifically about the user's local F5 TTS serve
 - Prefer direct F5 API use when the user wants to inspect voices, pick a specific cloned voice, debug the local TTS service, or bypass Hermes' default provider selection.
 - Preserve the user's text exactly unless they asked for rewriting.
 - For long text, keep the FastAPI request body within the service limit by chunking and stitching rather than relaxing validation.
+- Do not ask the user for the secret key if `F5TTS_SECRET_KEY` is already present in the environment.
 
 ## Long text
 
@@ -38,7 +39,8 @@ Use this skill when the task is specifically about the user's local F5 TTS serve
 ## Failure handling
 
 - If `/health` fails, report that the local F5 container is unavailable before trying anything else.
-- If auth fails, verify `F5TTS_SECRET_KEY` matches the FastAPI container `SECRET_KEY`.
+- If auth fails, first check whether `F5TTS_SECRET_KEY` is already present in the environment and use it before asking the user for anything.
+- If auth still fails after using the env var, verify `F5TTS_SECRET_KEY` matches the FastAPI container `SECRET_KEY`.
 - If a requested voice is missing, list available voices from `/api/v1/voices/list`.
 - If synthesis fails on long text, retry with shorter chunks instead of sending a larger single request.
 

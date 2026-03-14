@@ -2,6 +2,8 @@
 
 Use these examples when you need to talk to the local F5TTS-FASTAPI service directly.
 
+Use the existing environment variable first. Do not ask the user for a key if `F5TTS_SECRET_KEY` is already set in Hermes' environment.
+
 ## Defaults in this environment
 
 - Base URL: `http://localhost:8081`
@@ -20,9 +22,13 @@ Use these examples when you need to talk to the local F5TTS-FASTAPI service dire
 
 ```python
 import datetime
+import os
 import jwt
 
-def build_token(secret_key: str, ttl_minutes: int = 30) -> str:
+def build_token(secret_key: str | None = None, ttl_minutes: int = 30) -> str:
+    secret_key = secret_key or os.getenv("F5TTS_SECRET_KEY", "")
+    if not secret_key:
+        raise RuntimeError("F5TTS_SECRET_KEY is not set in the environment")
     now = datetime.datetime.utcnow()
     return jwt.encode(
         {
@@ -54,7 +60,7 @@ Expected response:
 import requests
 
 base_url = "http://localhost:8081"
-token = build_token(secret_key)
+token = build_token()
 
 response = requests.get(
     f"{base_url}/api/v1/voices/list",
@@ -74,7 +80,7 @@ from pathlib import Path
 base_url = "http://localhost:8081"
 voice_profile = "<voice-from-voices-list>"
 text = "Hello from the local F5 voice API."
-token = build_token(secret_key)
+token = build_token()
 
 response = requests.post(
     f"{base_url}/api/v1/tts/synthesize",
