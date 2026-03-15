@@ -832,7 +832,12 @@ def _resolve_update_remote(git_cmd):
 
     for remote, url in remote_urls.items():
         if _remote_points_to_update_repo(url):
-            return remote
+            subprocess.run(
+                git_cmd + ["remote", "add", UPDATE_REMOTE_NAME, UPDATE_REPO_HTTPS],
+                cwd=PROJECT_ROOT,
+                check=True,
+            )
+            return UPDATE_REMOTE_NAME
 
     if "origin" in remote_urls:
         subprocess.run(
@@ -843,11 +848,11 @@ def _resolve_update_remote(git_cmd):
         return UPDATE_REMOTE_NAME
 
     subprocess.run(
-        git_cmd + ["remote", "add", "origin", UPDATE_REPO_HTTPS],
+        git_cmd + ["remote", "add", UPDATE_REMOTE_NAME, UPDATE_REPO_HTTPS],
         cwd=PROJECT_ROOT,
         check=True,
     )
-    return "origin"
+    return UPDATE_REMOTE_NAME
 
 
 def _update_via_zip(args):

@@ -14,11 +14,15 @@ Run the one-line installer:
 
 ```bash
 # Linux / macOS / WSL2
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/helix4u/hermes-agent-private/main/scripts/install.sh | bash
 ```
 
 :::tip Windows Users
-Install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) first, then run the command above inside your WSL2 terminal.
+Run the PowerShell installer instead:
+
+```powershell
+irm https://raw.githubusercontent.com/helix4u/hermes-agent-private/main/scripts/install.ps1 | iex
+```
 :::
 
 After it finishes, reload your shell:
@@ -35,7 +39,7 @@ The installer runs the setup wizard automatically. If you skipped it, run:
 hermes setup
 ```
 
-This walks you through selecting an inference provider:
+This walks you through selecting an inference provider and can also configure Telegram, Discord, Slack, and WhatsApp:
 
 | Provider | What it is | How to set up |
 |----------|-----------|---------------|

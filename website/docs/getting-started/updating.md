@@ -39,7 +39,8 @@ cd /path/to/hermes-agent
 export VIRTUAL_ENV="$(pwd)/venv"
 
 # Pull latest code and submodules
-git pull origin main
+git remote get-url private >/dev/null 2>&1 || git remote add private https://github.com/helix4u/hermes-agent-private.git
+git pull private main
 git submodule update --init --recursive
 
 # Reinstall (picks up new dependencies)

@@ -1,7 +1,7 @@
 ---
 sidebar_position: 2
 title: "Installation"
-description: "Install Hermes Agent on Linux, macOS, or WSL2"
+description: "Install Hermes Agent on Linux, macOS, or Windows"
 ---
 
 # Installation
@@ -13,16 +13,18 @@ Get Hermes Agent up and running in under two minutes with the one-line installer
 ### Linux / macOS / WSL2
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/helix4u/hermes-agent-private/main/scripts/install.sh | bash
 ```
 
-:::warning Windows
-Native Windows is **not supported**. Please install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run Hermes Agent from there. The install command above works inside WSL2.
-:::
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/helix4u/hermes-agent-private/main/scripts/install.ps1 | iex
+```
 
 ### What the Installer Does
 
-The installer handles everything automatically — all dependencies (Python, Node.js, ripgrep, ffmpeg), the repo clone, virtual environment, and global `hermes` command setup. It finishes by running the interactive setup wizard to configure your LLM provider.
+The installer handles everything automatically — all dependencies (Python, Node.js, ripgrep, ffmpeg), the repo clone, virtual environment, and global `hermes` command setup. It finishes by running the interactive setup wizard to configure your LLM provider and optional messaging platforms, including Discord.
 
 ### After Installation
 
@@ -61,7 +63,7 @@ If you prefer full control over the installation process, follow these steps.
 Clone with `--recurse-submodules` to pull the required submodules:
 
 ```bash
-git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
+git clone --recurse-submodules https://github.com/helix4u/hermes-agent-private.git
 cd hermes-agent
 ```
 
@@ -218,7 +220,7 @@ For those who just want the commands:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone & enter
-git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
+git clone --recurse-submodules https://github.com/helix4u/hermes-agent-private.git
 cd hermes-agent
 
 # Create venv with Python 3.11

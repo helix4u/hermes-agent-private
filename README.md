@@ -34,12 +34,12 @@ Built by [Nous Research](https://nousresearch.com). Under the hood, the same arc
 
 **Linux/macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/helix4u/hermes-agent-private/main/scripts/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/helix4u/hermes-agent-private/main/scripts/install.ps1 | iex
 ```
 
 The installer will:
@@ -49,7 +49,7 @@ The installer will:
 - Create a virtual environment with Python 3.11
 - Install all dependencies and submodule packages
 - Symlink `hermes` into `~/.local/bin` so it works globally (no venv activation needed)
-- Run the interactive setup wizard
+- Run the interactive setup wizard, including optional Telegram, Discord, Slack, and WhatsApp gateway setup
 
 After installation, reload your shell and run:
 ```bash
@@ -1267,7 +1267,7 @@ Use the [Windows Subsystem for Linux](https://learn.microsoft.com/en-us/windows/
 Clone with `--recurse-submodules` to pull the required submodules ([mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) for the terminal tool backend and [tinker-atropos](https://github.com/nousresearch/tinker-atropos) for RL training):
 
 ```bash
-git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
+git clone --recurse-submodules https://github.com/helix4u/hermes-agent-private.git
 cd hermes-agent
 ```
 
@@ -1495,7 +1495,7 @@ For those who just want the commands without the explanations:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone & enter
-git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
+git clone --recurse-submodules https://github.com/helix4u/hermes-agent-private.git
 cd hermes-agent
 
 # Create venv with Python 3.11 (uv downloads it if needed)
@@ -1534,7 +1534,8 @@ cd /path/to/hermes-agent
 export VIRTUAL_ENV="$(pwd)/venv"
 
 # Pull latest code and submodules
-git pull origin main
+git remote get-url private >/dev/null 2>&1 || git remote add private https://github.com/helix4u/hermes-agent-private.git
+git pull private main
 git submodule update --init --recursive
 
 # Reinstall (picks up new dependencies)

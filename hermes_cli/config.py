@@ -14,6 +14,8 @@ This module provides:
 
 import os
 import sys
+import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
@@ -864,24 +866,71 @@ def edit_config():
         save_config(DEFAULT_CONFIG)
         print(f"Created {config_path}")
     
-    # Find editor
-    editor = os.getenv('EDITOR') or os.getenv('VISUAL')
-    
-    if not editor:
-        # Try common editors
-        for cmd in ['nano', 'vim', 'vi', 'code', 'notepad']:
-            import shutil
-            if shutil.which(cmd):
-                editor = cmd
+    def _split_editor_command(value: str) -> List[str]:
+        try:
+            return shlex.split(value, posix=(os.name != "nt"))
+        except ValueError:
+            return [value]
+
+    def _editor_exists(parts: List[str]) -> bool:
+        if not parts:
+            return False
+        candidate = os.path.expanduser(parts[0])
+        if os.path.isabs(candidate) and os.path.exists(candidate):
+            return True
+        return shutil.which(parts[0]) is not None
+
+    if sys.platform == "win32":
+        fallback_editors = [
+            ["code", "--wait"],
+            ["code.cmd", "--wait"],
+            ["code-insiders", "--wait"],
+            ["code-insiders.cmd", "--wait"],
+            ["notepad++"],
+            ["notepad++.exe"],
+            ["subl"],
+            ["nvim-qt"],
+            ["notepad"],
+        ]
+    else:
+        fallback_editors = [
+            ["code", "--wait"],
+            ["nano"],
+            ["vim"],
+            ["vi"],
+        ]
+
+    editor_cmd = None
+    configured_editor = os.getenv('EDITOR') or os.getenv('VISUAL')
+    if configured_editor:
+        candidate_cmd = _split_editor_command(configured_editor)
+        if _editor_exists(candidate_cmd):
+            editor_cmd = candidate_cmd
+        else:
+            print(color(f"Configured editor not found: {configured_editor}", Colors.YELLOW))
+            print("Falling back to an available editor...")
+
+    if not editor_cmd:
+        for candidate_cmd in fallback_editors:
+            if _editor_exists(candidate_cmd):
+                editor_cmd = candidate_cmd
                 break
-    
-    if not editor:
+
+    if not editor_cmd:
         print(f"No editor found. Config file is at:")
         print(f"  {config_path}")
+        if sys.platform == "win32":
+            print("Try installing Visual Studio Code or Notepad++,")
+            print("or set EDITOR/VISUAL to a valid Windows editor command.")
         return
-    
-    print(f"Opening {config_path} in {editor}...")
-    subprocess.run([editor, str(config_path)])
+
+    print(f"Opening {config_path} in {' '.join(editor_cmd)}...")
+    try:
+        subprocess.run([*editor_cmd, str(config_path)], check=False)
+    except OSError as exc:
+        print(color(f"Failed to launch editor: {exc}", Colors.YELLOW))
+        print("Config file is at:")
+        print(f"  {config_path}")
 
 
 def set_config_value(key: str, value: str):
