@@ -45,27 +45,75 @@ import logging
 import os
 import re
 import asyncio
+from pathlib import Path
 from typing import List, Dict, Any, Optional
+
+import yaml
 from firecrawl import Firecrawl
 from openai import AsyncOpenAI
 from agent.auxiliary_client import get_async_text_auxiliary_client
+from agent.env_loader import load_dotenv_with_fallback
 from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
 
 _firecrawl_client = None
+_firecrawl_client_config = None
+
+
+def _ensure_firecrawl_settings_loaded():
+    """Load Firecrawl settings on demand for call sites that skipped normal bootstrap."""
+    firecrawl_key = (os.getenv("FIRECRAWL_API_KEY") or "").strip()
+    firecrawl_url = (os.getenv("FIRECRAWL_API_URL") or "").strip()
+    if firecrawl_key or firecrawl_url:
+        return
+
+    hermes_home = Path.home() / ".hermes"
+    candidate_env_paths = [
+        hermes_home / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+    for env_path in candidate_env_paths:
+        try:
+            load_dotenv_with_fallback(env_path, override=False, logger=logger)
+        except Exception as exc:
+            logger.debug("Failed to load Firecrawl settings from %s: %s", env_path, exc)
+
+    firecrawl_key = (os.getenv("FIRECRAWL_API_KEY") or "").strip()
+    firecrawl_url = (os.getenv("FIRECRAWL_API_URL") or "").strip()
+    if firecrawl_key or firecrawl_url:
+        return
+
+    config_path = hermes_home / "config.yaml"
+    if not config_path.exists():
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8", errors="replace") as handle:
+            config = yaml.safe_load(handle) or {}
+    except Exception as exc:
+        logger.debug("Failed to load Firecrawl config from %s: %s", config_path, exc)
+        return
+
+    for env_name in ("FIRECRAWL_API_KEY", "FIRECRAWL_API_URL"):
+        value = config.get(env_name)
+        if isinstance(value, str) and value.strip() and not os.getenv(env_name):
+            os.environ[env_name] = value.strip()
 
 def _get_firecrawl_client():
     """Get or create the Firecrawl client (lazy initialization)."""
-    global _firecrawl_client
-    if _firecrawl_client is None:
-        api_key = (os.getenv("FIRECRAWL_API_KEY") or "").strip()
-        api_url = (os.getenv("FIRECRAWL_API_URL") or "").strip()
-        if not api_key and not api_url:
-            raise ValueError(
-                "Set FIRECRAWL_API_KEY for Firecrawl cloud or FIRECRAWL_API_URL for a self-hosted instance"
-            )
+    global _firecrawl_client, _firecrawl_client_config
+    _ensure_firecrawl_settings_loaded()
 
+    api_key = (os.getenv("FIRECRAWL_API_KEY") or "").strip()
+    api_url = (os.getenv("FIRECRAWL_API_URL") or "").strip()
+    if not api_key and not api_url:
+        raise ValueError(
+            "Set FIRECRAWL_API_KEY for Firecrawl cloud or FIRECRAWL_API_URL for a self-hosted instance"
+        )
+
+    client_config = (api_key, api_url)
+    if _firecrawl_client is None or _firecrawl_client_config != client_config:
         client_kwargs = {}
         if api_key:
             client_kwargs["api_key"] = api_key
@@ -77,6 +125,8 @@ def _get_firecrawl_client():
                 _firecrawl_client = Firecrawl(base_url=api_url, **client_kwargs)
         else:
             _firecrawl_client = Firecrawl(**client_kwargs)
+        _firecrawl_client_config = client_config
+
     return _firecrawl_client
 
 DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 5000
@@ -1152,6 +1202,7 @@ def check_firecrawl_api_key() -> bool:
     Returns:
         bool: True if cloud or self-hosted Firecrawl is configured, False otherwise
     """
+    _ensure_firecrawl_settings_loaded()
     return bool(os.getenv("FIRECRAWL_API_KEY") or os.getenv("FIRECRAWL_API_URL"))
 
 
@@ -1291,7 +1342,7 @@ registry.register(
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=5),
     check_fn=check_firecrawl_api_key,
-    requires_env=["FIRECRAWL_API_KEY"],
+    requires_env=["FIRECRAWL_API_KEY", "FIRECRAWL_API_URL"],
 )
 registry.register(
     name="web_extract",
@@ -1300,6 +1351,6 @@ registry.register(
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
     check_fn=check_firecrawl_api_key,
-    requires_env=["FIRECRAWL_API_KEY"],
+    requires_env=["FIRECRAWL_API_KEY", "FIRECRAWL_API_URL"],
     is_async=True,
 )
