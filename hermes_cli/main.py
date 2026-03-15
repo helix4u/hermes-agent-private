@@ -914,20 +914,7 @@ def _update_via_zip(args):
         print(f"✗ ZIP update failed: {e}")
         sys.exit(1)
     
-    # Reinstall Python dependencies
-    print("→ Updating Python dependencies...")
-    import subprocess
-    uv_bin = shutil.which("uv")
-    if uv_bin:
-        subprocess.run(
-            [uv_bin, "pip", "install", "-e", ".", "--quiet"],
-            cwd=PROJECT_ROOT, check=True,
-            env={**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-        )
-    else:
-        venv_pip = PROJECT_ROOT / "venv" / ("Scripts" if sys.platform == "win32" else "bin") / "pip"
-        if venv_pip.exists():
-            subprocess.run([str(venv_pip), "install", "-e", ".", "--quiet"], cwd=PROJECT_ROOT, check=True)
+    _reinstall_update_dependencies()
     
     # Sync skills
     try:
@@ -1017,21 +1004,7 @@ def cmd_update(args):
         print("→ Pulling updates...")
         subprocess.run(git_cmd + ["pull", remote_name, branch], cwd=PROJECT_ROOT, check=True)
         
-        # Reinstall Python dependencies (prefer uv for speed, fall back to pip)
-        print("→ Updating Python dependencies...")
-        uv_bin = shutil.which("uv")
-        if uv_bin:
-            subprocess.run(
-                [uv_bin, "pip", "install", "-e", ".", "--quiet"],
-                cwd=PROJECT_ROOT, check=True,
-                env={**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-            )
-        else:
-            venv_pip = PROJECT_ROOT / "venv" / ("Scripts" if sys.platform == "win32" else "bin") / "pip"
-            if venv_pip.exists():
-                subprocess.run([str(venv_pip), "install", "-e", ".", "--quiet"], cwd=PROJECT_ROOT, check=True)
-            else:
-                subprocess.run(["pip", "install", "-e", ".", "--quiet"], cwd=PROJECT_ROOT, check=True)
+        _reinstall_update_dependencies()
         
         # Check for Node.js deps
         if (PROJECT_ROOT / "package.json").exists():
@@ -1131,6 +1104,54 @@ def cmd_update(args):
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
+
+
+def _reinstall_update_dependencies():
+    """Reinstall Hermes and bundled extras after an update.
+
+    Updates should preserve the same full-featured install as the one-line
+    installers, including messaging extras like discord.py.
+    """
+    import subprocess
+    import shutil
+
+    print("→ Updating Python dependencies...")
+    uv_bin = shutil.which("uv")
+    venv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+
+    if uv_bin:
+        try:
+            subprocess.run(
+                [uv_bin, "pip", "install", "-e", ".[all]", "--quiet"],
+                cwd=PROJECT_ROOT,
+                check=True,
+                env=venv_env,
+            )
+        except subprocess.CalledProcessError:
+            print("⚠ Full extras reinstall failed, falling back to base package.")
+            subprocess.run(
+                [uv_bin, "pip", "install", "-e", ".", "--quiet"],
+                cwd=PROJECT_ROOT,
+                check=True,
+                env=venv_env,
+            )
+        return
+
+    venv_pip = PROJECT_ROOT / "venv" / ("Scripts" if sys.platform == "win32" else "bin") / "pip"
+    pip_cmd = [str(venv_pip)] if venv_pip.exists() else ["pip"]
+    try:
+        subprocess.run(
+            pip_cmd + ["install", "-e", ".[all]", "--quiet"],
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        print("⚠ Full extras reinstall failed, falling back to base package.")
+        subprocess.run(
+            pip_cmd + ["install", "-e", ".", "--quiet"],
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
 
 
 def main():
