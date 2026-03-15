@@ -157,7 +157,7 @@ class DeliveryRouter:
         
         # Always include local if configured
         if self.config.always_log_local:
-            local_key = (Platform.LOCAL, None)
+            local_key = (Platform.LOCAL, None, None)
             if local_key not in seen_platforms:
                 targets.append(DeliveryTarget(platform=Platform.LOCAL))
         

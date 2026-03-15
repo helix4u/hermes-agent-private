@@ -4,6 +4,7 @@
 
 # Core dependencies
 openai
+anthropic>=0.39.0
 python-dotenv
 fire
 httpx
@@ -32,6 +33,10 @@ platformdirs
 
 # Text-to-speech (Edge TTS is free, no API key needed)
 edge-tts
+
+# CLI voice mode (push-to-talk recording)
+numpy
+sounddevice
 
 # Optional: For cron expression parsing (cronjob scheduling)
 croniter

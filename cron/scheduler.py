@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output
 from agent.env_loader import load_dotenv_with_fallback
+from hermes_time import now as hermes_now
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
@@ -76,7 +77,7 @@ def _build_job_failure_output(job: dict, error_msg: str, tb: Optional[str] = Non
     return f"""# Cron Job: {job.get("name", job.get("id", "unknown"))} (FAILED)
 
 **Job ID:** {job.get("id", "unknown")}
-**Run Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Run Time:** {hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
 ## Prompt
@@ -416,7 +417,7 @@ def run_job(job: dict, tool_progress_callback=None) -> tuple[bool, str, str, Opt
             api_mode=runtime.get("api_mode"),
             quiet_mode=True,
             tool_progress_callback=tool_progress_callback,
-            session_id=f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            session_id=f"cron_{job_id}_{hermes_now().strftime('%Y%m%d_%H%M%S')}"
         )
         
         result = agent.run_conversation(prompt)
@@ -434,7 +435,7 @@ def run_job(job: dict, tool_progress_callback=None) -> tuple[bool, str, str, Opt
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
-**Run Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Run Time:** {hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
 ## Prompt
@@ -457,7 +458,7 @@ def run_job(job: dict, tool_progress_callback=None) -> tuple[bool, str, str, Opt
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
-**Run Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Run Time:** {hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
 ## Prompt
@@ -514,17 +515,17 @@ def tick(verbose: bool = True) -> int:
         job_timeout_seconds = _resolve_cron_job_timeout_seconds()
 
         if verbose and not due_jobs:
-            logger.info("%s - No jobs due", datetime.now().strftime('%H:%M:%S'))
+            logger.info("%s - No jobs due", hermes_now().strftime('%H:%M:%S'))
             return 0
 
         if verbose:
-            logger.info("%s - %s job(s) due", datetime.now().strftime('%H:%M:%S'), len(due_jobs))
+            logger.info("%s - %s job(s) due", hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
         executed = 0
         for job in due_jobs:
             try:
                 job_name = job.get("name", job["id"])
-                started_at_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                started_at_human = hermes_now().strftime("%Y-%m-%d %H:%M:%S")
                 _deliver_result(
                     job,
                     (

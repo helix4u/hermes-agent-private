@@ -211,6 +211,14 @@ class SessionDB:
         )
         self._conn.commit()
 
+    def update_session_model(self, session_id: str, model: str) -> None:
+        """Persist the resolved model name on a session record."""
+        self._conn.execute(
+            "UPDATE sessions SET model = ? WHERE id = ?",
+            (model, session_id),
+        )
+        self._conn.commit()
+
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         cursor = self._conn.execute(
@@ -218,6 +226,27 @@ class SessionDB:
         )
         row = cursor.fetchone()
         return dict(row) if row else None
+
+    def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
+        """Resolve an exact or uniquely prefixed session ID to the full ID."""
+        exact = self.get_session(session_id_or_prefix)
+        if exact:
+            return exact["id"]
+
+        escaped = (
+            session_id_or_prefix
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        cursor = self._conn.execute(
+            "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
+            (f"{escaped}%",),
+        )
+        matches = [row["id"] for row in cursor.fetchall()]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     # =========================================================================
     # Message storage

@@ -26,6 +26,7 @@ Usage:
 import argparse
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -47,21 +48,22 @@ def _ensure_utf8_stdio():
 
 _ensure_utf8_stdio()
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback (encoding-safe on Windows)
-from agent.env_loader import load_dotenv_with_fallback
+# Load .env from ~/.hermes/.env first, then project root as dev fallback.
+# User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_env_path, get_hermes_home
-_user_env = get_env_path()
-if _user_env.exists():
-    load_dotenv_with_fallback(_user_env, logger=logging.getLogger(__name__))
+from hermes_cli.env_loader import load_hermes_dotenv
 _project_env = PROJECT_ROOT / ".env"
-if _project_env.exists():
-    load_dotenv_with_fallback(_project_env, override=False, logger=logging.getLogger(__name__))
+load_hermes_dotenv(
+    hermes_home=get_hermes_home(),
+    project_env=_project_env,
+    logger=logging.getLogger(__name__),
+)
 
 # Point mini-swe-agent at ~/.hermes/ so it shares our config
 os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(get_hermes_home()))
 os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
-from hermes_cli import __version__
+from hermes_cli import __version__, __release_date__
 from hermes_constants import OPENROUTER_BASE_URL
 
 logger = logging.getLogger(__name__)
@@ -155,6 +157,13 @@ def cmd_chat(args):
         print("You can run 'hermes setup' at any time to configure.")
         sys.exit(1)
 
+    try:
+        from hermes_cli.banner import prefetch_update_check
+
+        prefetch_update_check()
+    except Exception:
+        pass
+
     # Import and run the CLI
     from cli import main as cli_main
     
@@ -166,6 +175,8 @@ def cmd_chat(args):
         "verbose": args.verbose,
         "query": args.query,
         "resume": getattr(args, "resume", None),
+        "worktree": getattr(args, "worktree", False),
+        "pass_session_id": getattr(args, "pass_session_id", False),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -416,6 +427,8 @@ def cmd_model(args):
         "openrouter": "OpenRouter",
         "nous": "Nous Portal",
         "openai-codex": "OpenAI Codex",
+        "anthropic": "Anthropic",
+        "kimi-coding": "Kimi / Moonshot",
         "custom": "Custom endpoint",
     }
     active_label = provider_labels.get(active, active)
@@ -430,11 +443,13 @@ def cmd_model(args):
         ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
         ("nous", "Nous Portal (Nous Research subscription)"),
         ("openai-codex", "OpenAI Codex"),
+        ("anthropic", "Anthropic (native Claude API / Claude Code credentials)"),
+        ("kimi-coding", "Kimi / Moonshot API"),
         ("custom", "Custom endpoint (self-hosted / VLLM / etc.)"),
     ]
 
     # Reorder so the active provider is at the top
-    active_key = active if active in ("openrouter", "nous", "openai-codex") else "custom"
+    active_key = active if active in ("openrouter", "nous", "openai-codex", "anthropic", "kimi-coding") else "custom"
     ordered = []
     for key, label in providers:
         if key == active_key:
@@ -457,6 +472,10 @@ def cmd_model(args):
         _model_flow_nous(config, current_model)
     elif selected_provider == "openai-codex":
         _model_flow_openai_codex(config, current_model)
+    elif selected_provider == "anthropic":
+        _model_flow_anthropic(config, current_model)
+    elif selected_provider == "kimi-coding":
+        _model_flow_kimi(config, current_model)
     elif selected_provider == "custom":
         _model_flow_custom(config)
 
@@ -671,6 +690,62 @@ def _model_flow_openai_codex(config, current_model=""):
         print("No change.")
 
 
+def _model_flow_anthropic(config, current_model=""):
+    """Native Anthropic provider: prompt for optional key/base URL and model."""
+    from hermes_cli.auth import (
+        _save_model_choice,
+        _update_config_for_provider,
+        resolve_anthropic_runtime_credentials,
+        AuthError,
+        format_auth_error,
+    )
+    from hermes_cli.config import get_env_value, save_env_value
+
+    current_api_key = get_env_value("ANTHROPIC_API_KEY") or ""
+    current_base_url = get_env_value("ANTHROPIC_BASE_URL") or ""
+    current_token = get_env_value("ANTHROPIC_TOKEN") or get_env_value("CLAUDE_CODE_OAUTH_TOKEN") or ""
+
+    print("Anthropic native provider configuration:")
+    if current_api_key:
+        print(f"  Current API key: {current_api_key[:8]}...")
+    if current_token:
+        print("  OAuth token: configured")
+    if current_base_url:
+        print(f"  Current base URL override: {current_base_url}")
+    print("  Tip: Hermes can also reuse Claude Code credentials from ~/.claude/.credentials.json")
+    print()
+
+    try:
+        api_key = input(f"Anthropic API key [{current_api_key[:8] + '...' if current_api_key else 'optional'}]: ").strip()
+        base_url = input(f"Base URL override [{current_base_url or 'https://api.anthropic.com'}]: ").strip()
+        model_name = input(f"Model name [{current_model or 'anthropic/claude-sonnet-4-20250514'}]: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        return
+
+    if api_key:
+        save_env_value("ANTHROPIC_API_KEY", api_key)
+    if base_url:
+        save_env_value("ANTHROPIC_BASE_URL", base_url)
+
+    try:
+        creds = resolve_anthropic_runtime_credentials()
+    except AuthError as exc:
+        print(format_auth_error(exc))
+        return
+
+    selected_model = model_name or current_model or "anthropic/claude-sonnet-4-20250514"
+    _save_model_choice(selected_model)
+    _update_config_for_provider("anthropic", creds.get("base_url", ""))
+
+    # Clear custom endpoint vars that would override the native provider.
+    if get_env_value("OPENAI_BASE_URL"):
+        save_env_value("OPENAI_BASE_URL", "")
+        save_env_value("OPENAI_API_KEY", "")
+
+    print(f"Default model set to: {selected_model} (via Anthropic)")
+
+
 def _model_flow_custom(config):
     """Custom endpoint: collect URL, API key, and model name."""
     from hermes_cli.auth import _save_model_choice, deactivate_provider
@@ -728,6 +803,56 @@ def _model_flow_custom(config):
         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
 
 
+def _model_flow_kimi(config, current_model=""):
+    """Kimi / Moonshot API-key provider: prompt for key, optional base URL, and model."""
+    from hermes_cli.auth import (
+        _save_model_choice,
+        _update_config_for_provider,
+        resolve_api_key_provider_credentials,
+        AuthError,
+        format_auth_error,
+    )
+    from hermes_cli.config import get_env_value, save_env_value
+
+    current_key = get_env_value("KIMI_API_KEY") or ""
+    current_url = get_env_value("KIMI_BASE_URL") or ""
+
+    print("Kimi / Moonshot configuration:")
+    if current_key:
+        print(f"  Current key: {current_key[:8]}...")
+    if current_url:
+        print(f"  Current base URL override: {current_url}")
+    print()
+
+    try:
+        api_key = input(f"Kimi API key [{current_key[:8] + '...' if current_key else 'optional'}]: ").strip()
+        base_url = input(f"Base URL override [{current_url or 'auto-detect from key'}]: ").strip()
+        model_name = input(f"Model name [{current_model or 'moonshotai/kimi-k2.5'}]: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        return
+
+    if api_key:
+        save_env_value("KIMI_API_KEY", api_key)
+    if base_url:
+        save_env_value("KIMI_BASE_URL", base_url)
+
+    try:
+        creds = resolve_api_key_provider_credentials("kimi-coding")
+    except AuthError as exc:
+        print(format_auth_error(exc))
+        return
+
+    selected_model = model_name or current_model or "moonshotai/kimi-k2.5"
+    _save_model_choice(selected_model)
+    _update_config_for_provider("kimi-coding", creds.get("base_url", ""))
+
+    if get_env_value("OPENAI_BASE_URL"):
+        save_env_value("OPENAI_BASE_URL", "")
+        save_env_value("OPENAI_API_KEY", "")
+    print(f"Default model set to: {selected_model} (via {creds.get('base_url', '')})")
+
+
 def cmd_login(args):
     """Authenticate Hermes CLI with a provider."""
     from hermes_cli.auth import login_command
@@ -766,7 +891,7 @@ def cmd_config(args):
 
 def cmd_version(args):
     """Show version."""
-    print(f"Hermes Agent v{__version__}")
+    print(f"Hermes Agent v{__version__} ({__release_date__})")
     print(f"Project: {PROJECT_ROOT}")
     
     # Show Python version
@@ -778,6 +903,18 @@ def cmd_version(args):
         print(f"OpenAI SDK: {openai.__version__}")
     except ImportError:
         print("OpenAI SDK: Not installed")
+
+    try:
+        from hermes_cli.banner import check_for_updates
+
+        behind = check_for_updates()
+        if behind and behind > 0:
+            commits_word = "commit" if behind == 1 else "commits"
+            print(f"Update available: {behind} {commits_word} behind - run 'hermes update'")
+        elif behind == 0:
+            print("Up to date")
+    except Exception:
+        pass
 
 
 def cmd_uninstall(args):
@@ -932,9 +1069,82 @@ def _update_via_zip(args):
     print("✓ Update complete!")
 
 
+def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+    """Stash tracked and untracked local changes before a git-based update."""
+    status = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if not status.stdout.strip():
+        return None
+
+    from datetime import datetime, timezone
+
+    stash_name = datetime.now(timezone.utc).strftime("hermes-update-autostash-%Y%m%d-%H%M%S")
+    print("→ Local changes detected — stashing before update...")
+    subprocess.run(
+        git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
+        cwd=cwd,
+        check=True,
+    )
+    stash_ref = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", "refs/stash"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return stash_ref
+
+
+def _restore_stashed_changes(
+    git_cmd: list[str],
+    cwd: Path,
+    stash_ref: str,
+    prompt_user: bool = False,
+) -> bool:
+    """Restore previously stashed local changes after a successful update."""
+    if prompt_user:
+        print()
+        print("⚠ Local changes were stashed before updating.")
+        print("  Restoring them may reapply local customizations onto the updated codebase.")
+        print("  Review the result afterward if Hermes behaves unexpectedly.")
+        print("Restore local changes now? [Y/n]")
+        response = input().strip().lower()
+        if response not in ("", "y", "yes"):
+            print("Skipped restoring local changes.")
+            print("Your changes are still preserved in git stash.")
+            print(f"Restore manually with: git stash apply {stash_ref}")
+            return False
+
+    print("→ Restoring local changes...")
+    restore = subprocess.run(
+        git_cmd + ["stash", "apply", stash_ref],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if restore.returncode != 0:
+        print("✗ Update pulled new code, but restoring local changes failed.")
+        if restore.stdout.strip():
+            print(restore.stdout.strip())
+        if restore.stderr.strip():
+            print(restore.stderr.strip())
+        print("Your changes are still preserved in git stash.")
+        print(f"Resolve manually with: git stash apply {stash_ref}")
+        sys.exit(1)
+
+    subprocess.run(git_cmd + ["stash", "drop", stash_ref], cwd=cwd, check=True)
+    print("⚠ Local changes were restored on top of the updated codebase.")
+    print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
+    return True
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version."""
-    import subprocess
     import shutil
     
     print("⚕ Updating Hermes Agent...")
@@ -986,9 +1196,20 @@ def cmd_update(args):
         )
         branch = result.stdout.strip()
         
+        update_branch = branch
+        remote_branch_ref = f"refs/remotes/{remote_name}/{branch}"
+        remote_branch_check = subprocess.run(
+            git_cmd + ["show-ref", "--verify", "--quiet", remote_branch_ref],
+            cwd=PROJECT_ROOT,
+            check=False,
+        )
+        if remote_branch_check.returncode != 0:
+            update_branch = "main"
+            print(f"→ No remote branch found for '{branch}', falling back to '{update_branch}'")
+
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..{remote_name}/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{remote_name}/{update_branch}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -1001,8 +1222,23 @@ def cmd_update(args):
             return
         
         print(f"→ Found {commit_count} new commit(s)")
+        auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+        prompt_for_restore = (
+            auto_stash_ref is not None
+            and sys.stdin.isatty()
+            and sys.stdout.isatty()
+        )
         print("→ Pulling updates...")
-        subprocess.run(git_cmd + ["pull", remote_name, branch], cwd=PROJECT_ROOT, check=True)
+        try:
+            subprocess.run(git_cmd + ["pull", remote_name, update_branch], cwd=PROJECT_ROOT, check=True)
+        finally:
+            if auto_stash_ref is not None:
+                _restore_stashed_changes(
+                    git_cmd,
+                    PROJECT_ROOT,
+                    auto_stash_ref,
+                    prompt_user=prompt_for_restore,
+                )
         
         _reinstall_update_dependencies()
         
@@ -1200,6 +1436,18 @@ For more help on a command:
         default=False,
         help="Resume the most recent CLI session"
     )
+    parser.add_argument(
+        "--worktree", "-w",
+        action="store_true",
+        default=False,
+        help="Start the CLI in an isolated Git worktree (fresh sessions only)"
+    )
+    parser.add_argument(
+        "--pass-session-id",
+        action="store_true",
+        default=False,
+        help="Include the session ID in the agent's system prompt"
+    )
     
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
     
@@ -1225,7 +1473,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex"],
+        choices=["auto", "openrouter", "nous", "openai-codex", "anthropic", "kimi-coding"],
         default=None,
         help="Inference provider (default: auto)"
     )
@@ -1245,6 +1493,18 @@ For more help on a command:
         action="store_true",
         default=False,
         help="Resume the most recent CLI session"
+    )
+    chat_parser.add_argument(
+        "--worktree", "-w",
+        action="store_true",
+        default=False,
+        help="Start the chat session in an isolated Git worktree"
+    )
+    chat_parser.add_argument(
+        "--pass-session-id",
+        action="store_true",
+        default=False,
+        help="Include the session ID in the agent's system prompt"
     )
     chat_parser.set_defaults(func=cmd_chat)
 
@@ -1271,6 +1531,8 @@ For more help on a command:
     # gateway run (default)
     gateway_run = gateway_subparsers.add_parser("run", help="Run gateway in foreground")
     gateway_run.add_argument("-v", "--verbose", action="store_true")
+    gateway_run.add_argument("--replace", action="store_true",
+                             help="Replace any existing gateway instance before starting")
     
     # gateway start
     gateway_start = gateway_subparsers.add_parser("start", help="Start gateway service")
@@ -1345,7 +1607,7 @@ For more help on a command:
         "--provider",
         choices=["nous", "openai-codex"],
         default=None,
-        help="Provider to authenticate with (default: nous)"
+        help="Provider to authenticate with (default: active OAuth provider, otherwise nous)"
     )
     login_parser.add_argument(
         "--portal-url",
@@ -1529,25 +1791,25 @@ For more help on a command:
     skills_parser = subparsers.add_parser(
         "skills",
         help="Skills Hub — search, install, and manage skills from online registries",
-        description="Search, install, inspect, audit, and manage skills from GitHub, ClawHub, and other registries."
+        description="Search, install, inspect, audit, and manage skills from skills.sh, well-known endpoints, GitHub, ClawHub, and other registries."
     )
     skills_subparsers = skills_parser.add_subparsers(dest="skills_action")
 
     skills_search = skills_subparsers.add_parser("search", help="Search skill registries")
     skills_search.add_argument("query", help="Search query")
-    skills_search.add_argument("--source", default="all", choices=["all", "github", "clawhub", "lobehub"])
+    skills_search.add_argument("--source", default="all", choices=["all", "skills-sh", "well-known", "github", "clawhub", "lobehub"])
     skills_search.add_argument("--limit", type=int, default=10, help="Max results")
 
     skills_install = skills_subparsers.add_parser("install", help="Install a skill")
     skills_install.add_argument("identifier", help="Skill identifier (e.g. openai/skills/skill-creator)")
     skills_install.add_argument("--category", default="", help="Category folder to install into")
-    skills_install.add_argument("--force", action="store_true", help="Install despite caution verdict")
+    skills_install.add_argument("--force", "--yes", "-y", dest="force", action="store_true", help="Install despite blocked scan verdict")
 
     skills_inspect = skills_subparsers.add_parser("inspect", help="Preview a skill without installing")
     skills_inspect.add_argument("identifier", help="Skill identifier")
 
     skills_list = skills_subparsers.add_parser("list", help="List installed skills")
-    skills_list.add_argument("--source", default="all", choices=["all", "hub", "builtin"])
+    skills_list.add_argument("--source", default="all", choices=["all", "hub", "builtin", "local"])
 
     skills_audit = skills_subparsers.add_parser("audit", help="Re-scan installed hub skills")
     skills_audit.add_argument("name", nargs="?", help="Specific skill to audit (default: all)")
@@ -1654,7 +1916,11 @@ For more help on a command:
 
         elif action == "export":
             if args.session_id:
-                data = db.export_session(args.session_id)
+                resolved_session_id = db.resolve_session_id(args.session_id)
+                if not resolved_session_id:
+                    print(f"Session '{args.session_id}' not found.")
+                    return
+                data = db.export_session(resolved_session_id)
                 if not data:
                     print(f"Session '{args.session_id}' not found.")
                     return
@@ -1669,13 +1935,17 @@ For more help on a command:
                 print(f"Exported {len(sessions)} sessions to {args.output}")
 
         elif action == "delete":
+            resolved_session_id = db.resolve_session_id(args.session_id)
+            if not resolved_session_id:
+                print(f"Session '{args.session_id}' not found.")
+                return
             if not args.yes:
-                confirm = input(f"Delete session '{args.session_id}' and all its messages? [y/N] ")
+                confirm = input(f"Delete session '{resolved_session_id}' and all its messages? [y/N] ")
                 if confirm.lower() not in ("y", "yes"):
                     print("Cancelled.")
                     return
-            if db.delete_session(args.session_id):
-                print(f"Deleted session '{args.session_id}'.")
+            if db.delete_session(resolved_session_id):
+                print(f"Deleted session '{resolved_session_id}'.")
             else:
                 print(f"Session '{args.session_id}' not found.")
 
@@ -1711,6 +1981,42 @@ For more help on a command:
         db.close()
 
     sessions_parser.set_defaults(func=cmd_sessions)
+
+    # =========================================================================
+    # insights command
+    # =========================================================================
+    insights_parser = subparsers.add_parser(
+        "insights",
+        help="Show usage insights and analytics",
+        description="Analyze session history to show token usage, costs, tool patterns, and activity trends",
+    )
+    insights_parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Number of days to analyze (default: 30)",
+    )
+    insights_parser.add_argument(
+        "--source",
+        help="Filter by platform (cli, telegram, discord, etc.)",
+    )
+
+    def cmd_insights(args):
+        try:
+            from hermes_state import SessionDB
+            from agent.insights import InsightsEngine
+
+            db = SessionDB()
+            try:
+                engine = InsightsEngine(db)
+                report = engine.generate(days=max(int(args.days or 30), 1), source=args.source)
+                print(engine.format_terminal(report))
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"Error generating insights: {e}")
+
+    insights_parser.set_defaults(func=cmd_insights)
 
     # =========================================================================
     # version command

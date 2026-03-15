@@ -64,6 +64,9 @@ DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+DEFAULT_MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
 
 
 # =============================================================================
@@ -72,7 +75,7 @@ CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 
 @dataclass
 class ProviderConfig:
-    """Describes a known OAuth provider."""
+    """Describes a known OAuth or API-key provider."""
     id: str
     name: str
     auth_type: str  # "oauth_device_code" or "api_key"
@@ -80,6 +83,8 @@ class ProviderConfig:
     inference_base_url: str = ""
     client_id: str = ""
     scope: str = ""
+    api_key_env_vars: tuple[str, ...] = ()
+    base_url_env_var: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -98,6 +103,23 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="OpenAI Codex",
         auth_type="oauth_external",
         inference_base_url=DEFAULT_CODEX_BASE_URL,
+    ),
+    "anthropic": ProviderConfig(
+        id="anthropic",
+        name="Anthropic",
+        auth_type="api_key",
+        inference_base_url=DEFAULT_ANTHROPIC_BASE_URL,
+        api_key_env_vars=("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"),
+        base_url_env_var="ANTHROPIC_BASE_URL",
+        extra={"auto_detect": False},
+    ),
+    "kimi-coding": ProviderConfig(
+        id="kimi-coding",
+        name="Kimi / Moonshot",
+        auth_type="api_key",
+        inference_base_url=DEFAULT_MOONSHOT_BASE_URL,
+        api_key_env_vars=("KIMI_API_KEY",),
+        base_url_env_var="KIMI_BASE_URL",
     ),
 }
 
@@ -129,7 +151,7 @@ def format_auth_error(error: Exception) -> str:
         return str(error)
 
     if error.relogin_required:
-        return f"{error} Run `hermes model` to re-authenticate."
+        return f"{error} Run `hermes login` to re-authenticate."
 
     if error.code == "subscription_required":
         return (
@@ -354,12 +376,20 @@ def resolve_provider(
     Priority (when requested="auto" or None):
     1. active_provider in auth.json with valid credentials
     2. Explicit CLI api_key/base_url -> "openrouter"
-    3. OPENAI_API_KEY or OPENROUTER_API_KEY env vars -> "openrouter"
-    4. Fallback: "openrouter"
+    3. Provider-specific API keys (e.g. Kimi) -> that provider
+    4. OPENAI_API_KEY or OPENROUTER_API_KEY env vars -> "openrouter"
+    5. Fallback: "openrouter"
     """
     normalized = (requested or "auto").strip().lower()
+    provider_aliases = {
+        "custom": "openrouter",
+        "claude": "anthropic",
+        "kimi": "kimi-coding",
+        "moonshot": "kimi-coding",
+    }
+    normalized = provider_aliases.get(normalized, normalized)
 
-    if normalized in {"openrouter", "custom"}:
+    if normalized == "openrouter":
         return "openrouter"
     if normalized in PROVIDER_REGISTRY:
         return normalized
@@ -383,6 +413,14 @@ def resolve_provider(
             return active
     except Exception as e:
         logger.debug("Could not detect active auth provider: %s", e)
+
+    for provider_id, pconfig in PROVIDER_REGISTRY.items():
+        if pconfig.auth_type != "api_key":
+            continue
+        if not pconfig.extra.get("auto_detect", True):
+            continue
+        if any(os.getenv(env_var, "").strip() for env_var in pconfig.api_key_env_vars):
+            return provider_id
 
     if os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
         return "openrouter"
@@ -431,6 +469,15 @@ def _optional_base_url(value: Any) -> Optional[str]:
         return None
     cleaned = value.strip().rstrip("/")
     return cleaned if cleaned else None
+
+
+def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) -> str:
+    """Resolve the correct Kimi/Moonshot base URL from key prefix and override."""
+    if env_override:
+        return env_override.rstrip("/")
+    if isinstance(api_key, str) and api_key.startswith("sk-kimi-"):
+        return KIMI_CODE_BASE_URL
+    return default_url.rstrip("/")
 
 
 def _decode_jwt_claims(token: Any) -> Dict[str, Any]:
@@ -1276,6 +1323,107 @@ def get_codex_auth_status() -> Dict[str, Any]:
         }
 
 
+def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
+    """Status snapshot for API-key providers such as Kimi."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if not pconfig or pconfig.auth_type != "api_key":
+        return {"configured": False}
+
+    api_key = ""
+    for env_var in pconfig.api_key_env_vars:
+        value = os.getenv(env_var, "").strip()
+        if value:
+            api_key = value
+            break
+
+    if not api_key:
+        return {"configured": False, "base_url": None, "source": None}
+
+    env_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    if provider_id == "kimi-coding":
+        base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
+    elif env_url:
+        base_url = env_url.rstrip("/")
+    else:
+        base_url = pconfig.inference_base_url.rstrip("/")
+
+    return {
+        "configured": True,
+        "base_url": base_url,
+        "source": "env",
+    }
+
+
+def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
+    """Resolve API key and base URL for an API-key provider."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if not pconfig or pconfig.auth_type != "api_key":
+        raise AuthError(
+            f"Unknown API-key provider '{provider_id}'.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+
+    api_key = ""
+    for env_var in pconfig.api_key_env_vars:
+        value = os.getenv(env_var, "").strip()
+        if value:
+            api_key = value
+            break
+
+    if not api_key:
+        expected = ", ".join(pconfig.api_key_env_vars) or "provider API key"
+        raise AuthError(
+            f"No API key configured for {pconfig.name}. Set {expected}.",
+            provider=provider_id,
+            code="api_key_missing",
+        )
+
+    env_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    if provider_id == "kimi-coding":
+        base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
+    elif env_url:
+        base_url = env_url.rstrip("/")
+    else:
+        base_url = pconfig.inference_base_url.rstrip("/")
+
+    return {
+        "provider": provider_id,
+        "api_key": api_key,
+        "base_url": base_url,
+        "source": "env",
+    }
+
+
+def resolve_anthropic_runtime_credentials() -> Dict[str, Any]:
+    """Resolve native Anthropic runtime credentials from env and Claude Code state."""
+    from agent.anthropic_adapter import (
+        DEFAULT_ANTHROPIC_BASE_URL,
+        get_anthropic_token_source,
+        resolve_anthropic_token,
+    )
+
+    api_key = resolve_anthropic_token()
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise AuthError(
+            "No Anthropic credentials configured. Set ANTHROPIC_API_KEY, ANTHROPIC_TOKEN, or use Claude Code credentials.",
+            provider="anthropic",
+            code="api_key_missing",
+        )
+
+    base_url = (
+        os.getenv("ANTHROPIC_BASE_URL", "").strip().rstrip("/")
+        or DEFAULT_ANTHROPIC_BASE_URL
+    )
+    return {
+        "provider": "anthropic",
+        "api_key": api_key.strip(),
+        "base_url": base_url,
+        "source": get_anthropic_token_source(api_key),
+        "auth_mode": "anthropic_messages",
+    }
+
+
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
     target = provider_id or get_active_provider()
@@ -1283,6 +1431,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_nous_auth_status()
     if target == "openai-codex":
         return get_codex_auth_status()
+    if target in PROVIDER_REGISTRY and PROVIDER_REGISTRY[target].auth_type == "api_key":
+        return get_api_key_provider_status(target)
     return {"logged_in": False}
 
 
@@ -1469,11 +1619,30 @@ def _save_model_choice(model_id: str) -> None:
 
 
 def login_command(args) -> None:
-    """Deprecated: use 'hermes model' or 'hermes setup' instead."""
-    print("The 'hermes login' command has been removed.")
-    print("Use 'hermes model' to select a provider and model,")
-    print("or 'hermes setup' for full interactive setup.")
-    raise SystemExit(0)
+    """Authenticate Hermes CLI with an OAuth-backed provider."""
+    provider_id = getattr(args, "provider", None)
+    if not provider_id:
+        active_provider = get_active_provider()
+        if active_provider in PROVIDER_REGISTRY:
+            provider_id = active_provider
+        else:
+            provider_id = "nous"
+
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if pconfig is None:
+        print(f"Unsupported provider for login: {provider_id}")
+        raise SystemExit(2)
+
+    if provider_id == "nous":
+        _login_nous(args, pconfig)
+        return
+
+    if provider_id == "openai-codex":
+        _login_openai_codex(args, pconfig)
+        return
+
+    print(f"Provider does not support Hermes login flow: {provider_id}")
+    raise SystemExit(2)
 
 
 def _login_openai_codex(args, pconfig: ProviderConfig) -> None:

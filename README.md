@@ -24,7 +24,7 @@ Built by [Nous Research](https://nousresearch.com). Under the hood, the same arc
 <tr><td><b>Grows the longer it runs</b></td><td>Persistent memory across sessions — the agent remembers your preferences, your projects, your environment. When it solves a hard problem, it writes a skill document for next time. Skills are searchable, shareable, and compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard. A Skills Hub lets you install community skills or publish your own.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Set up a daily AI funding report delivered to Telegram, a nightly backup verification on Discord, a weekly dependency audit that opens PRs, or a morning news briefing — all in natural language. The gateway runs them unattended.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams — each gets its own conversation and terminal. The agent can also write Python scripts that call its own tools via RPC, collapsing multi-step pipelines into a single turn with zero intermediate context cost.</td></tr>
-<tr><td><b>Real sandboxing</b></td><td>Five terminal backends — local, Docker, SSH, Singularity, and Modal — with persistent workspaces, background process management, with the option to make these machines ephemeral. Run it against a remote machine so it can't modify its own code or read private API keys for added security.</td></tr>
+<tr><td><b>Real sandboxing</b></td><td>Six terminal backends — local, Docker, SSH, Singularity, Modal, and Daytona — with persistent workspaces, background process management, with the option to make these machines ephemeral. Run it against a remote machine so it can't modify its own code or read private API keys for added security.</td></tr>
 <tr><td><b>Research-ready</b></td><td>Batch runner for generating thousands of tool-calling trajectories in parallel. Atropos RL environments for training models with reinforcement learning on agentic tasks. Trajectory compression for fitting training data into token budgets.</td></tr>
 </table>
 
@@ -125,6 +125,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **OpenAI Codex** | `hermes model` (ChatGPT OAuth, uses Codex models) |
 | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
 | **Custom Endpoint** | `OPENAI_BASE_URL` + `OPENAI_API_KEY` in `~/.hermes/.env` |
+| **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (`sk-kimi-...` keys auto-route to Kimi Code API) |
 
 **Codex note:** The OpenAI Codex provider authenticates via device code (open a URL, enter a code). Credentials are stored at `~/.codex/auth.json` and auto-refresh. No Codex CLI installation required.
 
@@ -185,7 +186,7 @@ The `hermes config set` command automatically routes values to the right file �
 | Browser automation | Local Playwright by default; optional [Browserbase](https://browserbase.com/) fallback | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` only if using Browserbase |
 | Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
 | Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
-| OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
+| OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` or `OPENAI_API_KEY` |
 | RL Training | [Tinker](https://tinker-console.thinkingmachines.ai/) + [WandB](https://wandb.ai/) | `TINKER_API_KEY`, `WANDB_API_KEY` |
 | Cross-session user modeling | [Honcho](https://honcho.dev/) | `HONCHO_API_KEY` |
 
@@ -1319,7 +1320,7 @@ uv pip install -e "."
 | `all` | Everything below | `uv pip install -e ".[all]"` |
 | `messaging` | Telegram & Discord gateway | `uv pip install -e ".[messaging]"` |
 | `cron` | Cron expression parsing for scheduled tasks | `uv pip install -e ".[cron]"` |
-| `cli` | Terminal menu UI for setup wizard | `uv pip install -e ".[cli]"` |
+| `cli` | Terminal menu UI for setup wizard and optional CLI voice mode | `uv pip install -e ".[cli]"` |
 | `modal` | Modal cloud execution backend (swe-rex + modal + boto3) | `uv pip install -e ".[modal]"` |
 | `dev` | pytest & test utilities | `uv pip install -e ".[dev]"` |
 
@@ -1626,7 +1627,7 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 | `OPENAI_API_KEY` | API key for custom OpenAI-compatible endpoints (used with `OPENAI_BASE_URL`) |
 | `OPENAI_BASE_URL` | Base URL for custom endpoint (VLLM, SGLang, etc.) |
 | `LLM_MODEL` | Default model name (fallback when `HERMES_MODEL` is not set) |
-| `VOICE_TOOLS_OPENAI_KEY` | OpenAI key for TTS and voice transcription (separate from custom endpoint) |
+| `VOICE_TOOLS_OPENAI_KEY` | Optional OpenAI key override for TTS and voice transcription. If unset, Hermes falls back to `OPENAI_API_KEY`. |
 | `HERMES_HOME` | Override Hermes config directory (default: `~/.hermes`). All config, sessions, logs, and skills are stored here. |
 
 **Provider Auth (OAuth):**
@@ -1763,7 +1764,7 @@ hermes config    # View current settings
 Common issues:
 - **"API key not set"**: Run `hermes setup` or `hermes config set OPENROUTER_API_KEY your_key`
 - **"hermes: command not found"**: Reload your shell (`source ~/.bashrc`) or check PATH
-- **"Run `hermes setup` to re-authenticate"**: Your Nous Portal session expired. Run `hermes setup` or `hermes model` to refresh.
+- **"Run `hermes login` to re-authenticate"**: Your OAuth-backed provider session expired. Run `hermes login` to refresh credentials, then use `hermes model` only if you want to change the selected provider or model.
 - **"No active paid subscription"**: Your Nous Portal account needs an active subscription for inference.
 - **Gateway won't start**: Check `hermes gateway status` and logs
 - **Missing config after update**: Run `hermes config check` to see what's new, then `hermes config migrate` to add missing options

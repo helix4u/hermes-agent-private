@@ -342,6 +342,11 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     return output_path
 
 
+def _get_openai_voice_api_key() -> str:
+    """Resolve the OpenAI key used for STT/TTS, preferring the voice-specific override."""
+    return os.getenv("VOICE_TOOLS_OPENAI_KEY") or os.getenv("OPENAI_API_KEY") or ""
+
+
 # ===========================================================================
 # Provider: OpenAI TTS
 # ===========================================================================
@@ -357,9 +362,9 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     Returns:
         Path to the saved audio file.
     """
-    api_key = os.getenv("VOICE_TOOLS_OPENAI_KEY", "")
+    api_key = _get_openai_voice_api_key()
     if not api_key:
-        raise ValueError("VOICE_TOOLS_OPENAI_KEY not set. Get one at https://platform.openai.com/api-keys")
+        raise ValueError("VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY not set. Get one at https://platform.openai.com/api-keys")
 
     oai_config = tts_config.get("openai", {})
     model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
@@ -644,7 +649,7 @@ def check_tts_requirements() -> bool:
         return True
     if _HAS_ELEVENLABS and os.getenv("ELEVENLABS_API_KEY"):
         return True
-    if _HAS_OPENAI and os.getenv("VOICE_TOOLS_OPENAI_KEY"):
+    if _HAS_OPENAI and _get_openai_voice_api_key():
         return True
     return False
 
@@ -661,7 +666,10 @@ if __name__ == "__main__":
     print(f"  ElevenLabs: {'✅ installed' if _HAS_ELEVENLABS else '❌ not installed (pip install elevenlabs)'}")
     print(f"    API Key:  {'✅ set' if os.getenv('ELEVENLABS_API_KEY') else '❌ not set'}")
     print(f"  OpenAI:     {'✅ installed' if _HAS_OPENAI else '❌ not installed'}")
-    print(f"    API Key:  {'✅ set' if os.getenv('VOICE_TOOLS_OPENAI_KEY') else '❌ not set (VOICE_TOOLS_OPENAI_KEY)'}")
+    print(
+        "    API Key:  "
+        f"{'✅ set' if _get_openai_voice_api_key() else '❌ not set (VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)'}"
+    )
     print(f"  ffmpeg:     {'✅ found' if _has_ffmpeg() else '❌ not found (needed for Telegram Opus)'}")
     print(f"\n  Output dir: {DEFAULT_OUTPUT_DIR}")
 

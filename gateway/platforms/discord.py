@@ -470,15 +470,37 @@ class DiscordAdapter(BasePlatformAdapter):
                 last_err: Optional[Exception] = None
                 for attempt in range(1, self.CHAIN_SEND_MAX_RETRIES + 1):
                     try:
+                        chunk_reference = reference if i == 0 else None
                         msg = await channel.send(
                             embed=embed,
                             view=view,
-                            reference=reference if i == 0 else None,
+                            reference=chunk_reference,
                         )
                         message_ids.append(str(msg.id))
                         last_err = None
                         break
                     except Exception as e:
+                        err_text = str(e)
+                        if (
+                            chunk_reference is not None
+                            and "error code: 50035" in err_text
+                            and "Cannot reply to a system message" in err_text
+                        ):
+                            logger.warning(
+                                "[discord] reply target %s is a Discord system message; retrying chunk send without reply reference",
+                                reply_to,
+                            )
+                            try:
+                                msg = await channel.send(
+                                    embed=embed,
+                                    view=view,
+                                    reference=None,
+                                )
+                                message_ids.append(str(msg.id))
+                                last_err = None
+                                break
+                            except Exception as retry_without_ref_error:
+                                e = retry_without_ref_error
                         last_err = e
                         status = getattr(e, "status", None)
                         code = getattr(e, "code", None)
@@ -651,6 +673,66 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             print(f"[{self.name}] Failed to send image attachment, falling back to URL: {e}")
             return await super().send_image(chat_id, image_url, caption, reply_to)
+
+    async def _send_file_attachment(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> SendResult:
+        """Send a local file as a Discord attachment."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        channel = self._client.get_channel(int(chat_id))
+        if not channel:
+            channel = await self._client.fetch_channel(int(chat_id))
+        if not channel:
+            return SendResult(success=False, error=f"Channel {chat_id} not found")
+
+        filename = file_name or os.path.basename(file_path)
+        with open(file_path, "rb") as fh:
+            file = discord.File(fh, filename=filename)
+            msg = await channel.send(content=caption if caption else None, file=file)
+            return SendResult(success=True, message_id=str(msg.id))
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a local video file natively as a Discord attachment."""
+        _ = reply_to, metadata
+        try:
+            return await self._send_file_attachment(chat_id, video_path, caption)
+        except FileNotFoundError:
+            return SendResult(success=False, error=f"Video file not found: {video_path}")
+        except Exception as e:
+            logger.error("[%s] Failed to send local video, falling back to base adapter: %s", self.name, e, exc_info=True)
+            return await super().send_video(chat_id, video_path, caption, reply_to, metadata=metadata)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an arbitrary file natively as a Discord attachment."""
+        _ = reply_to, metadata
+        try:
+            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name)
+        except FileNotFoundError:
+            return SendResult(success=False, error=f"File not found: {file_path}")
+        except Exception as e:
+            logger.error("[%s] Failed to send document, falling back to base adapter: %s", self.name, e, exc_info=True)
+            return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
     
     async def send_typing(self, chat_id: str) -> None:
         """Send typing indicator."""
@@ -993,6 +1075,16 @@ class DiscordAdapter(BasePlatformAdapter):
             await self.handle_message(event)
             try:
                 await interaction.followup.send("Status sent~", ephemeral=True)
+            except Exception as e:
+                logger.debug("Discord followup failed: %s", e)
+
+        @tree.command(name="update", description="Update Hermes Agent and notify this chat when it finishes")
+        async def slash_update(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            event = self._build_slash_event(interaction, "/update")
+            await self.handle_message(event)
+            try:
+                await interaction.followup.send("Update requested~", ephemeral=True)
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 

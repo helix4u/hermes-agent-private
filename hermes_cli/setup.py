@@ -31,6 +31,17 @@ from hermes_cli.config import (
 
 from hermes_cli.colors import Colors, color
 
+
+def _has_runtime_vision_backend() -> bool:
+    """Check vision availability using the same resolver as the runtime tools."""
+    try:
+        from agent.auxiliary_client import get_vision_auxiliary_client
+
+        client, _model = get_vision_auxiliary_client()
+        return client is not None
+    except Exception:
+        return False
+
 def _has_any_provider_configured() -> bool:
     """Check whether at least one inference provider is currently usable."""
     # API-key based providers (treat blank values as not configured)
@@ -40,6 +51,14 @@ def _has_any_provider_configured() -> bool:
         or get_env_value("ANTHROPIC_API_KEY")
     ):
         return True
+
+    try:
+        from agent.anthropic_adapter import resolve_anthropic_token
+
+        if resolve_anthropic_token():
+            return True
+    except Exception:
+        pass
 
     # OAuth providers (e.g., Nous Portal)
     auth_file = get_hermes_home() / "auth.json"
@@ -306,12 +325,16 @@ def _print_setup_summary(config: dict, hermes_home):
     
     tool_status = []
     
-    # OpenRouter (required for vision, moa)
-    if get_env_value('OPENROUTER_API_KEY'):
+    # Vision uses the same runtime resolver as the actual tool, while MoA
+    # still depends on OpenRouter.
+    if _has_runtime_vision_backend():
         tool_status.append(("Vision (image analysis)", True, None))
+    else:
+        tool_status.append(("Vision (image analysis)", False, "run 'hermes setup' to configure"))
+
+    if get_env_value('OPENROUTER_API_KEY'):
         tool_status.append(("Mixture of Agents", True, None))
     else:
-        tool_status.append(("Vision (image analysis)", False, "OPENROUTER_API_KEY"))
         tool_status.append(("Mixture of Agents", False, "OPENROUTER_API_KEY"))
     
     # Firecrawl (web tools)
@@ -402,7 +425,7 @@ def _print_setup_summary(config: dict, hermes_home):
     print()
     print(f"   {color('hermes config', Colors.GREEN)}        View current settings")
     print(f"   {color('hermes config edit', Colors.GREEN)}   Open config in your editor")
-    print(f"   {color('hermes config set KEY VALUE', Colors.GREEN)}")
+    print(f"   {color('hermes config set <key> <value>', Colors.GREEN)}")
     print(f"                         Set a specific value")
     print()
     print(f"   Or edit the files directly:")
@@ -805,11 +828,11 @@ def run_setup_wizard(args):
 
         except SystemExit:
             print_warning("Nous Portal login was cancelled or failed.")
-            print_info("You can try again later with: hermes model")
+            print_info("You can try again later with: hermes login")
             selected_provider = None
         except Exception as e:
             print_error(f"Login failed: {e}")
-            print_info("You can try again later with: hermes model")
+            print_info("You can try again later with: hermes login")
             selected_provider = None
 
     elif provider_idx == 1:  # OpenAI Codex
@@ -829,11 +852,11 @@ def run_setup_wizard(args):
             _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
         except SystemExit:
             print_warning("OpenAI Codex login was cancelled or failed.")
-            print_info("You can try again later with: hermes model")
+            print_info("You can try again later with: hermes login")
             selected_provider = None
         except Exception as e:
             print_error(f"Login failed: {e}")
-            print_info("You can try again later with: hermes model")
+            print_info("You can try again later with: hermes login")
             selected_provider = None
 
     elif provider_idx == 2:  # OpenRouter
@@ -893,15 +916,19 @@ def run_setup_wizard(args):
     # else: provider_idx == 4 (Keep current) — only shown when a provider already exists
 
     # =========================================================================
-    # Step 1b: OpenRouter API Key for tools (if not already set)
+    # Step 1b: OpenRouter API Key for web + MoA tools (if not already set)
     # =========================================================================
-    # Tools (vision, web, MoA) use OpenRouter independently of the main provider.
-    # Prompt for OpenRouter key if not set and a non-OpenRouter provider was chosen.
+    # Vision may already be covered by the selected provider or auxiliary
+    # overrides; web search/extract and MoA still rely on OpenRouter.
     if selected_provider in ("nous", "openai-codex", "custom") and not get_env_value("OPENROUTER_API_KEY"):
         print()
-        print_header("OpenRouter API Key (for tools)")
-        print_info("Tools like vision analysis, web search, and MoA use OpenRouter")
+        print_header("OpenRouter API Key (for web + MoA tools)")
+        print_info("Web search/extract and Mixture of Agents use OpenRouter")
         print_info("independently of your main inference provider.")
+        if _has_runtime_vision_backend():
+            print_info("Vision is already available through your current provider/runtime setup.")
+        else:
+            print_info("Vision can also be configured separately below.")
         print_info("Get your API key at: https://openrouter.ai/keys")
 
         api_key = prompt("  OpenRouter API key (optional, press Enter to skip)", password=True)
@@ -909,7 +936,53 @@ def run_setup_wizard(args):
             save_env_value("OPENROUTER_API_KEY", api_key)
             print_success("OpenRouter API key saved (for tools)")
         else:
-            print_info("Skipped - some tools (vision, web scraping) won't work without this")
+            print_info("Skipped - web scraping and Mixture of Agents won't use OpenRouter until configured")
+
+    # =========================================================================
+    # Step 1c: Vision & Image Analysis (optional)
+    # =========================================================================
+    if not _has_runtime_vision_backend():
+        print()
+        print_header("Vision & Image Analysis (optional)")
+        print_info("Vision uses a separate multimodal backend.")
+        print_info("Choose a backend now or skip and configure it later.")
+        print()
+
+        vision_choices = [
+            "OpenRouter — uses Gemini",
+            "OpenAI-compatible endpoint — base URL, API key, and vision model",
+            "Skip for now",
+        ]
+        vision_idx = prompt_choice("Configure vision:", vision_choices, 2)
+
+        if vision_idx == 0:
+            api_key = prompt("  OpenRouter API key", password=True)
+            if api_key:
+                save_env_value("OPENROUTER_API_KEY", api_key.strip())
+                print_success("OpenRouter key saved — vision will use Gemini")
+            else:
+                print_info("Skipped — vision won't be available")
+        elif vision_idx == 1:
+            base_url = prompt("  Base URL (blank for OpenAI)", "https://api.openai.com/v1").strip()
+            api_key_label = "  OpenAI API key" if "api.openai.com" in base_url.lower() else "  API key"
+            api_key = prompt(api_key_label, password=True).strip()
+            vision_model_default = "gpt-4o-mini" if "api.openai.com" in base_url.lower() else ""
+            vision_model = prompt("  Vision model (blank = use backend default)", vision_model_default).strip()
+
+            if api_key:
+                config.setdefault("auxiliary", {}).setdefault("vision", {})
+                config["auxiliary"]["vision"]["base_url"] = base_url
+                config["auxiliary"]["vision"]["api_key"] = api_key
+                config["auxiliary"]["vision"]["model"] = vision_model
+                save_config(config)
+                print_success(
+                    f"Vision configured with {base_url}"
+                    + (f" ({vision_model})" if vision_model else "")
+                )
+            else:
+                print_info("Skipped — vision won't be available")
+        else:
+            print_info("Skipped — add later with 'hermes setup' or auxiliary.vision in config.yaml")
 
     # =========================================================================
     # Step 2: Model Selection (adapts based on provider)
@@ -943,6 +1016,15 @@ def run_setup_wizard(args):
                     config['model'] = custom
                     save_env_value("LLM_MODEL", custom)
             # else: keep current
+        elif selected_provider == "nous":
+            # Nous login succeeded but model discovery failed — prompt manually
+            # instead of falling through to the OpenRouter static list.
+            print_warning("Could not fetch available models from Nous Portal.")
+            print_info(f"Enter a Nous model name manually, or press Enter to keep '{current_model}'.")
+            custom = prompt("  Model name")
+            if custom:
+                config['model'] = custom
+                save_env_value("LLM_MODEL", custom)
         elif selected_provider == "openai-codex":
             from hermes_cli.codex_models import get_codex_model_ids
             # Try to get the access token for live model discovery
@@ -1020,19 +1102,20 @@ def run_setup_wizard(args):
     
     terminal_choices.extend([
         "Modal (cloud execution, GPU access, serverless)",
+        "Daytona (cloud sandboxes, persistent workspaces)",
         "SSH (run commands on a remote server)",
         f"Keep current ({current_backend})"
     ])
     
     # Build index map based on available choices
     if is_linux:
-        backend_to_idx = {'local': 0, 'docker': 1, 'singularity': 2, 'modal': 3, 'ssh': 4}
-        idx_to_backend = {0: 'local', 1: 'docker', 2: 'singularity', 3: 'modal', 4: 'ssh'}
-        keep_current_idx = 5
+        backend_to_idx = {'local': 0, 'docker': 1, 'singularity': 2, 'modal': 3, 'daytona': 4, 'ssh': 5}
+        idx_to_backend = {0: 'local', 1: 'docker', 2: 'singularity', 3: 'modal', 4: 'daytona', 5: 'ssh'}
+        keep_current_idx = 6
     else:
-        backend_to_idx = {'local': 0, 'docker': 1, 'modal': 2, 'ssh': 3}
-        idx_to_backend = {0: 'local', 1: 'docker', 2: 'modal', 3: 'ssh'}
-        keep_current_idx = 4
+        backend_to_idx = {'local': 0, 'docker': 1, 'modal': 2, 'daytona': 3, 'ssh': 4}
+        idx_to_backend = {0: 'local', 1: 'docker', 2: 'modal', 3: 'daytona', 4: 'ssh'}
+        keep_current_idx = 5
         if current_backend == 'singularity':
             print_warning("Singularity is only available on Linux - please select a different backend")
     
@@ -1074,7 +1157,7 @@ def run_setup_wizard(args):
         
         print()
         print_info("Note: Container resource settings (CPU, memory, disk, persistence)")
-        print_info("are in your config but only apply to Docker/Singularity/Modal backends.")
+        print_info("are in your config but only apply to Docker/Singularity/Modal/Daytona backends.")
 
         if prompt_yes_no("  Enable sudo support? (allows agent to run sudo commands)", False):
             print_warning("  SECURITY WARNING: Sudo password will be stored in plaintext")
@@ -1158,6 +1241,49 @@ def run_setup_wizard(args):
         
         _prompt_container_resources(config)
         print_success("Terminal set to Modal")
+
+    elif selected_backend == 'daytona':
+        config.setdefault('terminal', {})['backend'] = 'daytona'
+        default_daytona = config.get('terminal', {}).get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')
+        print_info("Daytona Cloud Configuration:")
+        print_info("Get your API key at: https://app.daytona.io/dashboard/keys")
+
+        try:
+            from daytona import Daytona
+            print_info("daytona SDK: installed ✓")
+        except ImportError:
+            print_info("Installing required package: daytona...")
+            import shutil
+            uv_bin = shutil.which("uv")
+            if uv_bin:
+                result = subprocess.run(
+                    [uv_bin, "pip", "install", "daytona"],
+                    capture_output=True, text=True
+                )
+            else:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "daytona"],
+                    capture_output=True, text=True
+                )
+            if result.returncode == 0:
+                print_success("daytona SDK installed")
+            else:
+                print_warning("Failed to install daytona SDK - install manually:")
+                print_info("  pip install daytona")
+
+        daytona_image = prompt("  Container image", default_daytona)
+        config['terminal']['daytona_image'] = daytona_image
+
+        current_key = get_env_value('DAYTONA_API_KEY')
+        if current_key:
+            print_info(f"  API Key: {current_key[:8]}... (configured)")
+
+        api_key = prompt("  Daytona API key", current_key or "", password=True)
+        if api_key:
+            save_env_value("DAYTONA_API_KEY", api_key)
+
+        _prompt_container_resources(config)
+        print_success("Terminal set to Daytona")
     
     elif selected_backend == 'ssh':
         config.setdefault('terminal', {})['backend'] = 'ssh'
@@ -1188,7 +1314,7 @@ def run_setup_wizard(args):
         
         print()
         print_info("Note: Container resource settings (CPU, memory, disk, persistence)")
-        print_info("are in your config but only apply to Docker/Singularity/Modal backends.")
+        print_info("are in your config but only apply to Docker/Singularity/Modal/Daytona backends.")
         print_success("Terminal set to SSH")
     # else: Keep current (selected_backend is None)
     
@@ -1199,6 +1325,15 @@ def run_setup_wizard(args):
         docker_image = config.get('terminal', {}).get('docker_image')
         if docker_image:
             save_env_value("TERMINAL_DOCKER_IMAGE", docker_image)
+        singularity_image = config.get('terminal', {}).get('singularity_image')
+        if singularity_image:
+            save_env_value("TERMINAL_SINGULARITY_IMAGE", singularity_image)
+        modal_image = config.get('terminal', {}).get('modal_image')
+        if modal_image:
+            save_env_value("TERMINAL_MODAL_IMAGE", modal_image)
+        daytona_image = config.get('terminal', {}).get('daytona_image')
+        if daytona_image:
+            save_env_value("TERMINAL_DAYTONA_IMAGE", daytona_image)
     
     # =========================================================================
     # Step 5: Agent Settings
@@ -1468,8 +1603,22 @@ def run_setup_wizard(args):
         print_info("Steps to create a Slack app:")
         print_info("   1. Go to https://api.slack.com/apps → Create New App")
         print_info("   2. Enable Socket Mode: App Settings → Socket Mode → Enable")
-        print_info("   3. Bot Token: OAuth & Permissions → Install to Workspace")
-        print_info("   4. App Token: Basic Information → App-Level Tokens → Generate")
+        print_info("      • Create an App-Level Token with 'connections:write' scope")
+        print_info("   3. Add Bot Token Scopes: Features → OAuth & Permissions")
+        print_info("      Required scopes: chat:write, app_mentions:read,")
+        print_info("      channels:history, channels:read, im:history,")
+        print_info("      im:read, im:write, users:read, files:write")
+        print_info("      Optional for private channels: groups:history")
+        print_info("   4. Subscribe to Events: Features → Event Subscriptions → Enable")
+        print_info("      Required events: message.im, message.channels, app_mention")
+        print_info("      Optional for private channels: message.groups")
+        print_warning("   ⚠ Without message.channels the bot will ONLY work in DMs,")
+        print_warning("     not public channels.")
+        print_info("   5. Install to Workspace: Settings → Install App")
+        print_info("   6. Reinstall the app after any scope or event changes")
+        print_info("   7. After installing, invite the bot to channels: /invite @YourBot")
+        print()
+        print_info("   Full guide: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack/")
         print()
         bot_token = prompt("Slack Bot Token (xoxb-...)", password=True)
         if bot_token:
@@ -1483,12 +1632,17 @@ def run_setup_wizard(args):
             print_info("🔒 Security: Restrict who can use your bot")
             print_info("   Find Slack user IDs in your profile or via the Slack API")
             print()
-            allowed_users = prompt("Allowed user IDs (comma-separated, leave empty for open access)")
+            allowed_users = prompt(
+                "Allowed user IDs (comma-separated, leave empty to deny everyone except paired users)"
+            )
             if allowed_users:
                 save_env_value("SLACK_ALLOWED_USERS", allowed_users.replace(" ", ""))
                 print_success("Slack allowlist configured")
             else:
-                print_info("⚠️  No allowlist set - anyone in your workspace can use the bot!")
+                print_warning("⚠️  No Slack allowlist set - unpaired users will be denied by default.")
+                print_info(
+                    "   Set SLACK_ALLOW_ALL_USERS=true or GATEWAY_ALLOW_ALL_USERS=true only if you intentionally want open workspace access."
+                )
     
     # WhatsApp
     existing_whatsapp = get_env_value('WHATSAPP_ENABLED')

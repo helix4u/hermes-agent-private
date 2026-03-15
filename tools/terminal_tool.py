@@ -451,7 +451,7 @@ def _get_env_config() -> Dict[str, Any]:
     # catches the case where cli.py (or .env) leaked the host's CWD.
     # SSH is excluded since /home/ paths are valid on remote machines.
     cwd = os.getenv("TERMINAL_CWD", default_cwd)
-    if env_type in ("modal", "docker", "singularity") and cwd:
+    if env_type in ("modal", "docker", "singularity", "daytona") and cwd:
         host_prefixes = ("/Users/", "C:\\", "C:/")
         looks_like_windows_drive = bool(re.match(r"^[A-Za-z]:[\\/]", cwd))
         if (any(cwd.startswith(p) for p in host_prefixes) or looks_like_windows_drive) and cwd != default_cwd:
@@ -465,6 +465,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
+        "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
         "cwd": cwd,
         "timeout": int(os.getenv("TERMINAL_TIMEOUT", "180")),
         "lifetime_seconds": int(os.getenv("TERMINAL_LIFETIME_SECONDS", "300")),
@@ -473,7 +474,7 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": int(os.getenv("TERMINAL_SSH_PORT", "22")),
         "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
-        # Container resource config (applies to docker, singularity, modal -- ignored for local/ssh)
+        # Container resource config (applies to docker, singularity, modal, daytona -- ignored for local/ssh)
         "container_cpu": float(os.getenv("TERMINAL_CONTAINER_CPU", "1")),
         "container_memory": int(os.getenv("TERMINAL_CONTAINER_MEMORY", "5120")),     # MB (default 5GB)
         "container_disk": int(os.getenv("TERMINAL_CONTAINER_DISK", "51200")),        # MB (default 50GB)
@@ -489,8 +490,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     Create an execution environment from mini-swe-agent.
     
     Args:
-        env_type: One of "local", "docker", "singularity", "modal", "ssh"
-        image: Docker/Singularity/Modal image name (ignored for local/ssh)
+        env_type: One of "local", "docker", "singularity", "modal", "daytona", "ssh"
+        image: Docker/Singularity/Modal/Daytona image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
         ssh_config: SSH connection config (for env_type="ssh")
@@ -539,6 +540,20 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             modal_sandbox_kwargs=sandbox_kwargs,
             persistent_filesystem=persistent, task_id=task_id,
         )
+
+    elif env_type == "daytona":
+        from tools.environments.daytona import DaytonaEnvironment as _DaytonaEnvironment
+
+        return _DaytonaEnvironment(
+            image=image,
+            cwd=cwd,
+            timeout=timeout,
+            cpu=int(cpu),
+            memory=memory,
+            disk=disk,
+            persistent_filesystem=persistent,
+            task_id=task_id,
+        )
     
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
@@ -553,7 +568,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         )
     
     else:
-        raise ValueError(f"Unknown environment type: {env_type}. Use 'local', 'docker', 'singularity', 'modal', or 'ssh'")
+        raise ValueError(
+            f"Unknown environment type: {env_type}. Use 'local', 'docker', "
+            "'singularity', 'modal', 'daytona', or 'ssh'"
+        )
 
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
@@ -841,6 +859,8 @@ def terminal_tool(
             image = overrides.get("singularity_image") or config["singularity_image"]
         elif env_type == "modal":
             image = overrides.get("modal_image") or config["modal_image"]
+        elif env_type == "daytona":
+            image = overrides.get("daytona_image") or config["daytona_image"]
         else:
             image = ""
         
@@ -893,7 +913,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in ("docker", "singularity", "modal"):
+                        if env_type in ("docker", "singularity", "modal", "daytona"):
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
@@ -1134,15 +1154,38 @@ def check_terminal_requirements() -> bool:
         elif env_type == "ssh":
             from tools.environments.ssh import SSHEnvironment
             # Check that host and user are configured
-            return bool(config.get("ssh_host")) and bool(config.get("ssh_user"))
+            if not config.get("ssh_host") or not config.get("ssh_user"):
+                logger.error(
+                    "SSH backend selected but TERMINAL_SSH_HOST and TERMINAL_SSH_USER "
+                    "are not both set. Configure both or switch TERMINAL_ENV to 'local'."
+                )
+                return False
+            return True
         elif env_type == "modal":
             from minisweagent.environments.extra.swerex_modal import SwerexModalEnvironment
             # Check for modal token
-            return os.getenv("MODAL_TOKEN_ID") is not None or Path.home().joinpath(".modal.toml").exists()
+            has_token = os.getenv("MODAL_TOKEN_ID") is not None
+            has_config = Path.home().joinpath(".modal.toml").exists()
+            if not (has_token or has_config):
+                logger.error(
+                    "Modal backend selected but no MODAL_TOKEN_ID environment variable "
+                    "or ~/.modal.toml config file was found. Configure Modal or choose "
+                    "a different TERMINAL_ENV."
+                )
+                return False
+            return True
+        elif env_type == "daytona":
+            from daytona import Daytona
+            return os.getenv("DAYTONA_API_KEY") is not None
         else:
+            logger.error(
+                "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
+                "modal, daytona, ssh.",
+                env_type,
+            )
             return False
     except Exception as e:
-        logger.error("Terminal requirements check failed: %s", e)
+        logger.error("Terminal requirements check failed: %s", e, exc_info=True)
         return False
 
 
@@ -1177,10 +1220,11 @@ if __name__ == "__main__":
 
     print("\nEnvironment Variables:")
     default_img = "nikolaik/python-nodejs:python3.11-nodejs20"
-    print(f"  TERMINAL_ENV: {os.getenv('TERMINAL_ENV', 'local')} (local/docker/singularity/modal/ssh)")
+    print(f"  TERMINAL_ENV: {os.getenv('TERMINAL_ENV', 'local')} (local/docker/singularity/modal/daytona/ssh)")
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
+    print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
     print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', os.getcwd())}")
     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', '~/.hermes/sandboxes')}")
     print(f"  TERMINAL_TIMEOUT: {os.getenv('TERMINAL_TIMEOUT', '60')}")

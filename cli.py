@@ -17,10 +17,12 @@ import os
 import sys
 import json
 import atexit
+import subprocess
 import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -49,23 +51,21 @@ import threading
 import queue
 
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback
-from dotenv import load_dotenv
+# Load .env from ~/.hermes/.env first, then project root as dev fallback.
+# User-managed env files should override stale shell exports on restart.
 from hermes_constants import OPENROUTER_BASE_URL
+from hermes_cli.env_loader import load_hermes_dotenv
+from tools.voice_mode import (
+    AudioRecorder,
+    check_voice_requirements,
+    play_audio_file,
+    play_beep,
+    transcribe_recording,
+)
 
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-_user_env = _hermes_home / ".env"
 _project_env = Path(__file__).parent / '.env'
-if _user_env.exists():
-    try:
-        load_dotenv(dotenv_path=_user_env, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=_user_env, encoding="latin-1")
-elif _project_env.exists():
-    try:
-        load_dotenv(dotenv_path=_project_env, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=_project_env, encoding="latin-1")
+load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env, logger=logger)
 
 # Point mini-swe-agent at ~/.hermes/ so it shares our config
 os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(_hermes_home))
@@ -197,12 +197,37 @@ def load_cli_config() -> Dict[str, Any]:
         "display": {
             "compact": False,
         },
+        "voice": {
+            "record_key": "ctrl+b",
+            "max_recording_seconds": 120,
+            "auto_tts": False,
+        },
         "clarify": {
             "timeout": 120,  # Seconds to wait for a clarify answer before auto-proceeding
         },
         "code_execution": {
             "timeout": 300,    # Max seconds a sandbox script can run before being killed (5 min)
             "max_tool_calls": 50,  # Max RPC tool calls per execution
+        },
+        "auxiliary": {
+            "text": {
+                "provider": "",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+            },
+            "vision": {
+                "provider": "",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+            },
+            "web_extract": {
+                "provider": "",
+                "model": "",
+                "base_url": "",
+                "api_key": "",
+            },
         },
         "delegation": {
             "max_iterations": 45,  # Max tool-calling turns per child agent
@@ -346,6 +371,40 @@ def load_cli_config() -> Dict[str, Any]:
     for config_key, env_var in compression_env_mappings.items():
         if config_key in compression_config:
             os.environ[env_var] = str(compression_config[config_key])
+
+    auxiliary_config = defaults.get("auxiliary", {})
+    auxiliary_env_mappings = {
+        "text": {
+            "provider": "AUXILIARY_TEXT_PROVIDER",
+            "model": "AUXILIARY_TEXT_MODEL",
+            "base_url": "AUXILIARY_TEXT_BASE_URL",
+            "api_key": "AUXILIARY_TEXT_API_KEY",
+        },
+        "vision": {
+            "provider": "AUXILIARY_VISION_PROVIDER",
+            "model": "AUXILIARY_VISION_MODEL",
+            "base_url": "AUXILIARY_VISION_BASE_URL",
+            "api_key": "AUXILIARY_VISION_API_KEY",
+        },
+        "web_extract": {
+            "provider": "AUXILIARY_WEB_EXTRACT_PROVIDER",
+            "model": "AUXILIARY_WEB_EXTRACT_MODEL",
+            "base_url": "AUXILIARY_WEB_EXTRACT_BASE_URL",
+            "api_key": "AUXILIARY_WEB_EXTRACT_API_KEY",
+        },
+    }
+
+    for task_key, env_map in auxiliary_env_mappings.items():
+        task_cfg = auxiliary_config.get(task_key, {})
+        if not isinstance(task_cfg, dict):
+            continue
+        for cfg_key, env_var in env_map.items():
+            value = task_cfg.get(cfg_key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                os.environ[env_var] = text
     
     return defaults
 
@@ -365,8 +424,7 @@ from model_tools import get_tool_definitions, get_toolset_for_tool
 # Extracted CLI modules (Phase 3)
 from hermes_cli.banner import (
     cprint as _cprint, _GOLD, _BOLD, _DIM, _RST,
-    VERSION, HERMES_AGENT_LOGO, HERMES_CADUCEUS, COMPACT_BANNER,
-    get_available_skills as _get_available_skills,
+    COMPACT_BANNER,
     build_welcome_banner,
 )
 from hermes_cli.commands import COMMANDS, SlashCommandCompleter
@@ -394,6 +452,58 @@ def _run_cleanup():
         _cleanup_all_terminals()
     except Exception:
         pass
+
+
+def _git_run(args: List[str], cwd: Path) -> subprocess.CompletedProcess:
+    """Run a git command with UTF-8-safe text capture."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+
+def _find_git_toplevel(start_dir: Path) -> Optional[Path]:
+    """Return the top-level Git worktree for start_dir, or None if not in Git."""
+    result = _git_run(["rev-parse", "--show-toplevel"], start_dir)
+    if result.returncode != 0:
+        return None
+    output = (result.stdout or "").strip()
+    if not output:
+        return None
+    return Path(output)
+
+
+def _create_isolated_worktree(start_dir: Path) -> Path:
+    """
+    Create an isolated detached Git worktree for a fresh CLI session.
+
+    The worktree is created as a sibling under `.hermes-worktrees/` so
+    multiple interactive sessions can operate on the same repo concurrently.
+    """
+    git_root = _find_git_toplevel(start_dir)
+    if git_root is None:
+        raise RuntimeError("--worktree requires running Hermes inside a Git repository.")
+
+    worktrees_root = git_root.parent / ".hermes-worktrees"
+    worktrees_root.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:6]
+    target = worktrees_root / f"{git_root.name}-{stamp}_{suffix}"
+
+    result = _git_run(["worktree", "add", "--detach", str(target), "HEAD"], git_root)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if detail:
+            raise RuntimeError(f"Failed to create Git worktree: {detail}")
+        raise RuntimeError("Failed to create Git worktree.")
+
+    return target
     try:
         _cleanup_all_browsers()
     except Exception:
@@ -479,207 +589,6 @@ HERMES_CADUCEUS = """[#CD7F32]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⣀⣀�
 [#B8860B]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[/]"""
 
 # Compact banner for smaller terminals (fallback)
-COMPACT_BANNER = """
-[bold #FFD700]╔══════════════════════════════════════════════════════════════╗[/]
-[bold #FFD700]║[/]  [#FFBF00]⚕ NOUS HERMES[/] [dim #B8860B]- AI Agent Framework[/]              [bold #FFD700]║[/]
-[bold #FFD700]║[/]  [#CD7F32]Messenger of the Digital Gods[/]    [dim #B8860B]Nous Research[/]   [bold #FFD700]║[/]
-[bold #FFD700]╚══════════════════════════════════════════════════════════════╝[/]
-"""
-
-
-def _get_available_skills() -> Dict[str, List[str]]:
-    """
-    Scan ~/.hermes/skills/ and return skills grouped by category.
-    
-    Returns:
-        Dict mapping category name to list of skill names
-    """
-    import os
-    
-    hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-    skills_dir = hermes_home / "skills"
-    skills_by_category = {}
-    
-    if not skills_dir.exists():
-        return skills_by_category
-    
-    for skill_file in skills_dir.rglob("SKILL.md"):
-        rel_path = skill_file.relative_to(skills_dir)
-        parts = rel_path.parts
-        
-        if len(parts) >= 2:
-            category = parts[0]
-            skill_name = parts[-2]
-        else:
-            category = "general"
-            skill_name = skill_file.parent.name
-        
-        skills_by_category.setdefault(category, []).append(skill_name)
-    
-    return skills_by_category
-
-
-def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dict] = None, enabled_toolsets: List[str] = None, session_id: str = None):
-    """
-    Build and print a Claude Code-style welcome banner with caduceus on left and info on right.
-    
-    Args:
-        console: Rich Console instance for printing
-        model: The current model name (e.g., "anthropic/claude-sonnet-4")
-        cwd: Current working directory
-        tools: List of tool definitions
-        enabled_toolsets: List of enabled toolset names
-        session_id: Unique session identifier for logging
-    """
-    from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
-    
-    tools = tools or []
-    enabled_toolsets = enabled_toolsets or []
-    
-    # Get unavailable tools info for coloring
-    _, unavailable_toolsets = check_tool_availability(quiet=True)
-    disabled_tools = set()
-    for item in unavailable_toolsets:
-        disabled_tools.update(item.get("tools", []))
-    
-    # Build the side-by-side content using a table for precise control
-    layout_table = Table.grid(padding=(0, 2))
-    layout_table.add_column("left", justify="center")
-    layout_table.add_column("right", justify="left")
-    
-    # Build left content: caduceus + model info
-    left_lines = ["", HERMES_CADUCEUS, ""]
-    
-    # Shorten model name for display
-    model_short = model.split("/")[-1] if "/" in model else model
-    if len(model_short) > 28:
-        model_short = model_short[:25] + "..."
-    
-    left_lines.append(f"[#FFBF00]{model_short}[/] [dim #B8860B]·[/] [dim #B8860B]Nous Research[/]")
-    left_lines.append(f"[dim #B8860B]{cwd}[/]")
-    
-    # Add session ID if provided
-    if session_id:
-        left_lines.append(f"[dim #8B8682]Session: {session_id}[/]")
-    left_content = "\n".join(left_lines)
-    
-    # Build right content: tools list grouped by toolset
-    right_lines = []
-    right_lines.append("[bold #FFBF00]Available Tools[/]")
-    
-    # Group tools by toolset (include all possible tools, both enabled and disabled)
-    toolsets_dict = {}
-    
-    # First, add all enabled tools
-    for tool in tools:
-        tool_name = tool["function"]["name"]
-        toolset = get_toolset_for_tool(tool_name) or "other"
-        if toolset not in toolsets_dict:
-            toolsets_dict[toolset] = []
-        toolsets_dict[toolset].append(tool_name)
-    
-    # Also add disabled toolsets so they show in the banner
-    for item in unavailable_toolsets:
-        # Map the internal toolset ID to display name
-        toolset_id = item.get("id", item.get("name", "unknown"))
-        display_name = f"{toolset_id}_tools" if not toolset_id.endswith("_tools") else toolset_id
-        if display_name not in toolsets_dict:
-            toolsets_dict[display_name] = []
-        for tool_name in item.get("tools", []):
-            if tool_name not in toolsets_dict[display_name]:
-                toolsets_dict[display_name].append(tool_name)
-    
-    # Display tools grouped by toolset (compact format, max 8 groups)
-    sorted_toolsets = sorted(toolsets_dict.keys())
-    display_toolsets = sorted_toolsets[:8]
-    remaining_toolsets = len(sorted_toolsets) - 8
-    
-    for toolset in display_toolsets:
-        tool_names = toolsets_dict[toolset]
-        # Color each tool name - red if disabled, normal if enabled
-        colored_names = []
-        for name in sorted(tool_names):
-            if name in disabled_tools:
-                colored_names.append(f"[red]{name}[/]")
-            else:
-                colored_names.append(f"[#FFF8DC]{name}[/]")
-        
-        tools_str = ", ".join(colored_names)
-        # Truncate if too long (accounting for markup)
-        if len(", ".join(sorted(tool_names))) > 45:
-            # Rebuild with truncation
-            short_names = []
-            length = 0
-            for name in sorted(tool_names):
-                if length + len(name) + 2 > 42:
-                    short_names.append("...")
-                    break
-                short_names.append(name)
-                length += len(name) + 2
-            # Re-color the truncated list
-            colored_names = []
-            for name in short_names:
-                if name == "...":
-                    colored_names.append("[dim]...[/]")
-                elif name in disabled_tools:
-                    colored_names.append(f"[red]{name}[/]")
-                else:
-                    colored_names.append(f"[#FFF8DC]{name}[/]")
-            tools_str = ", ".join(colored_names)
-        
-        right_lines.append(f"[dim #B8860B]{toolset}:[/] {tools_str}")
-    
-    if remaining_toolsets > 0:
-        right_lines.append(f"[dim #B8860B](and {remaining_toolsets} more toolsets...)[/]")
-    
-    right_lines.append("")
-    
-    # Add skills section
-    right_lines.append("[bold #FFBF00]Available Skills[/]")
-    skills_by_category = _get_available_skills()
-    total_skills = sum(len(s) for s in skills_by_category.values())
-    
-    if skills_by_category:
-        for category in sorted(skills_by_category.keys()):
-            skill_names = sorted(skills_by_category[category])
-            # Show first 8 skills, then "..." if more
-            if len(skill_names) > 8:
-                display_names = skill_names[:8]
-                skills_str = ", ".join(display_names) + f" +{len(skill_names) - 8} more"
-            else:
-                skills_str = ", ".join(skill_names)
-            # Truncate if still too long
-            if len(skills_str) > 50:
-                skills_str = skills_str[:47] + "..."
-            right_lines.append(f"[dim #B8860B]{category}:[/] [#FFF8DC]{skills_str}[/]")
-    else:
-        right_lines.append("[dim #B8860B]No skills installed[/]")
-    
-    right_lines.append("")
-    right_lines.append(f"[dim #B8860B]{len(tools)} tools · {total_skills} skills · /help for commands[/]")
-    
-    right_content = "\n".join(right_lines)
-    
-    # Add to table
-    layout_table.add_row(left_content, right_content)
-    
-    # Wrap in a panel with the title
-    outer_panel = Panel(
-        layout_table,
-        title=f"[bold #FFD700]Hermes Agent {VERSION}[/]",
-        border_style="#CD7F32",
-        padding=(0, 2),
-    )
-    
-    # Print the big HERMES-AGENT logo first (no panel wrapper for full width)
-    console.print()
-    console.print(HERMES_AGENT_LOGO)
-    console.print()
-    
-    # Print the panel with caduceus and info
-    console.print(outer_panel)
-
-
 # ============================================================================
 # CLI Commands
 # ============================================================================
@@ -699,6 +608,7 @@ COMMANDS = {
     "/undo": "Remove the last user/assistant exchange",
     "/save": "Save the current conversation",
     "/config": "Show current configuration",
+    "/voice": "Toggle voice mode (Ctrl+B to record). Usage: /voice [on|off|tts|status]",
     "/cron": "Manage scheduled tasks (list, add, remove)",
     "/skills": "Search, install, inspect, or manage skills from online registries",
     "/platforms": "Show gateway/messaging platform status",
@@ -833,6 +743,8 @@ class HermesCLI:
         verbose: bool = False,
         compact: bool = False,
         resume: str = None,
+        pass_session_id: bool = False,
+        worktree_path: str = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -847,6 +759,8 @@ class HermesCLI:
             verbose: Enable verbose logging
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
+            pass_session_id: Include the session ID in the agent's system prompt
+            worktree_path: Optional isolated Git worktree path for this CLI session
         """
         # Initialize Rich console
         self.console = Console()
@@ -854,6 +768,7 @@ class HermesCLI:
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         self.tool_progress_mode = CLI_CONFIG["display"].get("tool_progress", "all")
         self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
+        self.pass_session_id = pass_session_id
         
         # Configuration - priority: CLI args > env vars > config file
         # Model can come from: CLI arg, LLM_MODEL env, OPENAI_MODEL env (custom endpoint), or config
@@ -952,6 +867,17 @@ class HermesCLI:
         self.conversation_history: List[Dict[str, Any]] = []
         self.session_start = datetime.now()
         self._resumed = False
+        self.worktree_path = worktree_path
+        voice_config = CLI_CONFIG.get("voice", {}) if isinstance(CLI_CONFIG.get("voice"), dict) else {}
+        self._voice_lock = threading.Lock()
+        self._voice_mode = False
+        self._voice_tts = bool(voice_config.get("auto_tts", False))
+        self._voice_recorder = None
+        self._voice_recording = False
+        self._voice_processing = False
+        self._voice_last_path = None
+        self._voice_record_key = str(voice_config.get("record_key", "ctrl+b") or "ctrl+b")
+        self._voice_max_recording_seconds = int(voice_config.get("max_recording_seconds", 120) or 120)
         
         # Session ID: reuse existing one when resuming, otherwise generate fresh
         if resume:
@@ -1119,6 +1045,8 @@ class HermesCLI:
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
                 honcho_session_key=self.session_id,
+                tool_progress_callback=self._on_tool_progress,
+                pass_session_id=self.pass_session_id,
             )
             return True
         except Exception as e:
@@ -1826,6 +1754,8 @@ class HermesCLI:
             self.undo_last()
         elif cmd_lower == "/save":
             self.save_conversation()
+        elif cmd_lower.startswith("/voice"):
+            self._handle_voice_command(cmd_original)
         elif cmd_lower.startswith("/cron"):
             self._handle_cron_command(cmd_original)
         elif cmd_lower.startswith("/skills"):
@@ -1838,6 +1768,8 @@ class HermesCLI:
             self._manual_compress()
         elif cmd_lower == "/usage":
             self._show_usage()
+        elif cmd_lower.startswith("/insights"):
+            self._show_insights(cmd_original)
         elif cmd_lower == "/reload-mcp":
             self._reload_mcp()
         else:
@@ -1854,10 +1786,199 @@ class HermesCLI:
                 else:
                     self.console.print(f"[bold red]Failed to load skill for {base_cmd}[/]")
             else:
-                self.console.print(f"[bold red]Unknown command: {cmd_lower}[/]")
-                self.console.print("[dim #B8860B]Type /help for available commands[/]")
+                from hermes_cli.commands import COMMANDS
+
+                typed_base = cmd_lower.split()[0]
+                all_known = set(COMMANDS) | set(_skill_commands)
+                matches = [name for name in all_known if name.startswith(typed_base)]
+
+                if len(matches) == 1:
+                    full_name = matches[0]
+                    if full_name == typed_base:
+                        self.console.print(f"[bold red]Unknown command: {cmd_lower}[/]")
+                        self.console.print("[dim #B8860B]Type /help for available commands[/]")
+                    else:
+                        remainder = cmd_original.strip()[len(typed_base):]
+                        full_cmd = full_name + remainder
+                        return self.process_command(full_cmd)
+                elif len(matches) > 1:
+                    self.console.print(f"[bold yellow]Ambiguous command: {cmd_lower}[/]")
+                    self.console.print(f"[dim]Did you mean: {', '.join(sorted(matches))}?[/]")
+                else:
+                    self.console.print(f"[bold red]Unknown command: {cmd_lower}[/]")
+                    self.console.print("[dim #B8860B]Type /help for available commands[/]")
         
         return True
+
+    def _on_tool_progress(self, tool_name: str, preview: str = "", extra: Any = None):
+        """Hook for agent tool progress events.
+
+        Voice mode does not currently need special progress handling, but we
+        wire this through so optional voice features can coexist with the
+        existing agent progress callback surface.
+        """
+        del tool_name, preview, extra
+
+    def _enable_voice_mode(self):
+        """Enable optional CLI voice mode if local requirements are satisfied."""
+        info = check_voice_requirements()
+        if not info.get("ok"):
+            print("Voice mode is not ready yet:")
+            for item in info.get("missing", []):
+                print(f"  - {item}")
+            return
+        self._voice_mode = True
+        status = "with auto-TTS" if self._voice_tts else "transcribe-only"
+        print(f"Voice mode enabled ({status}). Press {self._voice_record_key} to start/stop recording.")
+
+    def _disable_voice_mode(self):
+        """Disable voice mode and clear any in-progress local recording state."""
+        self._voice_mode = False
+        self._voice_tts = False
+        self._voice_recording = False
+        self._voice_processing = False
+        self._voice_recorder = None
+        print("Voice mode disabled.")
+
+    def _toggle_voice_tts(self, desired: Optional[bool] = None):
+        """Toggle or set automatic TTS playback for voice mode responses."""
+        self._voice_tts = (not self._voice_tts) if desired is None else bool(desired)
+        state = "enabled" if self._voice_tts else "disabled"
+        print(f"Voice auto-TTS {state}.")
+
+    def _show_voice_status(self):
+        """Display current voice-mode status and local environment readiness."""
+        info = check_voice_requirements()
+        env = info.get("environment", {})
+        print(f"Voice mode: {'ON' if self._voice_mode else 'OFF'}")
+        print(f"Auto-TTS:   {'ON' if self._voice_tts else 'OFF'}")
+        print(f"Record key: {self._voice_record_key}")
+        print(f"Recording deps ready: {'yes' if env.get('recording_available') else 'no'}")
+        print(f"Playback available:   {'yes' if env.get('playback_available') else 'no'}")
+        print(f"STT enabled:          {'yes' if env.get('stt_enabled') else 'no'}")
+        if not info.get("ok"):
+            print("Missing requirements:")
+            for item in info.get("missing", []):
+                print(f"  - {item}")
+
+    def _handle_voice_command(self, command: str):
+        """Handle /voice command family."""
+        parts = command.strip().split()
+        action = parts[1].lower() if len(parts) > 1 else ""
+
+        if action in ("", "toggle"):
+            if self._voice_mode:
+                self._disable_voice_mode()
+            else:
+                self._enable_voice_mode()
+            return
+
+        if action in ("on", "enable"):
+            self._enable_voice_mode()
+            return
+        if action in ("off", "disable"):
+            self._disable_voice_mode()
+            return
+        if action == "status":
+            self._show_voice_status()
+            return
+        if action == "tts":
+            if len(parts) > 2 and parts[2].lower() in ("on", "off"):
+                self._toggle_voice_tts(parts[2].lower() == "on")
+            else:
+                self._toggle_voice_tts()
+            return
+
+        print("Usage: /voice [on|off|tts|status]")
+
+    def _voice_start_recording(self):
+        """Start a push-to-talk recording session in the CLI."""
+        if not self._voice_mode:
+            return
+        with self._voice_lock:
+            if self._voice_recording or self._voice_processing:
+                return
+            info = check_voice_requirements()
+            if not info.get("ok"):
+                print("Voice mode is not ready yet:")
+                for item in info.get("missing", []):
+                    print(f"  - {item}")
+                return
+            try:
+                self._voice_recorder = AudioRecorder(
+                    max_duration=self._voice_max_recording_seconds,
+                )
+                self._voice_recorder.start()
+                self._voice_recording = True
+            except Exception as e:
+                print(f"Failed to start recording: {e}")
+                self._voice_recorder = None
+                self._voice_recording = False
+                return
+
+        play_beep()
+        print("Recording... Press the voice key again to stop.")
+
+    def _voice_stop_and_transcribe(self):
+        """Stop the current recording, transcribe it, and queue the text."""
+        with self._voice_lock:
+            if not self._voice_recording or not self._voice_recorder:
+                return
+            recorder = self._voice_recorder
+            self._voice_recording = False
+            self._voice_processing = True
+            self._voice_recorder = None
+
+        play_beep(frequency=660, duration_ms=100)
+        print("Transcribing...")
+
+        try:
+            file_path = recorder.stop()
+            self._voice_last_path = file_path
+            if not file_path:
+                print("No audio captured.")
+                return
+
+            result = transcribe_recording(file_path)
+            if not result.get("success"):
+                print(f"Transcription failed: {result.get('error', 'Unknown error')}")
+                return
+
+            transcript = str(result.get("transcript", "")).strip()
+            if not transcript:
+                print("Transcription was empty.")
+                return
+
+            print(f"Voice: {transcript}")
+            if hasattr(self, "_agent_running") and self._agent_running:
+                self._interrupt_queue.put(transcript)
+            else:
+                self._pending_input.put(transcript)
+        finally:
+            with self._voice_lock:
+                self._voice_processing = False
+
+    def _voice_speak_response(self, response: str):
+        """Play a final assistant response locally when voice auto-TTS is enabled."""
+        if not self._voice_mode or not self._voice_tts or not response.strip():
+            return
+
+        def _run_tts():
+            try:
+                from tools.tts_tool import text_to_speech_tool
+
+                raw = text_to_speech_tool(response)
+                payload = json.loads(raw)
+                if not payload.get("success"):
+                    print(f"Voice TTS skipped: {payload.get('error', 'Unknown error')}")
+                    return
+                audio_path = payload.get("file_path")
+                if not audio_path or not play_audio_file(str(audio_path)):
+                    print("Voice TTS generated audio, but local playback was unavailable.")
+            except Exception as e:
+                print(f"Voice TTS failed: {e}")
+
+        threading.Thread(target=_run_tts, daemon=True).start()
     
     def _toggle_verbose(self):
         """Cycle tool progress mode: off → new → all → verbose → off."""
@@ -1960,6 +2081,44 @@ class HermesCLI:
             logging.getLogger().setLevel(logging.INFO)
             for quiet_logger in ('tools', 'minisweagent', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
+    def _show_insights(self, command: str = "/insights"):
+        """Show usage insights and analytics from session history."""
+        days = 30
+        source = None
+        parts = command.split()
+        index = 1
+        while index < len(parts):
+            part = parts[index]
+            if part == "--days" and index + 1 < len(parts):
+                try:
+                    days = max(int(parts[index + 1]), 1)
+                except ValueError:
+                    print(f"Invalid --days value: {parts[index + 1]}")
+                    return
+                index += 2
+                continue
+            if part == "--source" and index + 1 < len(parts):
+                source = parts[index + 1]
+                index += 2
+                continue
+            if part.isdigit():
+                days = max(int(part), 1)
+            index += 1
+
+        try:
+            from hermes_state import SessionDB
+            from agent.insights import InsightsEngine
+
+            db = SessionDB()
+            try:
+                engine = InsightsEngine(db)
+                report = engine.generate(days=days, source=source)
+                print(engine.format_terminal(report))
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"  Error generating insights: {e}")
 
     def _reload_mcp(self):
         """Reload MCP servers: disconnect all, re-read config.yaml, reconnect.
@@ -2153,14 +2312,14 @@ class HermesCLI:
 
         timeout = 60
         response_queue = queue.Queue()
-        choices = ["once", "session", "always", "deny"]
 
         self._approval_state = {
             "command": command,
             "description": description,
-            "choices": choices,
+            "choices": self._approval_choices(command),
             "selected": 0,
             "response_queue": response_queue,
+            "show_full": False,
         }
         self._approval_deadline = _time.monotonic() + timeout
 
@@ -2185,6 +2344,37 @@ class HermesCLI:
         _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
         return "deny"
 
+    def _approval_choices(self, command: str) -> list[str]:
+        """Return approval choices for a dangerous command prompt."""
+        choices = ["once", "session", "always", "deny"]
+        if len(command) > 70:
+            choices.append("view")
+        return choices
+
+    def _handle_approval_selection(self) -> None:
+        """Process the currently selected dangerous-command approval choice."""
+        state = self._approval_state
+        if not state:
+            return
+
+        selected = state.get("selected", 0)
+        choices = state.get("choices") or []
+        if not (0 <= selected < len(choices)):
+            return
+
+        chosen = choices[selected]
+        if chosen == "view":
+            state["show_full"] = True
+            state["choices"] = [choice for choice in choices if choice != "view"]
+            if state["selected"] >= len(state["choices"]):
+                state["selected"] = max(0, len(state["choices"]) - 1)
+            self._invalidate()
+            return
+
+        state["response_queue"].put(chosen)
+        self._approval_state = None
+        self._invalidate()
+
     def chat(self, message: str) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -2208,8 +2398,16 @@ class HermesCLI:
         if not self._init_agent():
             return None
         
+        chat_message = message
+        if self._voice_mode:
+            chat_message = (
+                "[Voice input - respond concisely and conversationally, 2-3 sentences max. "
+                "No code blocks or markdown unless explicitly requested.] "
+                f"{message}"
+            )
+
         # Add user message to history
-        self.conversation_history.append({"role": "user", "content": message})
+        self.conversation_history.append({"role": "user", "content": chat_message})
         
         w = self.console.width
         _cprint(f"{_GOLD}{'─' * w}{_RST}")
@@ -2222,8 +2420,9 @@ class HermesCLI:
             def run_agent():
                 nonlocal result
                 result = self.agent.run_conversation(
-                    user_message=message,
+                    user_message=chat_message,
                     conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                    task_id=self.session_id,
                 )
             
             # Start agent in background thread
@@ -2295,6 +2494,7 @@ class HermesCLI:
                 # Render box + response as a single _cprint call so
                 # nothing can interleave between the box borders.
                 _cprint(f"\n{top}\n{response}\n\n{bot}")
+                self._voice_speak_response(response)
             
             # Combine all interrupt messages (user may have typed multiple while waiting)
             # and re-queue as one prompt for process_loop
@@ -2338,6 +2538,9 @@ class HermesCLI:
             print(f"  hermes --resume {self.session_id}")
             print()
             print(f"Session:        {self.session_id}")
+            if self.worktree_path:
+                print(f"Worktree:       {self.worktree_path}")
+                print(f"Remove later:   git worktree remove \"{self.worktree_path}\"")
             print(f"Duration:       {duration_str}")
             print(f"Messages:       {msg_count} ({user_msgs} user, {tool_calls} tool calls)")
         else:
@@ -2377,6 +2580,16 @@ class HermesCLI:
         
         # Key bindings for the input area
         kb = KeyBindings()
+
+        def _voice_binding_tokens(binding: str) -> Optional[tuple[str, ...]]:
+            value = (binding or "").strip().lower()
+            if value == "ctrl+b":
+                return ("c-b",)
+            if value == "ctrl+r":
+                return ("c-r",)
+            if value == "ctrl+space":
+                return ("c-space",)
+            return None
         
         @kb.add('enter')
         def handle_enter(event):
@@ -2403,12 +2616,7 @@ class HermesCLI:
 
             # --- Approval selection: confirm the highlighted choice ---
             if self._approval_state:
-                state = self._approval_state
-                selected = state["selected"]
-                choices = state["choices"]
-                if 0 <= selected < len(choices):
-                    state["response_queue"].put(choices[selected])
-                self._approval_state = None
+                self._handle_approval_selection()
                 event.app.invalidate()
                 return
 
@@ -2456,6 +2664,20 @@ class HermesCLI:
         def handle_ctrl_enter(event):
             """Ctrl+Enter (c-j) inserts a newline. Most terminals send c-j for Ctrl+Enter."""
             event.current_buffer.insert_text('\n')
+
+        voice_binding = _voice_binding_tokens(self._voice_record_key)
+        if voice_binding:
+            @kb.add(*voice_binding)
+            def handle_voice_key(event):
+                del event
+                if not self._voice_mode:
+                    return
+                if self._voice_processing:
+                    return
+                if self._voice_recording:
+                    threading.Thread(target=self._voice_stop_and_transcribe, daemon=True).start()
+                else:
+                    threading.Thread(target=self._voice_start_recording, daemon=True).start()
 
         # --- Clarify tool: arrow-key navigation for multiple-choice questions ---
 
@@ -2579,6 +2801,10 @@ class HermesCLI:
                 return [('class:clarify-selected', '✎ ❯ ')]
             if cli_ref._clarify_state:
                 return [('class:prompt-working', '? ❯ ')]
+            if cli_ref._voice_recording:
+                return [('class:prompt-working', '🎙 ❯ ')]
+            if cli_ref._voice_processing:
+                return [('class:prompt-working', '🔊 ❯ ')]
             if cli_ref._agent_running:
                 return [('class:prompt-working', '⚕ ❯ ')]
             return [('class:prompt', '❯ ')]
@@ -2819,13 +3045,15 @@ class HermesCLI:
             description = state["description"]
             choices = state["choices"]
             selected = state.get("selected", 0)
+            show_full = state.get("show_full", False)
 
-            cmd_display = command[:70] + '...' if len(command) > 70 else command
+            cmd_display = command if show_full or len(command) <= 70 else command[:70] + '...'
             choice_labels = {
                 "once": "Allow once",
                 "session": "Allow for this session",
                 "always": "Add to permanent allowlist",
                 "deny": "Deny",
+                "view": "Show full command",
             }
 
             lines = []
@@ -3047,6 +3275,8 @@ def main(
     list_toolsets: bool = False,
     gateway: bool = False,
     resume: str = None,
+    worktree: bool = False,
+    pass_session_id: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -3065,6 +3295,8 @@ def main(
         list_tools: List available tools and exit
         list_toolsets: List available toolsets and exit
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
+        worktree: Start the CLI in an isolated Git worktree (fresh sessions only)
+        pass_session_id: Include the session ID in the agent's system prompt
     
     Examples:
         python cli.py                            # Start interactive mode
@@ -3072,6 +3304,7 @@ def main(
         python cli.py -q "What is Python?"       # Single query mode
         python cli.py --list-tools               # List tools and exit
         python cli.py --resume 20260225_143052_a1b2c3  # Resume session
+        python cli.py --worktree                 # Start in an isolated Git worktree
     """
     # Signal to terminal_tool that we're in interactive mode
     # This enables interactive sudo password prompts with timeout
@@ -3087,6 +3320,24 @@ def main(
     
     # Handle query shorthand
     query = query or q
+
+    worktree_path = None
+    if worktree:
+        if resume:
+            raise SystemExit("--worktree is only supported for fresh CLI sessions, not --resume/--continue.")
+        terminal_backend = (
+            os.getenv("TERMINAL_ENV")
+            or CLI_CONFIG.get("terminal", {}).get("backend")
+            or CLI_CONFIG.get("terminal", {}).get("env_type")
+            or "local"
+        )
+        if terminal_backend != "local":
+            raise SystemExit("--worktree currently supports only the local terminal backend.")
+
+        worktree_path = _create_isolated_worktree(Path.cwd())
+        os.chdir(worktree_path)
+        os.environ["TERMINAL_CWD"] = str(worktree_path)
+        print(f"Using isolated Git worktree: {worktree_path}")
     
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
@@ -3121,6 +3372,8 @@ def main(
         verbose=verbose,
         compact=compact,
         resume=resume,
+        pass_session_id=pass_session_id,
+        worktree_path=str(worktree_path) if worktree_path else None,
     )
     
     # Handle list commands (don't init agent for these)

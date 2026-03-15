@@ -31,6 +31,26 @@ os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 from hermes_cli.colors import Colors, color
 from hermes_constants import OPENROUTER_MODELS_URL
 
+
+_PROVIDER_ENV_HINTS = (
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_BASE_URL",
+    "GLM_API_KEY",
+    "ZAI_API_KEY",
+    "Z_AI_API_KEY",
+    "KIMI_API_KEY",
+    "MINIMAX_API_KEY",
+    "MINIMAX_CN_API_KEY",
+)
+
+
+def _has_provider_env_config(content: str) -> bool:
+    """Return True when ~/.hermes/.env contains provider auth or endpoint settings."""
+    return any(key in content for key in _PROVIDER_ENV_HINTS)
+
+
 def check_ok(text: str, detail: str = ""):
     print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
@@ -134,8 +154,8 @@ def run_doctor(args):
         else:
             # Check for common issues
             content, _ = read_env_text_with_fallback(env_path)
-            if "OPENROUTER_API_KEY" in content or "ANTHROPIC_API_KEY" in content:
-                check_ok("API key configured")
+            if _has_provider_env_config(content):
+                check_ok("API key or custom endpoint configured")
             else:
                 check_warn("No API key found in ~/.hermes/.env")
                 issues.append("Run 'hermes setup' to configure API keys")
@@ -357,6 +377,20 @@ def run_doctor(args):
         else:
             check_fail("TERMINAL_SSH_HOST not set", "(required for TERMINAL_ENV=ssh)")
             issues.append("Set TERMINAL_SSH_HOST in .env")
+
+    if terminal_env == "daytona":
+        daytona_key = os.getenv("DAYTONA_API_KEY")
+        if daytona_key:
+            check_ok("Daytona API key", "(configured)")
+        else:
+            check_fail("DAYTONA_API_KEY not set", "(required for TERMINAL_ENV=daytona)")
+            issues.append("Set DAYTONA_API_KEY environment variable")
+        try:
+            from daytona import Daytona
+            check_ok("daytona SDK", "(installed)")
+        except ImportError:
+            check_fail("daytona SDK not installed", "(pip install daytona)")
+            issues.append("Install daytona SDK: pip install daytona")
     
     # Node.js + agent-browser (for browser automation tools)
     if shutil.which("node"):

@@ -204,7 +204,7 @@ async def _upscale_image(image_url: str, original_prompt: str) -> Dict[str, Any]
             return None
             
     except Exception as e:
-        logger.error("Error upscaling image: %s", e)
+        logger.error("Error upscaling image: %s", e, exc_info=True)
         return None
 
 
@@ -372,7 +372,7 @@ async def image_generate_tool(
     except Exception as e:
         generation_time = (datetime.datetime.now() - start_time).total_seconds()
         error_msg = f"Error generating image: {str(e)}"
-        logger.error("%s", error_msg)
+        logger.error("%s", error_msg, exc_info=True)
         
         # Prepare error response - minimal format
         response_data = {

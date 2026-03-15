@@ -26,6 +26,8 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+from agent.text_io import open_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +39,45 @@ SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", 
 
 # Maximum file size (25MB - OpenAI limit)
 MAX_FILE_SIZE = 25 * 1024 * 1024
+
+
+def _get_openai_voice_api_key() -> Optional[str]:
+    """Resolve the OpenAI key used for STT/TTS, preferring the voice-specific override."""
+    return os.getenv("VOICE_TOOLS_OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
+
+
+def _load_stt_config() -> Dict[str, Any]:
+    """Load the STT section from ~/.hermes/config.yaml."""
+    config_path = Path.home() / ".hermes" / "config.yaml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        import yaml
+
+        with open_text(config_path, "r") as f:
+            config = yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning("Failed to load STT config from %s: %s", config_path, e)
+        return {}
+
+    stt_config = config.get("stt")
+    if isinstance(stt_config, dict):
+        return stt_config
+    return {}
+
+
+def is_stt_enabled(stt_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether speech-to-text is enabled in user config."""
+    if stt_config is None:
+        stt_config = _load_stt_config()
+
+    enabled = stt_config.get("enabled", True)
+    if isinstance(enabled, str):
+        return enabled.strip().lower() in ("true", "1", "yes", "on")
+    if enabled is None:
+        return True
+    return bool(enabled)
 
 
 def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
@@ -56,7 +97,15 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
           - "transcript" (str): The transcribed text (empty on failure)
           - "error" (str, optional): Error message if success is False
     """
-    api_key = os.getenv("VOICE_TOOLS_OPENAI_KEY")
+    stt_config = _load_stt_config()
+    if not is_stt_enabled(stt_config):
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "STT is disabled in config.yaml (stt.enabled: false).",
+        }
+
+    api_key = _get_openai_voice_api_key()
     if not api_key:
         return {
             "success": False,
@@ -108,7 +157,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     # Use provided model, or fall back to default
     if model is None:
-        model = DEFAULT_STT_MODEL
+        model = stt_config.get("model") or DEFAULT_STT_MODEL
 
     try:
         from openai import OpenAI

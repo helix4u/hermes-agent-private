@@ -133,7 +133,7 @@ DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 5000
 
 # Resolve async auxiliary client at module level.
 # Handles Codex Responses API adapter transparently.
-_aux_async_client, DEFAULT_SUMMARIZER_MODEL = get_async_text_auxiliary_client()
+_aux_async_client, DEFAULT_SUMMARIZER_MODEL = get_async_text_auxiliary_client("web_extract")
 
 _debug = DebugSession("web_tools", env_var="WEB_TOOLS_DEBUG")
 

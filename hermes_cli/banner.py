@@ -3,8 +3,13 @@
 Pure display functions with no HermesCLI state dependency.
 """
 
+import json
+import os
+import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -33,7 +38,7 @@ def cprint(text: str):
 # ASCII Art & Branding
 # =========================================================================
 
-from hermes_cli import __version__ as VERSION
+from hermes_cli import __version__ as VERSION, __release_date__ as RELEASE_DATE
 
 HERMES_AGENT_LOGO = """[bold #FFD700]██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗       █████╗  ██████╗ ███████╗███╗   ██╗████████╗[/]
 [bold #FFD700]██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝      ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝[/]
@@ -64,6 +69,144 @@ COMPACT_BANNER = """
 [bold #FFD700]║[/]  [#CD7F32]Messenger of the Digital Gods[/]    [dim #B8860B]Nous Research[/]   [bold #FFD700]║[/]
 [bold #FFD700]╚══════════════════════════════════════════════════════════════╝[/]
 """
+
+
+# =========================================================================
+# Update checks
+# =========================================================================
+
+_UPDATE_CACHE_TTL_SECONDS = 6 * 60 * 60
+_update_result: Optional[int] = None
+_update_check_done = threading.Event()
+_update_check_lock = threading.Lock()
+_update_check_started = False
+
+
+def _resolve_update_repo() -> Optional[Path]:
+    """Return the git checkout to use for update checks, if available."""
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        repo_dir = get_hermes_home() / "hermes-agent"
+    except Exception:
+        repo_dir = Path.home() / ".hermes" / "hermes-agent"
+
+    if not (repo_dir / ".git").exists():
+        repo_dir = Path(__file__).resolve().parent.parent
+    if not (repo_dir / ".git").exists():
+        return None
+    return repo_dir
+
+
+def _git_output(repo_dir: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _resolve_tracking_ref(repo_dir: Path) -> Optional[str]:
+    try:
+        upstream_ref = _git_output(repo_dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+        if upstream_ref:
+            return upstream_ref
+    except Exception:
+        pass
+
+    for candidate in ("private/main", "upstream/main", "origin/main", "origin/master"):
+        try:
+            _git_output(repo_dir, "rev-parse", "--verify", candidate)
+            return candidate
+        except Exception:
+            continue
+    return None
+
+
+def check_for_updates() -> Optional[int]:
+    """Return how many commits behind the tracked branch this checkout is."""
+    repo_dir = _resolve_update_repo()
+    if repo_dir is None:
+        return None
+
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        cache_file = get_hermes_home() / ".update_check"
+    except Exception:
+        cache_file = Path.home() / ".hermes" / ".update_check"
+
+    now = time.time()
+    try:
+        cache = json.loads(cache_file.read_text(encoding="utf-8", errors="replace"))
+        if now - float(cache.get("checked_at", 0)) < _UPDATE_CACHE_TTL_SECONDS:
+            return int(cache.get("behind", 0))
+    except Exception:
+        pass
+
+    tracking_ref = _resolve_tracking_ref(repo_dir)
+    if not tracking_ref:
+        return None
+
+    try:
+        remote_name = tracking_ref.split("/", 1)[0]
+        subprocess.run(
+            ["git", "fetch", "--quiet", remote_name],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=True,
+        )
+        behind = int(_git_output(repo_dir, "rev-list", "--count", f"HEAD..{tracking_ref}") or "0")
+    except Exception:
+        return None
+
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(
+            json.dumps({"checked_at": now, "behind": behind}, ensure_ascii=False),
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        pass
+
+    return behind
+
+
+def prefetch_update_check() -> None:
+    """Start the update check in a background daemon thread once."""
+    global _update_check_started
+    with _update_check_lock:
+        if _update_check_started:
+            return
+        _update_check_started = True
+
+    def _run() -> None:
+        global _update_result
+        try:
+            _update_result = check_for_updates()
+        finally:
+            _update_check_done.set()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def get_update_result(timeout: float = 0.0) -> Optional[int]:
+    """Return the prefetched update result, or None if it isn't ready."""
+    _update_check_done.wait(timeout=timeout)
+    if not _update_check_done.is_set():
+        return None
+    return _update_result
 
 
 # =========================================================================
@@ -245,12 +388,20 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     summary_parts.append("/help for commands")
     right_lines.append(f"[dim #B8860B]{' · '.join(summary_parts)}[/]")
 
+    try:
+        behind = get_update_result(timeout=0.0)
+        if behind and behind > 0:
+            commits_word = "commit" if behind == 1 else "commits"
+            right_lines.append(f"[dim #B8860B]Update available: {behind} {commits_word} behind[/]")
+    except Exception:
+        pass
+
     right_content = "\n".join(right_lines)
     layout_table.add_row(left_content, right_content)
 
     outer_panel = Panel(
         layout_table,
-        title=f"[bold #FFD700]Hermes Agent {VERSION}[/]",
+        title=f"[bold #FFD700]Hermes Agent v{VERSION} ({RELEASE_DATE})[/]",
         border_style="#CD7F32",
         padding=(0, 2),
     )

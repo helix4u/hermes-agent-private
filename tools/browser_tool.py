@@ -53,6 +53,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import shutil
@@ -109,6 +110,26 @@ SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
 
 # Resolve vision auxiliary client for extraction/vision tasks
 _aux_vision_client, EXTRACTION_MODEL = get_vision_auxiliary_client()
+
+
+def _browser_screenshots_dir() -> Path:
+    """Persistent screenshot cache used for browser_vision sharing."""
+    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    return hermes_home / "browser_screenshots"
+
+
+def _cleanup_old_screenshots(screenshots_dir: Path, max_age_hours: int = 24) -> None:
+    """Remove stale browser screenshots to avoid unbounded disk growth."""
+    cutoff = time.time() - (max_age_hours * 3600)
+    try:
+        for entry in screenshots_dir.glob("browser_screenshot_*.png"):
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+            except Exception:
+                logger.debug("Could not prune browser screenshot %s", entry, exc_info=True)
+    except Exception:
+        logger.debug("Could not prune browser screenshot directory %s", screenshots_dir, exc_info=True)
 
 # Track active sessions per task
 # Now stores tuple of (session_name, browserbase_session_id, cdp_url)
@@ -568,41 +589,16 @@ def _emergency_cleanup_all_sessions():
         return
     
     logger.info("Emergency cleanup: closing %s active session(s)...", len(_active_sessions))
-    
+
     try:
-        api_key = os.environ.get("BROWSERBASE_API_KEY")
-        project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-        
-        if not api_key or not project_id:
-            logger.warning("Cannot cleanup - missing BROWSERBASE credentials")
-            return
-        
-        for task_id, session_info in list(_active_sessions.items()):
-            bb_session_id = session_info.get("bb_session_id")
-            if bb_session_id:
-                try:
-                    response = requests.post(
-                        f"https://api.browserbase.com/v1/sessions/{bb_session_id}",
-                        headers={
-                            "X-BB-API-Key": api_key,
-                            "Content-Type": "application/json"
-                        },
-                        json={
-                            "projectId": project_id,
-                            "status": "REQUEST_RELEASE"
-                        },
-                        timeout=5  # Short timeout for cleanup
-                    )
-                    if response.status_code in (200, 201, 204):
-                        logger.info("Closed session %s", bb_session_id)
-                    else:
-                        logger.warning("Failed to close session %s: HTTP %s", bb_session_id, response.status_code)
-                except Exception as e:
-                    logger.error("Error closing session %s: %s", bb_session_id, e)
-        
-        _active_sessions.clear()
+        cleanup_all_browsers()
     except Exception as e:
         logger.error("Emergency cleanup error: %s", e)
+    finally:
+        with _cleanup_lock:
+            _active_sessions.clear()
+            _session_last_activity.clear()
+        _recording_sessions.clear()
 
 
 def _signal_handler(signum, frame):
@@ -1139,6 +1135,27 @@ def _find_agent_browser() -> List[str]:
     )
 
 
+def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
+    """Extract a screenshot file path from agent-browser human-readable output."""
+    if not text:
+        return None
+
+    patterns = [
+        r"Screenshot saved to ['\"](?P<path>/[^'\"]+?\.png)['\"]",
+        r"Screenshot saved to (?P<path>/\S+?\.png)(?:\s|$)",
+        r"(?P<path>/\S+?\.png)(?:\s|$)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            path = match.group("path").strip().strip("'\"")
+            if path:
+                return path
+
+    return None
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -1198,10 +1215,19 @@ def _run_browser_command(
         )
         os.makedirs(task_socket_dir, exist_ok=True)
         
-        browser_env = {
-            **os.environ,
-            "AGENT_BROWSER_SOCKET_DIR": task_socket_dir,
-        }
+        browser_env = {**os.environ}
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_node_bin = str(hermes_home / "node" / "bin")
+
+        existing_path = browser_env.get("PATH", "")
+        path_parts = [p for p in existing_path.split(":") if p]
+        candidate_dirs = [hermes_node_bin] + [p for p in _SANE_PATH.split(":") if p]
+        for part in reversed(candidate_dirs):
+            if os.path.isdir(part) and part not in path_parts:
+                path_parts.insert(0, part)
+
+        browser_env["PATH"] = ":".join(path_parts)
+        browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
         
         result = subprocess.run(
             cmd_parts,
@@ -1215,10 +1241,12 @@ def _run_browser_command(
         if result.stderr and result.stderr.strip():
             logger.debug("stderr from '%s': %s", command, result.stderr.strip()[:200])
         
+        stdout_text = result.stdout.strip()
+
         # Parse JSON output
-        if result.stdout.strip():
+        if stdout_text:
             try:
-                parsed = json.loads(result.stdout.strip())
+                parsed = json.loads(stdout_text)
                 # Warn if snapshot came back empty (common sign of daemon/CDP issues)
                 if command == "snapshot" and parsed.get("success"):
                     snap_data = parsed.get("data", {})
@@ -1228,10 +1256,33 @@ def _run_browser_command(
                                        "returncode=%s", result.returncode)
                 return parsed
             except json.JSONDecodeError:
-                # If not valid JSON, return as raw output
+                raw = stdout_text[:2000]
+                logger.warning("browser '%s' returned non-JSON output (rc=%s): %s",
+                               command, result.returncode, raw[:500])
+
+                if command == "screenshot":
+                    stderr_text = (result.stderr or "").strip()
+                    combined_text = "\n".join(
+                        part for part in [stdout_text, stderr_text] if part
+                    )
+                    recovered_path = _extract_screenshot_path_from_text(combined_text)
+
+                    if recovered_path and Path(recovered_path).exists():
+                        logger.info(
+                            "browser 'screenshot' recovered file from non-JSON output: %s",
+                            recovered_path,
+                        )
+                        return {
+                            "success": True,
+                            "data": {
+                                "path": recovered_path,
+                                "raw": raw,
+                            },
+                        }
+
                 return {
-                    "success": True,
-                    "data": {"raw": result.stdout.strip()}
+                    "success": False,
+                    "error": f"Non-JSON output from agent-browser for '{command}': {raw}"
                 }
         
         # Check for errors
@@ -1640,44 +1691,18 @@ def browser_close(task_id: Optional[str] = None) -> str:
         JSON string with close result
     """
     effective_task_id = task_id or "default"
-    result = _run_browser_command(effective_task_id, "close", [])
-    
-    if _using_playwright_backend():
-        if result.get("success"):
-            return json.dumps({
-                "success": True,
-                "closed": True
-            }, ensure_ascii=False)
-        return json.dumps({
-            "success": False,
-            "error": result.get("error", "Failed to close Playwright browser session")
-        }, ensure_ascii=False)
+    with _cleanup_lock:
+        had_session = effective_task_id in _active_sessions
 
-    # Close the BrowserBase session via API
-    session_key = task_id if task_id and task_id in _active_sessions else "default"
-    if session_key in _active_sessions:
-        session_info = _active_sessions[session_key]
-        bb_session_id = session_info.get("bb_session_id")
-        if bb_session_id:
-            try:
-                config = _get_browserbase_config()
-                _close_browserbase_session(bb_session_id, config["api_key"], config["project_id"])
-            except Exception as e:
-                logger.warning("Could not close BrowserBase session: %s", e)
-        del _active_sessions[session_key]
-    
-    if result.get("success"):
-        return json.dumps({
-            "success": True,
-            "closed": True
-        }, ensure_ascii=False)
-    else:
-        # Even if close fails, session was released
-        return json.dumps({
-            "success": True,
-            "closed": True,
-            "warning": result.get("error", "Session may not have been active")
-        }, ensure_ascii=False)
+    cleanup_browser(effective_task_id)
+
+    response = {
+        "success": True,
+        "closed": True,
+    }
+    if not had_session:
+        response["warning"] = "Session may not have been active"
+    return json.dumps(response, ensure_ascii=False)
 
 
 def browser_get_images(task_id: Optional[str] = None) -> str:
@@ -1748,12 +1773,10 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
         task_id: Task identifier for session isolation
         
     Returns:
-        JSON string with vision analysis results
+        JSON string with vision analysis results and a persistent screenshot_path
     """
     import base64
-    import tempfile
     import uuid as uuid_mod
-    from pathlib import Path
     
     effective_task_id = task_id or "default"
     
@@ -1765,13 +1788,13 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
                      "Set OPENROUTER_API_KEY, configure Nous Portal, or sign in to Codex to enable browser vision."
         }, ensure_ascii=False)
     
-    # Create a temporary file target for the screenshot.
-    # Some agent-browser builds may ignore this exact path and return their own;
-    # we handle both.
-    temp_dir = Path(tempfile.gettempdir())
-    screenshot_path = temp_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
+    screenshots_dir = _browser_screenshots_dir()
+    screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
     
     try:
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        _cleanup_old_screenshots(screenshots_dir, max_age_hours=24)
+
         def _resolve_image_path(command_result: Dict[str, Any]) -> Path | None:
             candidates: list[Path] = [screenshot_path]
             data = command_result.get("data", {}) if isinstance(command_result, dict) else {}
@@ -1816,6 +1839,14 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
                 "error": "Screenshot file was not created",
                 "details": result
             }, ensure_ascii=False)
+
+        if image_path != screenshot_path:
+            shutil.copy2(image_path, screenshot_path)
+            try:
+                image_path.unlink()
+            except Exception:
+                logger.debug("Could not remove temporary browser screenshot %s", image_path, exc_info=True)
+            image_path = screenshot_path
         
         # Read and convert to base64
         image_data = image_path.read_bytes()
@@ -1852,6 +1883,7 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
         return json.dumps({
             "success": True,
             "analysis": analysis,
+            "screenshot_path": str(screenshot_path),
         }, ensure_ascii=False)
     
     except Exception as e:
@@ -1867,19 +1899,6 @@ def browser_vision(question: str, task_id: Optional[str] = None) -> str:
             "success": False,
             "error": error_text
         }, ensure_ascii=False)
-    
-    finally:
-        # Clean up screenshot file
-        if screenshot_path.exists():
-            try:
-                screenshot_path.unlink()
-            except Exception:
-                pass
-        if 'image_path' in locals() and image_path and image_path != screenshot_path and image_path.exists():
-            try:
-                image_path.unlink()
-            except Exception:
-                pass
 
 
 # ============================================================================

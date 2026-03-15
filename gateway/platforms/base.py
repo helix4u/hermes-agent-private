@@ -345,6 +345,9 @@ class BasePlatformAdapter(ABC):
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        # Track background message-processing tasks so gateway shutdown can
+        # cancel them cleanly during stop/restart/--replace.
+        self._background_tasks: set[asyncio.Task] = set()
     
     @property
     def name(self) -> str:
@@ -652,13 +655,31 @@ class BasePlatformAdapter(ABC):
             # Some commands should not interrupt a running agent. Handle them
             # immediately in a separate task and return their response.
             if self._is_out_of_band_command(event):
-                asyncio.create_task(
+                self._track_background_task(
                     self._process_message_background(
                         event,
                         session_key,
                         allow_interrupt=False,
                     )
                 )
+                return
+
+            # Photo bursts/albums often arrive as multiple near-simultaneous
+            # messages. Queue them without interrupting the active run so they
+            # can be merged and processed immediately afterward.
+            if event.message_type == MessageType.PHOTO:
+                existing = self._pending_messages.get(session_key)
+                if existing and existing.message_type == MessageType.PHOTO:
+                    existing.media_urls.extend(event.media_urls)
+                    existing.media_types.extend(event.media_types)
+                    if event.text:
+                        if not existing.text:
+                            existing.text = event.text
+                        elif event.text not in existing.text:
+                            existing.text = f"{existing.text}\n\n{event.text}".strip()
+                else:
+                    self._pending_messages[session_key] = event
+                print(f"[{self.name}] 🖼️ Queuing photo follow-up for session {session_key} without interrupt")
                 return
 
             # Store this as a pending message - it will interrupt the running agent
@@ -669,7 +690,14 @@ class BasePlatformAdapter(ABC):
             return  # Don't process now - will be handled after current task finishes
         
         # Spawn background task to process this message
-        asyncio.create_task(self._process_message_background(event, session_key))
+        self._track_background_task(self._process_message_background(event, session_key))
+
+    def _track_background_task(self, coro: Awaitable[None]) -> asyncio.Task:
+        """Create and track a background task for later shutdown cancellation."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -857,6 +885,17 @@ class BasePlatformAdapter(ABC):
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""
         return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
+
+    async def cancel_background_tasks(self) -> None:
+        """Cancel any in-flight background message-processing tasks."""
+        tasks = [task for task in self._background_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self._pending_messages.clear()
+        self._active_sessions.clear()
     
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""

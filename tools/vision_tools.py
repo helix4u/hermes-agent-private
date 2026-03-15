@@ -41,9 +41,6 @@ from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
 
-# Resolve vision auxiliary client at module level.
-_aux_async_client, DEFAULT_VISION_MODEL = get_async_vision_auxiliary_client()
-
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
 
 
@@ -174,7 +171,7 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
 async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
-    model: str = DEFAULT_VISION_MODEL
+    model: Optional[str] = None
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -234,12 +231,19 @@ async def vision_analyze_tool(
         logger.info("Analyzing image: %s", image_url[:60])
         logger.info("User prompt: %s", user_prompt[:100])
         
+        # Resolve the vision backend at call time so changes in config or env
+        # take effect without requiring a full process restart.
+        _aux_async_client, runtime_model = get_async_vision_auxiliary_client()
+        selected_model = model or runtime_model or "google/gemini-3-flash-preview"
+
         # Check auxiliary vision client availability
-        if _aux_async_client is None or DEFAULT_VISION_MODEL is None:
+        if _aux_async_client is None:
+            logger.error("Vision analysis unavailable: no auxiliary vision model configured")
             return json.dumps({
                 "success": False,
                 "analysis": "Vision analysis unavailable: no auxiliary vision model configured. "
-                            "Set OPENROUTER_API_KEY, configure Nous Portal, or sign in to Codex to enable vision tools."
+                            "Set OPENROUTER_API_KEY, configure Nous Portal, sign in to Codex, "
+                            "or configure an auxiliary vision endpoint to enable vision tools."
             }, indent=2, ensure_ascii=False)
         
         # Determine if this is a local file path or a remote URL
@@ -297,13 +301,13 @@ async def vision_analyze_tool(
             }
         ]
         
-        logger.info("Processing image with %s...", model)
+        logger.info("Processing image with %s...", selected_model)
         
         # Call the vision API
         from agent.auxiliary_client import get_auxiliary_extra_body, auxiliary_max_tokens_param
         _extra = get_auxiliary_extra_body()
         response = await _aux_async_client.chat.completions.create(
-            model=model,
+            model=selected_model,
             messages=messages,
             temperature=0.1,
             **auxiliary_max_tokens_param(2000),
@@ -338,7 +342,7 @@ async def vision_analyze_tool(
         # Prepare error response
         result = {
             "success": False,
-            "analysis": "There was a problem with the request and the image could not be analyzed."
+            "analysis": error_msg
         }
         
         debug_call_data["error"] = error_msg
@@ -358,8 +362,12 @@ async def vision_analyze_tool(
 
 
 def check_vision_requirements() -> bool:
-    """Check if an auxiliary vision model is available."""
-    return _aux_async_client is not None
+    """Check if an auxiliary vision model is available right now."""
+    try:
+        client, _model = get_async_vision_auxiliary_client()
+        return client is not None
+    except Exception:
+        return False
 
 
 def get_debug_session_info() -> Dict[str, Any]:
@@ -381,16 +389,17 @@ if __name__ == "__main__":
     
     # Check if vision model is available
     api_available = check_vision_requirements()
+    _client, default_vision_model = get_async_vision_auxiliary_client()
     
     if not api_available:
         print("❌ No auxiliary vision model available")
-        print("Set OPENROUTER_API_KEY, configure Nous Portal, or sign in to Codex to enable vision tools.")
+        print("Set OPENROUTER_API_KEY, configure Nous Portal, sign in to Codex, or configure an auxiliary vision endpoint.")
         exit(1)
     else:
-        print(f"✅ Vision model available: {DEFAULT_VISION_MODEL}")
+        print(f"✅ Vision model available: {default_vision_model}")
     
     print("🛠️ Vision tools ready for use!")
-    print(f"🧠 Using model: {DEFAULT_VISION_MODEL}")
+    print(f"🧠 Using model: {default_vision_model}")
     
     # Show debug mode status
     if _debug.active:
@@ -454,8 +463,7 @@ def _handle_vision_analyze(args, **kw):
     image_url = args.get("image_url", "")
     question = args.get("question", "")
     full_prompt = f"Fully describe and explain everything about this image, then answer the following question:\n\n{question}"
-    model = DEFAULT_VISION_MODEL or "google/gemini-3-flash-preview"
-    return vision_analyze_tool(image_url, full_prompt, model)
+    return vision_analyze_tool(image_url, full_prompt, None)
 
 
 registry.register(

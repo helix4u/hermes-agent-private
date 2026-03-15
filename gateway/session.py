@@ -286,14 +286,34 @@ def build_session_key(source: SessionSource) -> str:
     """Build a deterministic session key from a message source.
 
     This is the single source of truth for session key construction.
-    WhatsApp DMs include chat_id (multi-user), other DMs do not (single owner).
+
+    DM rules:
+      - DMs include chat_id when present, so each private conversation is isolated.
+      - thread_id further differentiates threaded DMs within the same DM chat.
+      - Without chat_id, thread_id is used as a best-effort fallback.
+      - Without thread_id or chat_id, DMs share a single session.
+
+    Group/channel rules:
+      - chat_id identifies the parent group/channel.
+      - thread_id differentiates threads within that parent chat.
+      - Without identifiers, messages fall back to one session per platform/chat_type.
     """
     platform = source.platform.value
     if source.chat_type == "dm":
-        if platform == "whatsapp" and source.chat_id:
+        if source.chat_id:
+            if source.thread_id:
+                return f"agent:main:{platform}:dm:{source.chat_id}:{source.thread_id}"
             return f"agent:main:{platform}:dm:{source.chat_id}"
+        if source.thread_id:
+            return f"agent:main:{platform}:dm:{source.thread_id}"
         return f"agent:main:{platform}:dm"
-    return f"agent:main:{platform}:{source.chat_type}:{source.chat_id}"
+    if source.chat_id:
+        if source.thread_id:
+            return f"agent:main:{platform}:{source.chat_type}:{source.chat_id}:{source.thread_id}"
+        return f"agent:main:{platform}:{source.chat_type}:{source.chat_id}"
+    if source.thread_id:
+        return f"agent:main:{platform}:{source.chat_type}:{source.thread_id}"
+    return f"agent:main:{platform}:{source.chat_type}"
 
 
 class SessionStore:
@@ -501,7 +521,8 @@ class SessionStore:
         self, 
         session_key: str,
         input_tokens: int = 0,
-        output_tokens: int = 0
+        output_tokens: int = 0,
+        model: Optional[str] = None,
     ) -> None:
         """Update a session's metadata after an interaction."""
         self._ensure_loaded()
@@ -519,6 +540,8 @@ class SessionStore:
                     self._db.update_token_counts(
                         entry.session_id, input_tokens, output_tokens
                     )
+                    if model:
+                        self._db.update_session_model(entry.session_id, model)
                 except Exception as e:
                     logger.debug("Session DB operation failed: %s", e)
 

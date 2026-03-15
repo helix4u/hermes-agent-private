@@ -91,9 +91,24 @@ def _get_platform_tools(config: dict, platform: str) -> Set[str]:
 
 
 def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[str]):
-    """Save the selected toolset keys for a platform to config."""
+    """Save the selected toolset keys for a platform to config.
+
+    Preserves any existing non-configurable entries for the platform, such as
+    MCP-specific toolset names, instead of overwriting them on save.
+    """
     config.setdefault("platform_toolsets", {})
-    config["platform_toolsets"][platform] = sorted(enabled_toolset_keys)
+
+    configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+    existing_toolsets = config.get("platform_toolsets", {}).get(platform, [])
+    if not isinstance(existing_toolsets, list):
+        existing_toolsets = []
+
+    preserved_entries = {
+        entry for entry in existing_toolsets
+        if entry not in configurable_keys
+    }
+
+    config["platform_toolsets"][platform] = sorted(enabled_toolset_keys | preserved_entries)
     save_config(config)
 
 
@@ -137,6 +152,15 @@ def _prompt_choice(question: str, choices: list, default: int = 0) -> int:
 
 def _toolset_has_keys(ts_key: str) -> bool:
     """Check if a toolset's required API keys are configured."""
+    if ts_key == "vision":
+        try:
+            from agent.auxiliary_client import get_vision_auxiliary_client
+
+            client, _model = get_vision_auxiliary_client()
+            return client is not None
+        except Exception:
+            return False
+
     requirements = TOOLSET_ENV_REQUIREMENTS.get(ts_key, [])
     if not requirements:
         return True
@@ -321,6 +345,63 @@ TOOLSET_ENV_REQUIREMENTS = {
 def _check_and_prompt_requirements(newly_enabled: Set[str]):
     """Check if newly enabled toolsets have missing API keys and offer to set them up."""
     for ts_key in sorted(newly_enabled):
+        if ts_key == "vision":
+            if _toolset_has_keys("vision"):
+                continue
+
+            print()
+            print(color("  ⚠ Vision / Image Analysis requires a multimodal backend:", Colors.YELLOW))
+            print(color("    OpenRouter, Nous Portal, Codex, or an auxiliary vision endpoint can satisfy this.", Colors.DIM))
+            print()
+
+            choices = [
+                "OpenRouter — uses Gemini",
+                "OpenAI-compatible endpoint — base URL, API key, and vision model",
+                "Skip",
+            ]
+            idx = _prompt_choice("  Configure vision backend", choices, 2)
+
+            if idx == 0:
+                print(color("    Get key at: https://openrouter.ai/keys", Colors.DIM))
+                try:
+                    import getpass
+                    value = getpass.getpass(color("    OPENROUTER_API_KEY: ", Colors.YELLOW))
+                except (KeyboardInterrupt, EOFError):
+                    print()
+                    continue
+                if value.strip():
+                    save_env_value("OPENROUTER_API_KEY", value.strip())
+                    print(color("    ✓ Saved", Colors.GREEN))
+                else:
+                    print(color("    Skipped", Colors.DIM))
+            elif idx == 1:
+                try:
+                    base_url = input(color("    Base URL [https://api.openai.com/v1]: ", Colors.YELLOW)).strip()
+                    if not base_url:
+                        base_url = "https://api.openai.com/v1"
+                    key_label = "    OPENAI_API_KEY" if "api.openai.com" in base_url.lower() else "    API key"
+                    import getpass
+                    api_key = getpass.getpass(color(f"{key_label}: ", Colors.YELLOW)).strip()
+                    model_prompt = "    Vision model [gpt-4o-mini]: " if "api.openai.com" in base_url.lower() else "    Vision model [optional]: "
+                    vision_model = input(color(model_prompt, Colors.YELLOW)).strip()
+                except (KeyboardInterrupt, EOFError):
+                    print()
+                    continue
+
+                if api_key:
+                    config = load_config()
+                    config.setdefault("auxiliary", {}).setdefault("vision", {})
+                    config["auxiliary"]["vision"]["base_url"] = base_url
+                    config["auxiliary"]["vision"]["api_key"] = api_key
+                    config["auxiliary"]["vision"]["model"] = vision_model or ("gpt-4o-mini" if "api.openai.com" in base_url.lower() else "")
+                    save_config(config)
+                    print(color("    ✓ Saved", Colors.GREEN))
+                else:
+                    print(color("    Skipped", Colors.DIM))
+            else:
+                print(color("    Skipped — configure later with 'hermes setup'", Colors.DIM))
+            continue
+
         requirements = TOOLSET_ENV_REQUIREMENTS.get(ts_key, [])
         if not requirements:
             continue

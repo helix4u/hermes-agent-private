@@ -43,28 +43,22 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
-# Load environment variables from ~/.hermes/.env first
-from dotenv import load_dotenv
+# Load environment variables from ~/.hermes/.env first.
+# User-managed env files should override stale shell exports on restart.
 from agent.env_loader import load_dotenv_with_fallback
+from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
-if _env_path.exists():
-    try:
-        load_dotenv_with_fallback(_env_path, logger=logging.getLogger(__name__))
-    except ValueError as exc:
-        print(f"Failed to load {_env_path}: {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
-# Also try project .env as fallback
 _project_env = Path(__file__).parent.parent / '.env'
-if _project_env.exists():
-    try:
-        load_dotenv_with_fallback(
-            _project_env,
-            override=False,
-            logger=logging.getLogger(__name__),
-        )
-    except ValueError as exc:
-        print(f"Failed to load {_project_env}: {exc}", file=sys.stderr)
-        raise SystemExit(2) from exc
+try:
+    load_hermes_dotenv(
+        hermes_home=_hermes_home,
+        project_env=_project_env,
+        logger=logging.getLogger(__name__),
+    )
+except ValueError as exc:
+    failed_path = _env_path if _env_path.exists() else _project_env
+    print(f"Failed to load {failed_path}: {exc}", file=sys.stderr)
+    raise SystemExit(2) from exc
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -115,6 +109,39 @@ if _config_path.exists():
             for _cfg_key, _env_var in _compression_env_map.items():
                 if _cfg_key in _compression_cfg:
                     os.environ[_env_var] = str(_compression_cfg[_cfg_key])
+        _auxiliary_cfg = _cfg.get("auxiliary", {})
+        if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
+            _auxiliary_env_map = {
+                "text": {
+                    "provider": "AUXILIARY_TEXT_PROVIDER",
+                    "model": "AUXILIARY_TEXT_MODEL",
+                    "base_url": "AUXILIARY_TEXT_BASE_URL",
+                    "api_key": "AUXILIARY_TEXT_API_KEY",
+                },
+                "vision": {
+                    "provider": "AUXILIARY_VISION_PROVIDER",
+                    "model": "AUXILIARY_VISION_MODEL",
+                    "base_url": "AUXILIARY_VISION_BASE_URL",
+                    "api_key": "AUXILIARY_VISION_API_KEY",
+                },
+                "web_extract": {
+                    "provider": "AUXILIARY_WEB_EXTRACT_PROVIDER",
+                    "model": "AUXILIARY_WEB_EXTRACT_MODEL",
+                    "base_url": "AUXILIARY_WEB_EXTRACT_BASE_URL",
+                    "api_key": "AUXILIARY_WEB_EXTRACT_API_KEY",
+                },
+            }
+            for _task_key, _env_map in _auxiliary_env_map.items():
+                _task_cfg = _auxiliary_cfg.get(_task_key, {})
+                if not isinstance(_task_cfg, dict):
+                    continue
+                for _cfg_key, _env_var in _env_map.items():
+                    _value = _task_cfg.get(_cfg_key)
+                    if _value is None:
+                        continue
+                    _text = str(_value).strip()
+                    if _text:
+                        os.environ[_env_var] = _text
         _browser_cfg = _cfg.get("browser", {})
         if _browser_cfg and isinstance(_browser_cfg, dict):
             _browser_env_map = {
@@ -241,6 +268,28 @@ def _resolve_gateway_runtime_model(provider: Optional[str]) -> str:
     from hermes_cli.runtime_provider import normalize_model_for_runtime
 
     return normalize_model_for_runtime(_resolve_gateway_model(), provider)
+
+
+def _resolve_hermes_bin() -> Optional[list[str]]:
+    """Resolve the Hermes update command as argv parts.
+
+    Tries, in order:
+    1. ``hermes`` from PATH
+    2. ``sys.executable -m hermes_cli.main`` when running from a venv/module
+    """
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin:
+        return [hermes_bin]
+
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("hermes_cli") is not None:
+            return [sys.executable, "-m", "hermes_cli.main"]
+    except Exception:
+        pass
+
+    return None
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -650,6 +699,7 @@ class GatewayRunner:
         self._wiki_server_thread: threading.Thread | None = None
         self._wiki_host_port: int | None = None
         self._wiki_web_root: Path | None = None
+        self._update_notification_task: Optional[asyncio.Task] = None
         self._browser_bridge: BrowserBridgeServer | None = None
         self._browser_bridge_tasks: Dict[str, asyncio.Task] = {}
         self._browser_bridge_progress: Dict[str, Dict[str, Any]] = {}
@@ -1038,6 +1088,11 @@ class GatewayRunner:
         logger.info("Starting Hermes Gateway...")
         logger.info("Python process: executable=%s prefix=%s (venv=%s)", sys.executable, sys.prefix, sys.prefix != getattr(sys, "base_prefix", sys.prefix))
         logger.info("Session storage: %s", self.config.sessions_dir)
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(gateway_state="starting", exit_reason=None)
+        except Exception as e:
+            logger.debug("Failed to initialize runtime gateway status: %s", e)
         
         # Warn if no user allowlists are configured and open access is not opted in
         _any_allowlist = any(
@@ -1072,10 +1127,25 @@ class GatewayRunner:
         for platform, platform_config in self.config.platforms.items():
             if not platform_config.enabled:
                 continue
+            try:
+                from gateway.status import write_runtime_status
+                write_runtime_status(platform=platform.value, platform_state="connecting")
+            except Exception as e:
+                logger.debug("Failed to write connecting status for %s: %s", platform.value, e)
             
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 logger.warning("No adapter available for %s", platform.value)
+                try:
+                    from gateway.status import write_runtime_status
+                    write_runtime_status(
+                        platform=platform.value,
+                        platform_state="unavailable",
+                        error_code="adapter_unavailable",
+                        error_message="No adapter available for this platform",
+                    )
+                except Exception as e:
+                    logger.debug("Failed to write unavailable status for %s: %s", platform.value, e)
                 continue
             
             # Set up message handler
@@ -1089,10 +1159,40 @@ class GatewayRunner:
                     self.adapters[platform] = adapter
                     connected_count += 1
                     logger.info("ok: %s connected", platform.value)
+                    try:
+                        from gateway.status import write_runtime_status
+                        write_runtime_status(
+                            platform=platform.value,
+                            platform_state="connected",
+                            error_code="",
+                            error_message="",
+                        )
+                    except Exception as e:
+                        logger.debug("Failed to write connected status for %s: %s", platform.value, e)
                 else:
                     logger.warning("x: %s failed to connect", platform.value)
+                    try:
+                        from gateway.status import write_runtime_status
+                        write_runtime_status(
+                            platform=platform.value,
+                            platform_state="failed",
+                            error_code="connect_failed",
+                            error_message="Adapter connect() returned false",
+                        )
+                    except Exception as e:
+                        logger.debug("Failed to write failed status for %s: %s", platform.value, e)
             except Exception as e:
                 logger.error("x: %s error: %s", platform.value, e)
+                try:
+                    from gateway.status import write_runtime_status
+                    write_runtime_status(
+                        platform=platform.value,
+                        platform_state="failed",
+                        error_code="connect_exception",
+                        error_message=str(e),
+                    )
+                except Exception as status_error:
+                    logger.debug("Failed to write exception status for %s: %s", platform.value, status_error)
         
         if connected_count == 0:
             logger.warning("No messaging platforms connected.")
@@ -1113,6 +1213,11 @@ class GatewayRunner:
         
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(gateway_state="running", exit_reason=None)
+        except Exception as e:
+            logger.debug("Failed to write running gateway status: %s", e)
         
         # Build initial channel directory for send_message name resolution
         try:
@@ -1122,6 +1227,16 @@ class GatewayRunner:
             logger.info("Channel directory built: %d target(s)", ch_count)
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
+
+        notified = await self._send_update_notification()
+        if not notified and any(
+            path.exists()
+            for path in (
+                _hermes_home / ".update_pending.json",
+                _hermes_home / ".update_pending.claimed.json",
+            )
+        ):
+            self._schedule_update_notification_watch()
 
         wiki_cfg = _get_wiki_host_config()
         if wiki_cfg.get("enabled"):
@@ -1148,23 +1263,60 @@ class GatewayRunner:
     async def stop(self) -> None:
         """Stop the gateway and disconnect all adapters."""
         logger.info("Stopping gateway...")
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(gateway_state="stopping", exit_reason="shutdown_requested")
+        except Exception as e:
+            logger.debug("Failed to write stopping gateway status: %s", e)
         self._running = False
         self._stop_wiki_host()
         if self._browser_bridge:
             self._browser_bridge.stop()
             self._browser_bridge = None
+
+        for session_key, agent in list(self._running_agents.items()):
+            try:
+                agent.interrupt("Gateway shutting down")
+                logger.debug("Interrupted running agent for session %s during shutdown", session_key[:20])
+            except Exception as e:
+                logger.debug("Failed interrupting agent during shutdown: %s", e)
         
-        for platform, adapter in self.adapters.items():
+        for platform, adapter in list(self.adapters.items()):
+            try:
+                await adapter.cancel_background_tasks()
+            except Exception as e:
+                logger.debug("%s background-task cancel error: %s", platform.value, e)
             try:
                 await adapter.disconnect()
                 logger.info("%s disconnected", platform.value)
+                try:
+                    from gateway.status import write_runtime_status
+                    write_runtime_status(
+                        platform=platform.value,
+                        platform_state="disconnected",
+                        error_code="",
+                        error_message="",
+                    )
+                except Exception as status_error:
+                    logger.debug("Failed to write disconnect status for %s: %s", platform.value, status_error)
             except Exception as e:
                 logger.error("%s disconnect error: %s", platform.value, e)
+                try:
+                    from gateway.status import write_runtime_status
+                    write_runtime_status(
+                        platform=platform.value,
+                        platform_state="disconnect_error",
+                        error_code="disconnect_error",
+                        error_message=str(e),
+                    )
+                except Exception as status_error:
+                    logger.debug("Failed to write disconnect-error status for %s: %s", platform.value, status_error)
         
         self.adapters.clear()
         self._shutdown_event.set()
         
-        from gateway.status import remove_pid_file
+        from gateway.status import remove_pid_file, write_runtime_status
+        write_runtime_status(gateway_state="stopped", exit_reason="shutdown_complete")
         remove_pid_file()
         
         logger.info("Gateway stopped")
@@ -1344,8 +1496,8 @@ class GatewayRunner:
         _known_commands = {
             "new", "reset", "help", "status", "stop", "model",
             "personality", "retry", "undo", "sethome", "set-home",
-            "terminal", "shell", "compress", "usage", "reload-mcp",
-            "cron", "invokeai-defaults", "invokeai_defaults",
+            "terminal", "shell", "compress", "usage", "insights", "reload-mcp",
+            "cron", "invokeai-defaults", "invokeai_defaults", "update",
             "wiki-host", "wiki_host"
         }
         if command and command in _known_commands:
@@ -1362,9 +1514,29 @@ class GatewayRunner:
         # normal message interruption and explicit /stop behavior.
         _quick_key = build_session_key(source)
         if _quick_key in self._running_agents:
+            if event.message_type == MessageType.PHOTO:
+                logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    if _quick_key in adapter._pending_messages:
+                        existing = adapter._pending_messages[_quick_key]
+                        if getattr(existing, "message_type", None) == MessageType.PHOTO:
+                            existing.media_urls.extend(event.media_urls)
+                            existing.media_types.extend(event.media_types)
+                            if event.text:
+                                if not existing.text:
+                                    existing.text = event.text
+                                elif event.text not in existing.text:
+                                    existing.text = f"{existing.text}\n\n{event.text}".strip()
+                        else:
+                            adapter._pending_messages[_quick_key] = event
+                    else:
+                        adapter._pending_messages[_quick_key] = event
+                return None
+
             if command == "stop":
                 return await self._handle_stop_command(event)
-            if command in {"help", "status", "usage", "cron"}:
+            if command in {"help", "status", "usage", "insights", "cron", "update"}:
                 logger.debug(
                     "Handling out-of-band command /%s for active session %s",
                     command,
@@ -1376,6 +1548,10 @@ class GatewayRunner:
                     return await self._handle_status_command(event)
                 if command == "usage":
                     return await self._handle_usage_command(event)
+                if command == "insights":
+                    return await self._handle_insights_command(event)
+                if command == "update":
+                    return await self._handle_update_command(event)
                 return await self._handle_cron_command(event)
 
             running_agent = self._running_agents[_quick_key]
@@ -1429,8 +1605,14 @@ class GatewayRunner:
         if command == "usage":
             return await self._handle_usage_command(event)
 
+        if command == "insights":
+            return await self._handle_insights_command(event)
+
         if command == "reload-mcp":
             return await self._handle_reload_mcp_command(event)
+
+        if command == "update":
+            return await self._handle_update_command(event)
 
         if command == "cron":
             return await self._handle_cron_command(event)
@@ -1736,7 +1918,10 @@ class GatewayRunner:
                     rewritten.append(entry)
 
                 self.session_store.rewrite_transcript(session_entry.session_id, rewritten)
-                self.session_store.update_session(session_entry.session_key)
+                self.session_store.update_session(
+                    session_entry.session_key,
+                    model=agent_result.get("model"),
+                )
                 return response
             
             # Find only the NEW messages from this turn (skip history we loaded).
@@ -3352,7 +3537,9 @@ class GatewayRunner:
             "`/sethome` — Set this chat as the home channel",
             "`/compress` — Compress conversation context",
             "`/usage` — Show token usage for this session",
+            "`/insights [days]` — Show usage insights and analytics",
             "`/reload-mcp` — Reload MCP servers from config",
+            "`/update` — Update Hermes Agent to the latest version",
             "`/cron` — Manage scheduled jobs (`list`, `add`, `remove`, `run`)",
             "`/help` — Show this message",
         ]
@@ -4144,8 +4331,7 @@ class GatewayRunner:
         )
         
         # Let the normal message handler process it
-        await self._handle_message(retry_event)
-        return None  # Response sent through normal flow
+        return await self._handle_message(retry_event)
     
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo command - remove the last user/assistant exchange."""
@@ -4288,6 +4474,52 @@ class GatewayRunner:
             )
         return "No usage data available for this session."
 
+    async def _handle_insights_command(self, event: MessageEvent) -> str:
+        """Handle /insights command -- show usage insights and analytics."""
+        args = (event.get_command_args() or "").strip()
+        days = 30
+        source = None
+
+        if args:
+            parts = args.split()
+            index = 0
+            while index < len(parts):
+                part = parts[index]
+                if part == "--days" and index + 1 < len(parts):
+                    try:
+                        days = max(int(parts[index + 1]), 1)
+                    except ValueError:
+                        return f"Invalid --days value: {parts[index + 1]}"
+                    index += 2
+                    continue
+                if part == "--source" and index + 1 < len(parts):
+                    source = parts[index + 1]
+                    index += 2
+                    continue
+                if part.isdigit():
+                    days = max(int(part), 1)
+                index += 1
+
+        try:
+            from hermes_state import SessionDB
+            from agent.insights import InsightsEngine
+
+            loop = asyncio.get_running_loop()
+
+            def _run_insights() -> str:
+                db = SessionDB()
+                try:
+                    engine = InsightsEngine(db)
+                    report = engine.generate(days=days, source=source)
+                    return engine.format_gateway(report)
+                finally:
+                    db.close()
+
+            return await loop.run_in_executor(None, _run_insights)
+        except Exception as e:
+            logger.error("Insights command error: %s", e, exc_info=True)
+            return f"Error generating insights: {e}"
+
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> str:
         """Handle /reload-mcp command -- disconnect and reconnect all MCP servers."""
         loop = asyncio.get_event_loop()
@@ -4358,16 +4590,233 @@ class GatewayRunner:
             logger.warning("MCP reload failed: %s", e)
             return f"❌ MCP reload failed: {e}"
 
+    async def _handle_update_command(self, event: MessageEvent) -> str:
+        """Handle /update command for gateway platforms."""
+        project_root = Path(__file__).parent.parent.resolve()
+        git_dir = project_root / ".git"
+        if not git_dir.exists():
+            return "✗ Not a git repository, so Hermes cannot update itself from the gateway."
+
+        hermes_cmd = _resolve_hermes_bin()
+        if not hermes_cmd:
+            return (
+                "✗ Could not locate the Hermes executable. "
+                "Try running `hermes update` manually in your terminal."
+            )
+
+        pending_path = _hermes_home / ".update_pending.json"
+        claimed_path = _hermes_home / ".update_pending.claimed.json"
+        output_path = _hermes_home / ".update_output.txt"
+        exit_code_path = _hermes_home / ".update_exit_code"
+
+        pending = {
+            "platform": event.source.platform.value if event.source.platform else "",
+            "chat_id": event.source.chat_id,
+            "user_id": event.source.user_id,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        try:
+            pending_path.write_text(json.dumps(pending), encoding="utf-8")
+            claimed_path.unlink(missing_ok=True)
+            exit_code_path.unlink(missing_ok=True)
+        except Exception as exc:
+            return f"✗ Failed to prepare update markers: {exc}"
+
+        wrapper_code = (
+            "import pathlib, subprocess, sys\n"
+            f"cmd = {hermes_cmd!r} + ['update']\n"
+            f"output_path = pathlib.Path({str(output_path)!r})\n"
+            f"exit_code_path = pathlib.Path({str(exit_code_path)!r})\n"
+            "output_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "exit_code = 1\n"
+            "with output_path.open('w', encoding='utf-8', errors='replace', newline='') as fh:\n"
+            "    result = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT)\n"
+            "    exit_code = int(result.returncode)\n"
+            "exit_code_path.write_text(str(exit_code), encoding='utf-8')\n"
+            "sys.exit(exit_code)\n"
+        )
+
+        systemd_run = shutil.which("systemd-run") if os.name != "nt" else None
+        if systemd_run:
+            launcher_cmd = [
+                systemd_run,
+                "--user",
+                "--scope",
+                "--unit=hermes-update",
+                "--",
+                sys.executable,
+                "-c",
+                wrapper_code,
+            ]
+        else:
+            launcher_cmd = [sys.executable, "-c", wrapper_code]
+
+        try:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = (
+                    getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                )
+            subprocess.Popen(
+                launcher_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                creationflags=creationflags,
+                cwd=str(project_root),
+            )
+        except Exception as exc:
+            pending_path.unlink(missing_ok=True)
+            claimed_path.unlink(missing_ok=True)
+            exit_code_path.unlink(missing_ok=True)
+            return f"✗ Failed to start update: {exc}"
+
+        self._schedule_update_notification_watch()
+        return "⚕ Starting Hermes update. I'll notify you when it finishes."
+
+    def _schedule_update_notification_watch(self) -> None:
+        """Ensure a background task is watching for update completion."""
+        existing_task = self._update_notification_task
+        if existing_task and not existing_task.done():
+            return
+
+        try:
+            self._update_notification_task = asyncio.create_task(
+                self._watch_for_update_completion()
+            )
+        except RuntimeError:
+            logger.debug("Skipping update notification watcher: no running event loop")
+
+    async def _watch_for_update_completion(
+        self,
+        poll_interval: float = 2.0,
+        timeout: float = 1800.0,
+    ) -> None:
+        """Wait for a gateway-triggered update to finish, then notify the user."""
+        pending_path = _hermes_home / ".update_pending.json"
+        claimed_path = _hermes_home / ".update_pending.claimed.json"
+        exit_code_path = _hermes_home / ".update_exit_code"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        while (pending_path.exists() or claimed_path.exists()) and loop.time() < deadline:
+            if exit_code_path.exists():
+                await self._send_update_notification()
+                return
+            await asyncio.sleep(poll_interval)
+
+        if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
+            logger.warning("Update watcher timed out waiting for completion marker")
+            try:
+                exit_code_path.write_text("124", encoding="utf-8")
+            except Exception:
+                logger.debug("Failed to write update timeout marker", exc_info=True)
+            await self._send_update_notification()
+
+    async def _send_update_notification(self) -> bool:
+        """If an update finished, notify the originating user.
+
+        Returns False when the update is still running and should be checked again.
+        Returns True after a definitive send or skip decision.
+        """
+        pending_path = _hermes_home / ".update_pending.json"
+        claimed_path = _hermes_home / ".update_pending.claimed.json"
+        output_path = _hermes_home / ".update_output.txt"
+        exit_code_path = _hermes_home / ".update_exit_code"
+
+        if not pending_path.exists() and not claimed_path.exists():
+            return False
+
+        cleanup = True
+        active_pending_path = claimed_path
+        try:
+            if pending_path.exists():
+                try:
+                    pending_path.replace(claimed_path)
+                except FileNotFoundError:
+                    if not claimed_path.exists():
+                        return True
+            elif not claimed_path.exists():
+                return True
+
+            pending = json.loads(claimed_path.read_text(encoding="utf-8"))
+            platform_str = str(pending.get("platform") or "").strip()
+            chat_id = pending.get("chat_id")
+
+            if not exit_code_path.exists():
+                logger.info("Update notification deferred: update still running")
+                cleanup = False
+                active_pending_path = pending_path
+                claimed_path.replace(pending_path)
+                return False
+
+            exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
+            exit_code = int(exit_code_raw)
+
+            output = ""
+            if output_path.exists():
+                output = output_path.read_text(encoding="utf-8", errors="replace")
+
+            adapter = None
+            if platform_str:
+                try:
+                    adapter = self.adapters.get(Platform(platform_str))
+                except Exception:
+                    adapter = None
+
+            if adapter and chat_id:
+                output = re.sub(r"\x1b\[[0-9;]*m", "", output).strip()
+                if output:
+                    if len(output) > 3500:
+                        output = "…" + output[-3500:]
+                    if exit_code == 0:
+                        msg = f"✅ Hermes update finished.\n\n```\n{output}\n```"
+                    else:
+                        msg = f"❌ Hermes update failed.\n\n```\n{output}\n```"
+                else:
+                    if exit_code == 0:
+                        msg = "✅ Hermes update finished successfully."
+                    else:
+                        msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
+                await adapter.send(chat_id, msg)
+                logger.info(
+                    "Sent post-update notification to %s:%s (exit=%s)",
+                    platform_str,
+                    chat_id,
+                    exit_code,
+                )
+            else:
+                logger.info(
+                    "Update finished but no adapter/chat was available for notification (platform=%s, chat_id=%s, exit=%s)",
+                    platform_str,
+                    chat_id,
+                    exit_code,
+                )
+        except Exception as exc:
+            logger.warning("Post-update notification failed: %s", exc)
+        finally:
+            if cleanup:
+                active_pending_path.unlink(missing_ok=True)
+                claimed_path.unlink(missing_ok=True)
+                output_path.unlink(missing_ok=True)
+                exit_code_path.unlink(missing_ok=True)
+
+        return True
+
     def _set_session_env(self, context: SessionContext) -> None:
         """Set environment variables for the current session."""
         os.environ["HERMES_SESSION_PLATFORM"] = context.source.platform.value
         os.environ["HERMES_SESSION_CHAT_ID"] = context.source.chat_id
         if context.source.chat_name:
             os.environ["HERMES_SESSION_CHAT_NAME"] = context.source.chat_name
+        if context.source.thread_id:
+            os.environ["HERMES_SESSION_THREAD_ID"] = str(context.source.thread_id)
     
     def _clear_session_env(self) -> None:
         """Clear session environment variables."""
-        for var in ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"]:
+        for var in ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID"]:
             if var in os.environ:
                 del os.environ[var]
     
@@ -4445,7 +4894,7 @@ class GatewayRunner:
         audio_paths: List[str],
     ) -> str:
         """
-        Auto-transcribe user voice/audio messages using OpenAI Whisper API
+        Auto-transcribe user voice/audio messages using the configured STT setup
         and prepend the transcript to the message text.
 
         Args:
@@ -4455,6 +4904,15 @@ class GatewayRunner:
         Returns:
             The enriched message string with transcriptions prepended.
         """
+        if not getattr(self.config, "stt_enabled", True):
+            disabled_note = (
+                "[The user sent a voice message, but transcription is disabled "
+                "in Hermes config.]"
+            )
+            if user_text:
+                return f"{disabled_note}\n\n{user_text}"
+            return disabled_note
+
         from tools.transcription_tools import transcribe_audio
         import asyncio
 
@@ -4785,6 +5243,10 @@ class GatewayRunner:
             int(os.getenv("HERMES_TOOL_THREAD_CREATE_MAX_ATTEMPTS", "3")),
         )
         last_tool = [None]
+        last_live_detail = [None]
+        last_live_detail_repeats = [0]
+        last_detail_payload = [None]
+        last_detail_payload_repeats = [0]
         progress_state = {
             "started_at": time.monotonic(),
             "phase": "thinking",
@@ -4826,12 +5288,39 @@ class GatewayRunner:
             while len(recent_events) > progress_rolling_entries:
                 recent_events.pop(0)
 
+        def _dedupe_live_detail(detail: str) -> str:
+            text = (detail or "").strip()
+            if not text:
+                return text
+            if text == last_live_detail[0]:
+                last_live_detail_repeats[0] += 1
+                return f"{text} (×{last_live_detail_repeats[0] + 1})"
+            last_live_detail[0] = text
+            last_live_detail_repeats[0] = 0
+            return text
+
+        def _queue_detail_payload(payload: str) -> None:
+            if not detail_queue:
+                return
+            text = str(payload or "").strip()
+            if not text:
+                return
+            ts = datetime.now().strftime("%H:%M:%S")
+            if text == last_detail_payload[0]:
+                last_detail_payload_repeats[0] += 1
+                detail_queue.put((ts, f"{text} (×{last_detail_payload_repeats[0] + 1})"))
+                return
+            last_detail_payload[0] = text
+            last_detail_payload_repeats[0] = 0
+            detail_queue.put((ts, text))
+
         def _set_progress_state(*, phase: str | None = None, detail: str | None = None, tool_call: bool = False):
             if phase:
                 progress_state["phase"] = phase
             if detail:
-                progress_state["last_detail"] = detail
-                _push_recent_event(detail)
+                deduped_detail = _dedupe_live_detail(detail)
+                progress_state["last_detail"] = deduped_detail
+                _push_recent_event(deduped_detail)
             if tool_call:
                 progress_state["tool_calls"] += 1
             progress_state["updates"] += 1
@@ -4956,9 +5445,7 @@ class GatewayRunner:
                     detail_payload = f"{detail_payload} {status_suffix}"
                 if result_text:
                     detail_payload = f"{detail_payload}\n{result_text}"
-                ts = datetime.now().strftime("%H:%M:%S")
-                if detail_queue:
-                    detail_queue.put((ts, detail_payload))
+                _queue_detail_payload(detail_payload)
                 _append_artifact(f"[{datetime.now().isoformat()}] {detail_payload}")
                 return
 
@@ -5035,9 +5522,7 @@ class GatewayRunner:
             if args_text:
                 detail_payload = f"{emoji} CALL {tool_name}\n{args_text}"
 
-            if detail_queue:
-                ts = datetime.now().strftime("%H:%M:%S")
-                detail_queue.put((ts, detail_payload))
+            _queue_detail_payload(detail_payload)
             _append_artifact(f"[{datetime.now().isoformat()}] {detail_payload}")
 
         async def send_progress_messages():
@@ -5393,7 +5878,11 @@ class GatewayRunner:
             
             if tool_progress_enabled:
                 _set_progress_state(phase="thinking", detail="Calling model...")
-            result = agent.run_conversation(message, conversation_history=agent_history)
+            result = agent.run_conversation(
+                message,
+                conversation_history=agent_history,
+                task_id=session_id,
+            )
             result_holder[0] = result
             if tool_progress_enabled:
                 _set_progress_state(phase="finalizing", detail="Preparing final response...")
@@ -5668,13 +6157,17 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int
     logger.info("Cron ticker stopped")
 
 
-async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
+async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False) -> bool:
     """
     Start the gateway and run until interrupted.
     
     This is the main entry point for running the gateway.
     Returns True if the gateway ran successfully, False if it failed to start.
     A False return causes a non-zero exit code so systemd can auto-restart.
+
+    Args:
+        config: Optional gateway configuration override.
+        replace: If True, terminate any existing gateway instance before starting.
     """
     # Configure rotating file log so gateway output is persisted for debugging.
     # On Windows, reconfigure stderr to UTF-8 so emoji/Unicode in log messages don't cause UnicodeEncodeError.
@@ -5706,6 +6199,58 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
     error_handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
     logging.getLogger().addHandler(error_handler)
 
+    # Prevent duplicate gateway instances under the same HERMES_HOME.
+    from gateway.status import get_gateway_pid, remove_pid_file, write_runtime_status
+    existing_pid = get_gateway_pid()
+    if existing_pid is not None and existing_pid != os.getpid():
+        if replace:
+            logger.info("Replacing existing gateway instance (PID %d).", existing_pid)
+            try:
+                os.kill(existing_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                logger.error("Permission denied when trying to stop PID %d.", existing_pid)
+                return False
+
+            for _ in range(20):
+                if get_gateway_pid() != existing_pid:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                logger.warning(
+                    "Existing gateway PID %d did not exit after SIGTERM; forcing termination.",
+                    existing_pid,
+                )
+                try:
+                    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                    os.kill(existing_pid, kill_signal)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                await asyncio.sleep(0.5)
+
+            remove_pid_file()
+        else:
+            hermes_home = os.getenv("HERMES_HOME", "~/.hermes")
+            logger.error(
+                "Another gateway instance is already running (PID %d, HERMES_HOME=%s). "
+                "Use 'hermes gateway restart', 'hermes gateway stop', or 'hermes gateway run --replace'.",
+                existing_pid,
+                hermes_home,
+            )
+            print(
+                f"\n❌ Gateway already running (PID {existing_pid}).\n"
+                f"   Use 'hermes gateway restart' to replace it,\n"
+                f"   or 'hermes gateway stop' to kill it first.\n"
+                f"   Or use 'hermes gateway run --replace' to auto-replace.\n"
+            )
+            return False
+
+    try:
+        write_runtime_status(gateway_state="starting", exit_reason=None)
+    except Exception as e:
+        logger.debug("Failed to pre-write starting gateway status: %s", e)
+
     runner = GatewayRunner(config)
     
     # Set up signal handlers
@@ -5728,12 +6273,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
     # Start the gateway
     success = await runner.start()
     if not success:
+        try:
+            write_runtime_status(gateway_state="failed", exit_reason="startup_failed")
+        except Exception as e:
+            logger.debug("Failed to write startup failure status: %s", e)
         return False
     
     # Write PID file so CLI can detect gateway is running
     import atexit
-    from gateway.status import write_pid_file, remove_pid_file
+    from gateway.status import write_pid_file, remove_pid_file, write_runtime_status
     write_pid_file()
+    write_runtime_status(gateway_state="running", exit_reason=None)
     atexit.register(remove_pid_file)
     
     # Start background cron ticker so scheduled jobs fire automatically

@@ -22,12 +22,14 @@ COMMANDS = {
     "/undo": "Remove the last user/assistant exchange",
     "/save": "Save the current conversation",
     "/config": "Show current configuration",
+    "/voice": "Toggle voice mode (Ctrl+B to record). Usage: /voice [on|off|tts|status]",
     "/cron": "Manage scheduled tasks (list, add, remove)",
     "/skills": "Search, install, inspect, or manage skills from online registries",
     "/platforms": "Show gateway/messaging platform status",
     "/verbose": "Cycle tool progress display: off → new → all → verbose",
     "/compress": "Manually compress conversation context (flush memories + summarize)",
     "/usage": "Show token usage for the current session",
+    "/insights": "Show usage insights and analytics (last 30 days)",
     "/quit": "Exit the CLI (also: /exit, /q)",
 }
 

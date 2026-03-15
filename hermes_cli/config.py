@@ -17,12 +17,14 @@ import sys
 import shlex
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
 import yaml
 
 from hermes_cli.colors import Colors, color
+from hermes_cli.default_soul import DEFAULT_SOUL_MD
 from agent.env_loader import read_env_text_with_fallback
 
 
@@ -46,6 +48,13 @@ def get_project_root() -> Path:
     """Get the project installation directory."""
     return Path(__file__).parent.parent.resolve()
 
+def _ensure_default_soul_md(home: Path):
+    """Seed a default global SOUL.md if the user does not have one yet."""
+    soul_path = home / "SOUL.md"
+    if soul_path.exists():
+        return
+    soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8", newline="")
+
 def ensure_hermes_home():
     """Ensure ~/.hermes directory structure exists."""
     home = get_hermes_home()
@@ -53,6 +62,7 @@ def ensure_hermes_home():
     (home / "sessions").mkdir(parents=True, exist_ok=True)
     (home / "logs").mkdir(parents=True, exist_ok=True)
     (home / "memories").mkdir(parents=True, exist_ok=True)
+    _ensure_default_soul_md(home)
 
 
 # =============================================================================
@@ -63,6 +73,7 @@ DEFAULT_CONFIG = {
     "model": "google/gemini-2.0-flash-001:free",
     "toolsets": ["hermes-cli"],
     "max_turns": 100,
+    "timezone": "",
     
     "terminal": {
         "backend": "local",
@@ -71,7 +82,8 @@ DEFAULT_CONFIG = {
         "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
         "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
-        # Container resource limits (docker, singularity, modal — ignored for local/ssh)
+        "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+        # Container resource limits (docker, singularity, modal, daytona — ignored for local/ssh)
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)
         "container_disk": 51200,        # MB (default 50GB)
@@ -92,6 +104,36 @@ DEFAULT_CONFIG = {
         "summary_model": "google/gemini-3-flash-preview",
         "protect_last_n": 8,
         "summary_target_tokens": 2048,
+    },
+
+    "auxiliary": {
+        "text": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+        },
+        "vision": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+        },
+        "web_extract": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+        },
+    },
+
+    "delegation": {
+        "default_toolsets": ["terminal", "file", "web"],
+        "max_concurrent_children": 2,
+        "provider": "",
+        "model": "",
+        "base_url": "",
+        "api_key": "",
     },
     
     "display": {
@@ -128,7 +170,13 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "model": "whisper-1",
     },
-    
+
+    "voice": {
+        "record_key": "ctrl+b",
+        "max_recording_seconds": 120,
+        "auto_tts": False,
+    },
+
     "human_delay": {
         "mode": "off",
         "min_ms": 800,
@@ -182,6 +230,24 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "KIMI_API_KEY": {
+        "description": "Kimi / Moonshot API key for direct Kimi provider access",
+        "prompt": "Kimi API key",
+        "url": "https://platform.kimi.ai/",
+        "password": True,
+        "tools": ["provider_chat"],
+        "category": "provider",
+        "advanced": True,
+    },
+    "KIMI_BASE_URL": {
+        "description": "Optional Kimi / Moonshot base URL override",
+        "prompt": "Kimi base URL",
+        "url": None,
+        "password": False,
+        "tools": ["provider_chat"],
+        "category": "provider",
+        "advanced": True,
+    },
 
     # ── Tool API keys ──
     "FIRECRAWL_API_KEY": {
@@ -207,6 +273,15 @@ OPTIONAL_ENV_VARS = {
         "tools": ["browser_navigate", "browser_click"],
         "password": False,
         "category": "tool",
+    },
+    "DAYTONA_API_KEY": {
+        "description": "Daytona API key for the Daytona cloud terminal backend",
+        "prompt": "Daytona API key",
+        "url": "https://app.daytona.io/dashboard/keys",
+        "tools": ["terminal"],
+        "password": True,
+        "category": "tool",
+        "advanced": True,
     },
     "FAL_KEY": {
         "description": "FAL API key for image generation",
@@ -657,6 +732,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml."""
     import copy
+    ensure_hermes_home()
     config_path = get_config_path()
     
     config = copy.deepcopy(DEFAULT_CONFIG)
@@ -730,9 +806,25 @@ def save_env_value(key: str, value: str):
             lines[-1] += "\n"
         lines.append(f"{key}={value}\n")
     
-    # Normalize to UTF-8 so future loads are deterministic across platforms.
-    with open(env_path, 'w', encoding='utf-8', newline='') as f:
-        f.writelines(lines)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(env_path.parent),
+        suffix='.tmp',
+        prefix='.env_',
+    )
+    try:
+        # Normalize to UTF-8 so future loads are deterministic across platforms.
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, env_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    _secure_file(env_path)
 
 
 def get_env_value(key: str) -> Optional[str]:
@@ -823,6 +915,10 @@ def show_config():
         print(f"  Modal image:  {terminal.get('modal_image', 'python:3.11')}")
         modal_token = get_env_value('MODAL_TOKEN_ID')
         print(f"  Modal token:  {'configured' if modal_token else '(not set)'}")
+    elif terminal.get('backend') == 'daytona':
+        print(f"  Daytona image: {terminal.get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+        daytona_key = get_env_value('DAYTONA_API_KEY')
+        print(f"  API key:      {'configured' if daytona_key else '(not set)'}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')
         ssh_user = get_env_value('TERMINAL_SSH_USER')
@@ -852,7 +948,7 @@ def show_config():
     print()
     print(color("─" * 60, Colors.DIM))
     print(color("  hermes config edit     # Edit config file", Colors.DIM))
-    print(color("  hermes config set KEY VALUE", Colors.DIM))
+    print(color("  hermes config set <key> <value>", Colors.DIM))
     print(color("  hermes setup           # Run setup wizard", Colors.DIM))
     print()
 
@@ -937,15 +1033,22 @@ def set_config_value(key: str, value: str):
     """Set a configuration value."""
     # Check if it's an API key (goes to .env)
     api_keys = [
-        'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
-        'F5TTS_SECRET_KEY', 'FIRECRAWL_API_KEY', 'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID',
+        'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
+        'F5TTS_SECRET_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL', 'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
         'SUDO_PASSWORD', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
-        'GITHUB_TOKEN', 'HONCHO_API_KEY',
+        'GITHUB_TOKEN', 'HONCHO_API_KEY', 'NOUS_API_KEY', 'WANDB_API_KEY',
+        'TINKER_API_KEY', 'DAYTONA_API_KEY', 'ANTHROPIC_BASE_URL',
+        'KIMI_BASE_URL',
     ]
     
-    if key.upper() in api_keys or key.upper().startswith('TERMINAL_SSH'):
+    if (
+        key.upper() in api_keys
+        or key.upper().endswith('_API_KEY')
+        or key.upper().endswith('_TOKEN')
+        or key.upper().startswith('TERMINAL_SSH')
+    ):
         save_env_value(key.upper(), value)
         print(f"✓ Set {key} in {get_env_path()}")
         return
@@ -995,6 +1098,7 @@ def set_config_value(key: str, value: str):
         "terminal.docker_image": "TERMINAL_DOCKER_IMAGE",
         "terminal.singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "terminal.modal_image": "TERMINAL_MODAL_IMAGE",
+        "terminal.daytona_image": "TERMINAL_DAYTONA_IMAGE",
         "terminal.cwd": "TERMINAL_CWD",
         "terminal.timeout": "TERMINAL_TIMEOUT",
     }
@@ -1022,7 +1126,7 @@ def config_command(args):
         key = getattr(args, 'key', None)
         value = getattr(args, 'value', None)
         if not key or not value:
-            print("Usage: hermes config set KEY VALUE")
+            print("Usage: hermes config set <key> <value>")
             print()
             print("Examples:")
             print("  hermes config set model anthropic/claude-sonnet-4")
@@ -1137,7 +1241,7 @@ def config_command(args):
         print("Available commands:")
         print("  hermes config           Show current configuration")
         print("  hermes config edit      Open config in editor")
-        print("  hermes config set K V   Set a config value")
+        print("  hermes config set <key> <value>   Set a config value")
         print("  hermes config check     Check for missing/outdated config")
         print("  hermes config migrate   Update config with new options")
         print("  hermes config path      Show config file path")

@@ -37,6 +37,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -46,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from tools.environments.local import _sanitize_subprocess_env
 from tools.environments.shell_utils import (
     build_local_subprocess_invocation,
     is_windows,
@@ -160,7 +162,7 @@ class ProcessRegistry:
             try:
                 import ptyprocess
                 user_shell = os.environ.get("SHELL") or shutil.which("bash") or "/bin/bash"
-                pty_env = os.environ | (env_vars or {})
+                pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = ptyprocess.PtyProcess.spawn(
                     [user_shell, "-lic", command],
@@ -201,7 +203,7 @@ class ProcessRegistry:
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
-        bg_env = os.environ | (env_vars or {})
+        bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
             popen_args,
@@ -696,6 +698,37 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
+    def _write_checkpoint_data(self, entries: List[Dict[str, Any]]) -> None:
+        """Atomically write checkpoint JSON to disk for crash-safe recovery."""
+        CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = None
+        tmp_path = None
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(CHECKPOINT_PATH.parent),
+                prefix=f"{CHECKPOINT_PATH.name}.",
+                suffix=".tmp",
+                text=True,
+            )
+            tmp_path = Path(tmp_name)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace", newline="") as handle:
+                fd = None
+                json.dump(entries, handle, indent=2, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, CHECKPOINT_PATH)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp_path is not None and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
     def _write_checkpoint(self):
         """Write running process metadata to checkpoint file."""
         try:
@@ -712,12 +745,9 @@ class ProcessRegistry:
                             "task_id": s.task_id,
                             "session_key": s.session_key,
                         })
-            CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CHECKPOINT_PATH.write_text(
-                json.dumps(entries, indent=2), encoding="utf-8"
-            )
+            self._write_checkpoint_data(entries)
         except Exception:
-            pass  # Best-effort
+            logger.debug("Could not write checkpoint file", exc_info=True)
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -729,8 +759,9 @@ class ProcessRegistry:
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8", errors="replace"))
         except Exception:
+            logger.debug("Could not read checkpoint file", exc_info=True)
             return 0
 
         recovered = 0
@@ -765,9 +796,9 @@ class ProcessRegistry:
 
         # Clear the checkpoint (will be rewritten as processes finish)
         try:
-            CHECKPOINT_PATH.write_text("[]", encoding="utf-8")
+            self._write_checkpoint_data([])
         except Exception as e:
-            logger.debug("Could not write checkpoint file: %s", e)
+            logger.debug("Could not clear checkpoint file: %s", e, exc_info=True)
 
         return recovered
 

@@ -79,6 +79,7 @@ def show_status(args):
         "OpenRouter": "OPENROUTER_API_KEY",
         "Anthropic": "ANTHROPIC_API_KEY", 
         "OpenAI": "OPENAI_API_KEY",
+        "Kimi": "KIMI_API_KEY",
         "Firecrawl": "FIRECRAWL_API_KEY",
         "Browserbase": "BROWSERBASE_API_KEY",
         "FAL": "FAL_KEY",
@@ -111,7 +112,7 @@ def show_status(args):
     nous_logged_in = bool(nous_status.get("logged_in"))
     print(
         f"  {'Nous Portal':<12}  {check_mark(nous_logged_in)} "
-        f"{'logged in' if nous_logged_in else 'not logged in (run: hermes model)'}"
+        f"{'logged in' if nous_logged_in else 'not logged in (run: hermes login)'}"
     )
     if nous_logged_in:
         portal_url = nous_status.get("portal_base_url") or "(unknown)"
@@ -126,9 +127,9 @@ def show_status(args):
     codex_logged_in = bool(codex_status.get("logged_in"))
     print(
         f"  {'OpenAI Codex':<12}  {check_mark(codex_logged_in)} "
-        f"{'logged in' if codex_logged_in else 'not logged in (run: hermes model)'}"
+        f"{'logged in' if codex_logged_in else 'not logged in (run: hermes login)'}"
     )
-    codex_auth_file = codex_status.get("auth_file")
+    codex_auth_file = codex_status.get("auth_store")
     if codex_auth_file:
         print(f"    Auth file:  {codex_auth_file}")
     codex_last_refresh = _format_iso_timestamp(codex_status.get("last_refresh"))
@@ -169,7 +170,15 @@ def show_status(args):
     elif terminal_env == "docker":
         docker_image = os.getenv("TERMINAL_DOCKER_IMAGE", "python:3.11-slim")
         print(f"  Docker Image: {docker_image}")
-    
+    elif terminal_env == "modal":
+        modal_image = os.getenv("TERMINAL_MODAL_IMAGE", "python:3.11-slim")
+        print(f"  Modal Image:  {modal_image}")
+    elif terminal_env == "daytona":
+        daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
+        daytona_key = os.getenv("DAYTONA_API_KEY", "")
+        print(f"  Daytona Image:{' ' if len('Daytona Image:') < 14 else ''} {daytona_image}")
+        print(f"  API Key:      {check_mark(bool(daytona_key))} {'configured' if daytona_key else 'not set'}")
+
     sudo_password = os.getenv("SUDO_PASSWORD", "")
     print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
     

@@ -19,6 +19,17 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 
+def _coerce_bool(value: Any, default: bool = True) -> bool:
+    """Coerce config values into bools with a sensible default."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
 class Platform(Enum):
     """Supported messaging platforms."""
     LOCAL = "local"
@@ -149,6 +160,7 @@ class GatewayConfig:
     
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
+    stt_enabled: bool = True  # Whether gateway audio should be transcribed
     
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
@@ -200,6 +212,7 @@ class GatewayConfig:
             "reset_triggers": self.reset_triggers,
             "sessions_dir": str(self.sessions_dir),
             "always_log_local": self.always_log_local,
+            "stt_enabled": self.stt_enabled,
         }
     
     @classmethod
@@ -231,6 +244,12 @@ class GatewayConfig:
         sessions_dir = Path.home() / ".hermes" / "sessions"
         if "sessions_dir" in data:
             sessions_dir = Path(data["sessions_dir"])
+
+        stt_enabled = data.get("stt_enabled")
+        if stt_enabled is None:
+            stt_cfg = data.get("stt")
+            if isinstance(stt_cfg, dict):
+                stt_enabled = stt_cfg.get("enabled")
         
         return cls(
             platforms=platforms,
@@ -240,6 +259,7 @@ class GatewayConfig:
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             sessions_dir=sessions_dir,
             always_log_local=data.get("always_log_local", True),
+            stt_enabled=_coerce_bool(stt_enabled, True),
         )
 
 
@@ -277,6 +297,10 @@ def load_gateway_config() -> GatewayConfig:
             sr = yaml_cfg.get("session_reset")
             if sr and isinstance(sr, dict):
                 config.default_reset_policy = SessionResetPolicy.from_dict(sr)
+
+            stt_cfg = yaml_cfg.get("stt")
+            if isinstance(stt_cfg, dict) and "enabled" in stt_cfg:
+                config.stt_enabled = _coerce_bool(stt_cfg.get("enabled"), True)
     except Exception:
         pass
 

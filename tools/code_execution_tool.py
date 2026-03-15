@@ -32,6 +32,7 @@ import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional
+from hermes_time import get_timezone_name
 
 # Availability gate: UDS requires a POSIX OS
 logger = logging.getLogger(__name__)
@@ -407,6 +408,16 @@ def execute_code(
                 child_env[k] = v
         child_env["HERMES_RPC_SOCKET"] = sock_path
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # Ensure repo-local Hermes modules remain importable from the temp sandbox.
+        hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        existing_pythonpath = child_env.get("PYTHONPATH", "")
+        child_env["PYTHONPATH"] = hermes_root + (
+            os.pathsep + existing_pythonpath if existing_pythonpath else ""
+        )
+        tz_name = get_timezone_name()
+        if tz_name:
+            child_env["HERMES_TIMEZONE"] = tz_name
+            child_env["TZ"] = tz_name
 
         proc = subprocess.Popen(
             [sys.executable, "script.py"],

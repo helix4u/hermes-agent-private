@@ -67,6 +67,100 @@ _PROVIDER_ALIASES = {
 }
 
 
+def _load_auxiliary_config() -> Dict[str, Any]:
+    """Read auxiliary config from ~/.hermes/config.yaml."""
+    try:
+        if not _CONFIG_YAML_PATH.is_file():
+            return {}
+        import yaml
+
+        data = yaml.safe_load(_CONFIG_YAML_PATH.read_text(encoding="utf-8")) or {}
+        auxiliary_cfg = data.get("auxiliary", {})
+        return auxiliary_cfg if isinstance(auxiliary_cfg, dict) else {}
+    except Exception as exc:
+        logger.debug("Could not read auxiliary config: %s", exc)
+        return {}
+
+
+def _get_auxiliary_overrides(kind: str) -> Dict[str, str]:
+    """Return normalized auxiliary overrides for a task kind."""
+    auxiliary_cfg = _load_auxiliary_config()
+    task_cfg = auxiliary_cfg.get(kind, {})
+    if not isinstance(task_cfg, dict):
+        return {}
+    overrides: Dict[str, str] = {}
+    for key in ("provider", "model", "base_url", "api_key"):
+        value = task_cfg.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            overrides[key] = text
+    return overrides
+
+
+def _get_auxiliary_env_override(task: str, suffix: str) -> Optional[str]:
+    """Read task-specific auxiliary overrides from AUXILIARY_/CONTEXT_ env vars."""
+    if not task:
+        return None
+    task_name = task.strip().upper().replace("-", "_")
+    if not task_name:
+        return None
+    for prefix in ("AUXILIARY_", "CONTEXT_"):
+        value = os.getenv(f"{prefix}{task_name}_{suffix}", "").strip()
+        if value:
+            return value
+    return None
+
+
+def _get_task_auxiliary_overrides(task: Optional[str], task_kind: str) -> Dict[str, str]:
+    """Merge task-specific overrides with the text/vision task-kind defaults."""
+    merged: Dict[str, str] = {}
+    merged.update(_get_auxiliary_overrides(task_kind))
+
+    task_name = (task or "").strip().lower()
+    if task_name and task_name != task_kind:
+        merged.update(_get_auxiliary_overrides(task_name))
+
+    env_task_names: List[str] = []
+    if task_name:
+        env_task_names.append(task_name)
+    if task_kind not in env_task_names:
+        env_task_names.append(task_kind)
+
+    for env_task in env_task_names:
+        for key, suffix in (
+            ("provider", "PROVIDER"),
+            ("model", "MODEL"),
+            ("base_url", "BASE_URL"),
+            ("api_key", "API_KEY"),
+        ):
+            value = _get_auxiliary_env_override(env_task, suffix)
+            if value:
+                merged[key] = value
+
+    return merged
+
+
+def _resolve_auxiliary_direct_credentials(overrides: Dict[str, str]) -> Tuple[str, str]:
+    """Resolve explicit direct endpoint credentials from config/env."""
+    base_url = overrides.get("base_url", "").strip()
+    api_key = overrides.get("api_key", "").strip() or os.getenv("OPENAI_API_KEY", "").strip()
+    return base_url, api_key
+
+
+def _build_custom_auxiliary_client(
+    base_url: str,
+    api_key: str,
+    model: Optional[str] = None,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
+    """Build a direct OpenAI-compatible auxiliary client."""
+    if not (base_url and api_key):
+        return None, None
+    resolved_model = model or os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
+    return OpenAI(api_key=api_key, base_url=base_url), resolved_model
+
+
 def _chat_content_to_text(content: Any) -> str:
     """Extract text from chat.completions-style message content."""
     if isinstance(content, str):
@@ -394,9 +488,304 @@ def _resolve_auto_provider_preference() -> str:
     return "auto"
 
 
+def _to_async_client(sync_client: Any, model: Optional[str]):
+    """Convert a sync auxiliary client to its async counterpart."""
+    from openai import AsyncOpenAI
+
+    if isinstance(sync_client, CodexAuxiliaryClient):
+        return AsyncCodexAuxiliaryClient(sync_client), model
+
+    async_kwargs = {
+        "api_key": sync_client.api_key,
+        "base_url": str(sync_client.base_url),
+    }
+    base_lower = str(sync_client.base_url).lower()
+    if "openrouter" in base_lower:
+        async_kwargs["default_headers"] = dict(_OR_HEADERS)
+    return AsyncOpenAI(**async_kwargs), model
+
+
+def _infer_task_kind(task: Optional[str]) -> str:
+    """Return 'vision' for multimodal tasks, else 'text'."""
+    task_name = (task or "").strip().lower()
+    if task_name in {"vision", "browser_vision", "browser-vision"}:
+        return "vision"
+    return "text"
+
+
+def _resolve_task_provider_model(
+    task: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Tuple[str, Optional[str], str, Optional[str], Optional[str]]:
+    """Resolve provider/model intent for a task without creating a client."""
+    task_kind = _infer_task_kind(task)
+    overrides = _get_task_auxiliary_overrides(task, task_kind)
+
+    if base_url:
+        return "custom", model or overrides.get("model"), task_kind, base_url, api_key
+    if provider:
+        return _normalize_provider_name(provider), model or overrides.get("model"), task_kind, None, None
+
+    cfg_provider = _normalize_provider_name(overrides.get("provider", ""))
+    cfg_model = overrides.get("model") or model
+    cfg_base_url = overrides.get("base_url")
+    cfg_api_key = overrides.get("api_key")
+    if cfg_base_url:
+        return "custom", cfg_model, task_kind, cfg_base_url, cfg_api_key
+    if cfg_provider and cfg_provider != "auto":
+        return cfg_provider, cfg_model, task_kind, None, None
+
+    env_provider = _normalize_provider_name(os.getenv(_AUX_PROVIDER_ENV, "auto"))
+    if env_provider and env_provider != "auto":
+        return env_provider, cfg_model, task_kind, None, None
+
+    preferred = _resolve_auto_provider_preference()
+    return preferred or "auto", cfg_model, task_kind, None, None
+
+
+def resolve_provider_client(
+    provider: str,
+    model: Optional[str] = None,
+    async_mode: bool = False,
+    raw_codex: bool = False,
+    task_kind: str = "text",
+    task: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Central entry point for provider-specific auxiliary client resolution.
+
+    This Stage 1 wrapper preserves the existing local provider behavior while
+    giving consumers a single place to ask for a configured client.
+    """
+    normalized_provider = _normalize_provider_name(provider or "auto")
+    task_kind = "vision" if task_kind == "vision" else "text"
+    overrides = _get_task_auxiliary_overrides(task, task_kind)
+
+    if normalized_provider == "auto":
+        if explicit_base_url:
+            client, resolved_model = _build_custom_auxiliary_client(
+                explicit_base_url,
+                (explicit_api_key or "").strip() or os.getenv("OPENAI_API_KEY", "").strip(),
+                model or overrides.get("model"),
+            )
+            if client is None:
+                return None, None
+            final_model = model or resolved_model
+            return _to_async_client(client, final_model) if async_mode else (client, final_model)
+        if task_kind == "vision":
+            client, resolved_model = get_vision_auxiliary_client(task or task_kind)
+        else:
+            client, resolved_model = get_text_auxiliary_client(task or task_kind)
+        if client is None:
+            return None, None
+        final_model = model or resolved_model
+        return _to_async_client(client, final_model) if async_mode else (client, final_model)
+
+    if normalized_provider == "openrouter":
+        or_key = os.getenv("OPENROUTER_API_KEY")
+        if not or_key:
+            return None, None
+        resolved_model = model or overrides.get("model") or _OPENROUTER_MODEL
+        client = OpenAI(
+            api_key=or_key,
+            base_url=OPENROUTER_BASE_URL,
+            default_headers=_OR_HEADERS,
+        )
+        return _to_async_client(client, resolved_model) if async_mode else (client, resolved_model)
+
+    if normalized_provider == "nous":
+        global auxiliary_is_nous
+        nous = _read_nous_auth()
+        if not nous:
+            return None, None
+        auxiliary_is_nous = True
+        resolved_model = model or overrides.get("model") or _NOUS_MODEL
+        client = OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url())
+        return _to_async_client(client, resolved_model) if async_mode else (client, resolved_model)
+
+    if normalized_provider == "custom":
+        base_url = (explicit_base_url or "").strip()
+        api_key = (explicit_api_key or "").strip()
+        if not base_url:
+            base_url, api_key = _resolve_auxiliary_direct_credentials(overrides)
+        if not base_url:
+            base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+        client, resolved_model = _build_custom_auxiliary_client(
+            base_url,
+            api_key,
+            model or overrides.get("model"),
+        )
+        if client is None:
+            return None, None
+        return _to_async_client(client, resolved_model) if async_mode else (client, resolved_model)
+
+    if normalized_provider == "openai-codex":
+        codex_token = _read_codex_access_token()
+        if not codex_token:
+            return None, None
+        resolved_model = model or _CODEX_AUX_MODEL
+        real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
+        if raw_codex:
+            return real_client, resolved_model
+        wrapped = CodexAuxiliaryClient(real_client, resolved_model)
+        return _to_async_client(wrapped, resolved_model) if async_mode else (wrapped, resolved_model)
+
+    logger.warning("resolve_provider_client: unknown provider %r", provider)
+    return None, None
+
+
+def _build_llm_call_kwargs(
+    client: Any,
+    model: str,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    tools: Optional[list] = None,
+    timeout: float = 30.0,
+    extra_body: Optional[dict] = None,
+    base_url: Optional[str] = None,
+) -> dict:
+    """Build provider-aware kwargs for chat.completions.create()."""
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "timeout": timeout,
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        base_lower = str(base_url or getattr(client, "base_url", "")).lower()
+        if "api.openai.com" in base_lower:
+            kwargs["max_completion_tokens"] = max_tokens
+        else:
+            kwargs["max_tokens"] = max_tokens
+    if tools:
+        kwargs["tools"] = tools
+
+    merged_extra = dict(extra_body or {})
+    if auxiliary_is_nous:
+        existing_tags = merged_extra.get("tags")
+        if isinstance(existing_tags, list):
+            if "product=hermes-agent" not in existing_tags:
+                existing_tags.append("product=hermes-agent")
+        elif not merged_extra:
+            merged_extra = dict(NOUS_EXTRA_BODY)
+        else:
+            merged_extra["tags"] = ["product=hermes-agent"]
+    if merged_extra:
+        kwargs["extra_body"] = merged_extra
+    return kwargs
+
+
+def call_llm(
+    task: Optional[str] = None,
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    tools: Optional[list] = None,
+    timeout: float = 30.0,
+    extra_body: Optional[dict] = None,
+) -> Any:
+    """Centralized synchronous auxiliary LLM call."""
+    resolved_provider, resolved_model, task_kind, resolved_base_url, resolved_api_key = _resolve_task_provider_model(
+        task=task,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    client, final_model = resolve_provider_client(
+        resolved_provider,
+        model=resolved_model,
+        async_mode=False,
+        task_kind=task_kind,
+        task=task,
+        explicit_base_url=resolved_base_url,
+        explicit_api_key=resolved_api_key,
+    )
+    if client is None or final_model is None:
+        raise RuntimeError(
+            f"No LLM provider configured for task={task or task_kind} provider={resolved_provider}. "
+            "Run: hermes setup"
+        )
+
+    kwargs = _build_llm_call_kwargs(
+        client,
+        final_model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        timeout=timeout,
+        extra_body=extra_body,
+        base_url=resolved_base_url,
+    )
+    return client.chat.completions.create(**kwargs)
+
+
+async def async_call_llm(
+    task: Optional[str] = None,
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    tools: Optional[list] = None,
+    timeout: float = 30.0,
+    extra_body: Optional[dict] = None,
+) -> Any:
+    """Centralized asynchronous auxiliary LLM call."""
+    resolved_provider, resolved_model, task_kind, resolved_base_url, resolved_api_key = _resolve_task_provider_model(
+        task=task,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    client, final_model = resolve_provider_client(
+        resolved_provider,
+        model=resolved_model,
+        async_mode=True,
+        task_kind=task_kind,
+        task=task,
+        explicit_base_url=resolved_base_url,
+        explicit_api_key=resolved_api_key,
+    )
+    if client is None or final_model is None:
+        raise RuntimeError(
+            f"No LLM provider configured for task={task or task_kind} provider={resolved_provider}. "
+            "Run: hermes setup"
+        )
+
+    kwargs = _build_llm_call_kwargs(
+        client,
+        final_model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        timeout=timeout,
+        extra_body=extra_body,
+        base_url=resolved_base_url,
+    )
+    return await client.chat.completions.create(**kwargs)
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
+def get_text_auxiliary_client(task: str = "text") -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, model_slug) for text-only auxiliary tasks.
 
     Falls through OpenRouter -> Nous Portal -> custom endpoint -> Codex OAuth -> (None, None).
@@ -404,7 +793,8 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
     global auxiliary_is_nous
     auxiliary_is_nous = False
 
-    forced_provider_raw = os.getenv(_AUX_PROVIDER_ENV, "auto").strip().lower()
+    text_overrides = _get_task_auxiliary_overrides(task, "text")
+    forced_provider_raw = text_overrides.get("provider") or os.getenv(_AUX_PROVIDER_ENV, "auto").strip().lower()
     forced_provider = _normalize_provider_name(forced_provider_raw)
     valid_providers = {"auto", "openrouter", "nous", "custom", "openai-codex"}
     if forced_provider not in valid_providers:
@@ -414,6 +804,23 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
             forced_provider_raw,
         )
         forced_provider = "auto"
+
+    if forced_provider == "auto":
+        override_base_url, override_api_key = _resolve_auxiliary_direct_credentials(text_overrides)
+        if override_base_url:
+            client, model = _build_custom_auxiliary_client(
+                override_base_url,
+                override_api_key,
+                text_overrides.get("model"),
+            )
+            if client is None:
+                logger.warning(
+                    "auxiliary.text.base_url is set but no API key is available "
+                    "(set auxiliary.text.api_key or OPENAI_API_KEY)"
+                )
+                return None, None
+            logger.debug("Auxiliary text client: direct override (%s)", model)
+            return client, model
 
     # Explicit provider selection (strict): if a forced provider is selected
     # but not configured, return no client rather than silently falling through.
@@ -447,7 +854,7 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
                 _AUX_PROVIDER_ENV,
             )
             return None, None
-        model = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
+        model = text_overrides.get("model") or os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
         logger.debug("Auxiliary text client: custom endpoint (%s, forced)", model)
         return OpenAI(api_key=custom_key, base_url=custom_base), model
     if forced_provider == "openai-codex":
@@ -461,7 +868,9 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
 
     # Auto mode: if the runtime provider is explicitly selected, keep using it.
     if forced_provider == "auto":
-        preferred_provider = _resolve_auto_provider_preference()
+        preferred_provider = _normalize_provider_name(text_overrides.get("provider", ""))
+        if not preferred_provider:
+            preferred_provider = _resolve_auto_provider_preference()
         if preferred_provider == "openai-codex":
             codex_token = _read_codex_access_token()
             if codex_token:
@@ -479,7 +888,7 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
             logger.debug("Auxiliary text client: OpenRouter (via runtime provider preference)")
             return (
                 OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL, default_headers=_OR_HEADERS),
-                _OPENROUTER_MODEL,
+                text_overrides.get("model") or _OPENROUTER_MODEL,
             )
         if preferred_provider == "nous":
             nous = _read_nous_auth()
@@ -489,14 +898,14 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
             logger.debug("Auxiliary text client: Nous Portal (via runtime provider preference)")
             return (
                 OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()),
-                _NOUS_MODEL,
+                text_overrides.get("model") or _NOUS_MODEL,
             )
         if preferred_provider == "custom":
             custom_base = os.getenv("OPENAI_BASE_URL")
             custom_key = os.getenv("OPENAI_API_KEY")
             if not (custom_base and custom_key):
                 return None, None
-            model = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
+            model = text_overrides.get("model") or os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
             logger.debug("Auxiliary text client: custom endpoint (%s via runtime provider preference)", model)
             return OpenAI(api_key=custom_key, base_url=custom_base), model
 
@@ -505,7 +914,7 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
     if or_key:
         logger.debug("Auxiliary text client: OpenRouter")
         return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                       default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                       default_headers=_OR_HEADERS), text_overrides.get("model") or _OPENROUTER_MODEL
 
     # 2. Nous Portal
     nous = _read_nous_auth()
@@ -514,14 +923,14 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
         logger.debug("Auxiliary text client: Nous Portal")
         return (
             OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()),
-            _NOUS_MODEL,
+            text_overrides.get("model") or _NOUS_MODEL,
         )
 
     # 3. Custom endpoint (both base URL and key must be set)
     custom_base = os.getenv("OPENAI_BASE_URL")
     custom_key = os.getenv("OPENAI_API_KEY")
     if custom_base and custom_key:
-        model = os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
+        model = text_overrides.get("model") or os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
         logger.debug("Auxiliary text client: custom endpoint (%s)", model)
         return OpenAI(api_key=custom_key, base_url=custom_base), model
 
@@ -538,7 +947,7 @@ def get_text_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
     return None, None
 
 
-def get_async_text_auxiliary_client():
+def get_async_text_auxiliary_client(task: str = "text"):
     """Return (async_client, model_slug) for async consumers.
 
     For standard providers returns (AsyncOpenAI, model). For Codex returns
@@ -547,7 +956,7 @@ def get_async_text_auxiliary_client():
     """
     from openai import AsyncOpenAI
 
-    sync_client, model = get_text_auxiliary_client()
+    sync_client, model = get_text_auxiliary_client(task)
     if sync_client is None:
         return None, None
 
@@ -563,13 +972,14 @@ def get_async_text_auxiliary_client():
     return AsyncOpenAI(**async_kwargs), model
 
 
-def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
+def get_vision_auxiliary_client(task: str = "vision") -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, model_slug) for vision/multimodal auxiliary tasks.
 
     Falls through OpenRouter -> Nous Portal -> Codex OAuth -> (None, None).
     Custom endpoints are not assumed to provide multimodal compatibility.
     """
-    forced_provider_raw = os.getenv(_AUX_PROVIDER_ENV, "auto").strip().lower()
+    vision_overrides = _get_task_auxiliary_overrides(task, "vision")
+    forced_provider_raw = vision_overrides.get("provider") or os.getenv(_AUX_PROVIDER_ENV, "auto").strip().lower()
     forced_provider = _normalize_provider_name(forced_provider_raw)
     valid_providers = {"auto", "openrouter", "nous", "custom", "openai-codex"}
     if forced_provider not in valid_providers:
@@ -580,6 +990,23 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
         )
         forced_provider = "auto"
 
+    if forced_provider == "auto":
+        override_base_url, override_api_key = _resolve_auxiliary_direct_credentials(vision_overrides)
+        if override_base_url:
+            client, model = _build_custom_auxiliary_client(
+                override_base_url,
+                override_api_key,
+                vision_overrides.get("model"),
+            )
+            if client is None:
+                logger.warning(
+                    "auxiliary.vision.base_url is set but no API key is available "
+                    "(set auxiliary.vision.api_key or OPENAI_API_KEY)"
+                )
+                return None, None
+            logger.debug("Auxiliary vision client: direct override (%s)", model)
+            return client, model
+
     if forced_provider == "openrouter":
         or_key = os.getenv("OPENROUTER_API_KEY")
         if not or_key:
@@ -587,7 +1014,7 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
             return None, None
         logger.debug("Auxiliary vision client: OpenRouter (forced)")
         return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                      default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                      default_headers=_OR_HEADERS), vision_overrides.get("model") or _OPENROUTER_MODEL
 
     if forced_provider == "nous":
         nous = _read_nous_auth()
@@ -595,14 +1022,24 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
             logger.warning("%s=nous but no active Nous auth was found", _AUX_PROVIDER_ENV)
             return None, None
         logger.debug("Auxiliary vision client: Nous Portal (forced)")
-        return OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()), _NOUS_MODEL
+        return OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()), vision_overrides.get("model") or _NOUS_MODEL
 
     if forced_provider == "custom":
-        logger.warning(
-            "%s=custom is not supported for auxiliary vision; use OpenRouter, Nous, or openai-codex",
-            _AUX_PROVIDER_ENV,
+        custom_base = os.getenv("OPENAI_BASE_URL")
+        custom_key = os.getenv("OPENAI_API_KEY")
+        client, model = _build_custom_auxiliary_client(
+            custom_base,
+            custom_key,
+            vision_overrides.get("model"),
         )
-        return None, None
+        if client is None:
+            logger.warning(
+                "%s=custom but OPENAI_BASE_URL/OPENAI_API_KEY are not fully configured",
+                _AUX_PROVIDER_ENV,
+            )
+            return None, None
+        logger.debug("Auxiliary vision client: custom endpoint (%s, forced)", model)
+        return client, model
 
     if forced_provider == "openai-codex":
         codex_token = _read_codex_access_token()
@@ -614,7 +1051,9 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
         return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
 
     if forced_provider == "auto":
-        preferred_provider = _resolve_auto_provider_preference()
+        preferred_provider = _normalize_provider_name(vision_overrides.get("provider", ""))
+        if not preferred_provider:
+            preferred_provider = _resolve_auto_provider_preference()
         if preferred_provider == "openai-codex":
             codex_token = _read_codex_access_token()
             if codex_token:
@@ -631,22 +1070,29 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
                 return None, None
             logger.debug("Auxiliary vision client: OpenRouter (via runtime provider preference)")
             return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                          default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                          default_headers=_OR_HEADERS), vision_overrides.get("model") or _OPENROUTER_MODEL
         if preferred_provider == "nous":
             nous = _read_nous_auth()
             if not nous:
                 return None, None
             logger.debug("Auxiliary vision client: Nous Portal (via runtime provider preference)")
-            return OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()), _NOUS_MODEL
+            return OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()), vision_overrides.get("model") or _NOUS_MODEL
         if preferred_provider == "custom":
-            return None, None
+            custom_base = os.getenv("OPENAI_BASE_URL")
+            custom_key = os.getenv("OPENAI_API_KEY")
+            client, model = _build_custom_auxiliary_client(
+                custom_base,
+                custom_key,
+                vision_overrides.get("model"),
+            )
+            return client, model
 
     # 1. OpenRouter
     or_key = os.getenv("OPENROUTER_API_KEY")
     if or_key:
         logger.debug("Auxiliary vision client: OpenRouter")
         return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                       default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                       default_headers=_OR_HEADERS), vision_overrides.get("model") or _OPENROUTER_MODEL
 
     # 2. Nous Portal
     nous = _read_nous_auth()
@@ -654,7 +1100,7 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
         logger.debug("Auxiliary vision client: Nous Portal")
         return (
             OpenAI(api_key=_nous_api_key(nous), base_url=_nous_base_url()),
-            _NOUS_MODEL,
+            vision_overrides.get("model") or _NOUS_MODEL,
         )
 
     # 3. Codex OAuth
@@ -669,11 +1115,11 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
     return None, None
 
 
-def get_async_vision_auxiliary_client():
+def get_async_vision_auxiliary_client(task: str = "vision"):
     """Return (async_client, model_slug) for async multimodal auxiliary tasks."""
     from openai import AsyncOpenAI
 
-    sync_client, model = get_vision_auxiliary_client()
+    sync_client, model = get_vision_auxiliary_client(task)
     if sync_client is None:
         return None, None
 
@@ -706,7 +1152,8 @@ def auxiliary_max_tokens_param(value: int) -> dict:
     The Codex adapter translates max_tokens internally, so we use max_tokens
     for it as well.
     """
-    custom_base = os.getenv("OPENAI_BASE_URL", "")
+    text_overrides = _get_auxiliary_overrides("text")
+    custom_base = text_overrides.get("base_url") or os.getenv("OPENAI_BASE_URL", "")
     or_key = os.getenv("OPENROUTER_API_KEY")
     # Only use max_completion_tokens for direct OpenAI custom endpoints
     if (not or_key

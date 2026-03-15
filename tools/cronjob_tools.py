@@ -11,6 +11,7 @@ The prompt must contain ALL necessary information.
 import json
 import os
 import re
+import shutil
 from typing import Optional
 
 # Import from cron module (will be available when properly installed)
@@ -122,6 +123,9 @@ def schedule_cronjob(
             "chat_id": origin_chat_id,
             "chat_name": os.getenv("HERMES_SESSION_CHAT_NAME"),
         }
+        origin_thread_id = os.getenv("HERMES_SESSION_THREAD_ID")
+        if origin_thread_id:
+            origin["thread_id"] = origin_thread_id
     
     try:
         job = create_job(
@@ -383,10 +387,14 @@ use this to cancel a job before it completes.""",
 def check_cronjob_requirements() -> bool:
     """
     Check if cronjob tools can be used.
-    
+
+    Requires 'crontab' executable to be present in the system PATH.
     Available in interactive CLI mode and gateway/messaging platforms.
     Cronjobs are server-side scheduled tasks so they work from any interface.
     """
+    if not shutil.which("crontab"):
+        return False
+
     return bool(
         os.getenv("HERMES_INTERACTIVE")
         or os.getenv("HERMES_GATEWAY_SESSION")

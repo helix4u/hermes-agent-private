@@ -81,6 +81,11 @@ class TelegramAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        self._media_batch_delay_seconds = float(
+            os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8")
+        )
+        self._pending_photo_batches: Dict[str, MessageEvent] = {}
+        self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
     
     async def connect(self) -> bool:
         """Connect to Telegram and start polling for updates."""
@@ -146,11 +151,19 @@ class TelegramAdapter(BasePlatformAdapter):
         """Stop polling and disconnect."""
         if self._app:
             try:
-                await self._app.updater.stop()
-                await self._app.stop()
+                if self._app.updater and self._app.updater.running:
+                    await self._app.updater.stop()
+                if self._app.running:
+                    await self._app.stop()
                 await self._app.shutdown()
             except Exception as e:
                 print(f"[{self.name}] Error during disconnect: {e}")
+
+        for task in self._pending_photo_batch_tasks.values():
+            if task and not task.done():
+                task.cancel()
+        self._pending_photo_batch_tasks.clear()
+        self._pending_photo_batches.clear()
         
         self._running = False
         self._app = None
@@ -458,6 +471,42 @@ class TelegramAdapter(BasePlatformAdapter):
         # Add caption as text
         if msg.caption:
             event.text = msg.caption
+
+        def _photo_batch_key(message_event: MessageEvent, telegram_msg: Message) -> str:
+            session_key = message_event.source.chat_id
+            media_group_id = getattr(telegram_msg, "media_group_id", None)
+            if media_group_id:
+                return f"{session_key}:album:{media_group_id}"
+            return f"{session_key}:photo-burst"
+
+        async def _flush_photo_batch(batch_key: str) -> None:
+            current_task = asyncio.current_task()
+            try:
+                await asyncio.sleep(self._media_batch_delay_seconds)
+                pending_event = self._pending_photo_batches.pop(batch_key, None)
+                if pending_event:
+                    await self.handle_message(pending_event)
+            finally:
+                if self._pending_photo_batch_tasks.get(batch_key) is current_task:
+                    self._pending_photo_batch_tasks.pop(batch_key, None)
+
+        def _enqueue_photo_event(batch_key: str, message_event: MessageEvent) -> None:
+            existing = self._pending_photo_batches.get(batch_key)
+            if existing is None:
+                self._pending_photo_batches[batch_key] = message_event
+            else:
+                existing.media_urls.extend(message_event.media_urls)
+                existing.media_types.extend(message_event.media_types)
+                if message_event.text:
+                    if not existing.text:
+                        existing.text = message_event.text
+                    elif message_event.text not in existing.text:
+                        existing.text = f"{existing.text}\n\n{message_event.text}".strip()
+
+            prior_task = self._pending_photo_batch_tasks.get(batch_key)
+            if prior_task and not prior_task.done():
+                prior_task.cancel()
+            self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(_flush_photo_batch(batch_key))
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
@@ -486,6 +535,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}"]
                 print(f"[Telegram] Cached user photo: {cached_path}", flush=True)
+                batch_key = _photo_batch_key(event, msg)
+                _enqueue_photo_event(batch_key, event)
+                return
             except Exception as e:
                 print(f"[Telegram] Failed to cache photo: {e}", flush=True)
         

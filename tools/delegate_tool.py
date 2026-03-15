@@ -103,6 +103,69 @@ def _resolve_max_concurrent_children(cfg: Optional[Dict[str, Any]] = None) -> in
     return max(1, min(value, 3))
 
 
+def _infer_provider_from_base_url(base_url: str) -> str:
+    """Best-effort provider inference for direct endpoint overrides."""
+    url = (base_url or "").strip().lower()
+    if not url:
+        return ""
+    if "chatgpt.com/backend-api/codex" in url:
+        return "openai-codex"
+    if "api.anthropic.com" in url:
+        return "anthropic"
+    if "openrouter.ai" in url:
+        return "openrouter"
+    if "nousresearch.com" in url:
+        return "nous"
+    return "custom"
+
+
+def _infer_api_mode(provider: str, base_url: str, parent_agent) -> Optional[str]:
+    """Infer the correct api_mode for a delegated child runtime."""
+    normalized = (provider or "").strip().lower()
+    if normalized == "openai-codex" or "chatgpt.com/backend-api/codex" in (base_url or "").lower():
+        return "codex_responses"
+    if normalized == "anthropic" or "api.anthropic.com" in (base_url or "").lower():
+        return "anthropic_messages"
+    parent_mode = getattr(parent_agent, "api_mode", None)
+    if normalized and normalized == getattr(parent_agent, "provider", None):
+        return parent_mode
+    return "chat_completions"
+
+
+def _resolve_delegation_runtime(cfg: Dict[str, Any], parent_agent, model_override: Optional[str]) -> Dict[str, Any]:
+    """Resolve the child runtime, allowing direct endpoint overrides."""
+    parent_provider = getattr(parent_agent, "provider", None)
+    parent_base_url = getattr(parent_agent, "base_url", None)
+    parent_api_mode = getattr(parent_agent, "api_mode", None)
+    parent_api_key = getattr(parent_agent, "api_key", None)
+    if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
+        parent_api_key = parent_agent._client_kwargs.get("api_key")
+
+    configured_base_url = str(cfg.get("base_url", "") or "").strip()
+    configured_api_key = str(cfg.get("api_key", "") or "").strip()
+    configured_provider = str(cfg.get("provider", "") or "").strip()
+    configured_model = str(cfg.get("model", "") or "").strip()
+
+    if configured_base_url:
+        provider = configured_provider or _infer_provider_from_base_url(configured_base_url)
+        api_key = configured_api_key or os.getenv("OPENAI_API_KEY", "").strip() or parent_api_key
+        return {
+            "base_url": configured_base_url,
+            "api_key": api_key,
+            "provider": provider,
+            "api_mode": _infer_api_mode(provider, configured_base_url, parent_agent),
+            "model": model_override or configured_model or parent_agent.model,
+        }
+
+    return {
+        "base_url": parent_base_url,
+        "api_key": parent_api_key,
+        "provider": parent_provider,
+        "api_mode": parent_api_mode,
+        "model": model_override or configured_model or parent_agent.model,
+    }
+
+
 def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -215,20 +278,18 @@ def _run_single_child(
     child_prompt = _build_child_system_prompt(goal, context)
 
     try:
-        # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
-        parent_api_key = getattr(parent_agent, "api_key", None)
-        if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
-            parent_api_key = parent_agent._client_kwargs.get("api_key")
+        cfg = _load_config()
+        child_runtime = _resolve_delegation_runtime(cfg, parent_agent, model)
 
         # Build progress callback to relay tool calls to parent display
         child_progress_cb = _build_child_progress_callback(task_index, parent_agent, task_count)
 
         child = AIAgent(
-            base_url=parent_agent.base_url,
-            api_key=parent_api_key,
-            model=model or parent_agent.model,
-            provider=getattr(parent_agent, "provider", None),
-            api_mode=getattr(parent_agent, "api_mode", None),
+            base_url=child_runtime["base_url"],
+            api_key=child_runtime["api_key"],
+            model=child_runtime["model"],
+            provider=child_runtime["provider"],
+            api_mode=child_runtime["api_mode"],
             max_iterations=max_iterations,
             enabled_toolsets=child_toolsets,
             quiet_mode=True,

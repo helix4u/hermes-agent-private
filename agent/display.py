@@ -20,6 +20,11 @@ _RESET = "\033[0m"
 # Tool preview (one-line summary of a tool call's primary argument)
 # =========================================================================
 
+def _oneline(text: str) -> str:
+    """Collapse whitespace, including newlines, to a single line."""
+    return " ".join(text.split())
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
     """Build a short preview of a tool call's primary argument for display."""
     primary_args = {
@@ -44,7 +49,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
         if sid:
             parts.append(sid[:16])
         if data:
-            parts.append(f'"{data[:20]}"')
+            parts.append(f'"{_oneline(data[:20])}"')
         if timeout_val and action == "wait":
             parts.append(f"{timeout_val}s")
         return " ".join(parts) if parts else None
@@ -60,24 +65,24 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
             return f"planning {len(todos_arg)} task(s)"
 
     if tool_name == "session_search":
-        query = args.get("query", "")
+        query = _oneline(args.get("query", ""))
         return f"recall: \"{query[:25]}{'...' if len(query) > 25 else ''}\""
 
     if tool_name == "memory":
         action = args.get("action", "")
         target = args.get("target", "")
         if action == "add":
-            content = args.get("content", "")
+            content = _oneline(args.get("content", ""))
             return f"+{target}: \"{content[:25]}{'...' if len(content) > 25 else ''}\""
         elif action == "replace":
-            return f"~{target}: \"{args.get('old_text', '')[:20]}\""
+            return f"~{target}: \"{_oneline(args.get('old_text', '')[:20])}\""
         elif action == "remove":
-            return f"-{target}: \"{args.get('old_text', '')[:20]}\""
+            return f"-{target}: \"{_oneline(args.get('old_text', '')[:20])}\""
         return action
 
     if tool_name == "send_message":
         target = args.get("target", "?")
-        msg = args.get("message", "")
+        msg = _oneline(args.get("message", ""))
         if len(msg) > 20:
             msg = msg[:17] + "..."
         return f"to {target}: \"{msg}\""
@@ -130,7 +135,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
     if isinstance(value, list):
         value = value[0] if value else ""
 
-    preview = str(value).strip()
+    preview = _oneline(str(value))
     if not preview:
         return None
     if len(preview) > max_len:
