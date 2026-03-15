@@ -1498,6 +1498,7 @@ class GatewayRunner:
             "personality", "retry", "undo", "sethome", "set-home",
             "terminal", "shell", "compress", "usage", "insights", "reload-mcp",
             "cron", "invokeai-defaults", "invokeai_defaults", "update",
+            "background",
             "wiki-host", "wiki_host"
         }
         if command and command in _known_commands:
@@ -1536,7 +1537,7 @@ class GatewayRunner:
 
             if command == "stop":
                 return await self._handle_stop_command(event)
-            if command in {"help", "status", "usage", "insights", "cron", "update"}:
+            if command in {"help", "status", "usage", "insights", "cron", "update", "background"}:
                 logger.debug(
                     "Handling out-of-band command /%s for active session %s",
                     command,
@@ -1552,6 +1553,8 @@ class GatewayRunner:
                     return await self._handle_insights_command(event)
                 if command == "update":
                     return await self._handle_update_command(event)
+                if command == "background":
+                    return await self._handle_background_command(event)
                 return await self._handle_cron_command(event)
 
             running_agent = self._running_agents[_quick_key]
@@ -1613,6 +1616,9 @@ class GatewayRunner:
 
         if command == "update":
             return await self._handle_update_command(event)
+
+        if command == "background":
+            return await self._handle_background_command(event)
 
         if command == "cron":
             return await self._handle_cron_command(event)
@@ -3538,6 +3544,7 @@ class GatewayRunner:
             "`/compress` — Compress conversation context",
             "`/usage` — Show token usage for this session",
             "`/insights [days]` — Show usage insights and analytics",
+            "`/background <prompt>` — Run a prompt in a separate background session",
             "`/reload-mcp` — Reload MCP servers from config",
             "`/update` — Update Hermes Agent to the latest version",
             "`/cron` — Manage scheduled jobs (`list`, `add`, `remove`, `run`)",
@@ -4589,6 +4596,190 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("MCP reload failed: %s", e)
             return f"❌ MCP reload failed: {e}"
+
+    async def _handle_background_command(self, event: MessageEvent) -> str:
+        """Handle /background <prompt> by running a separate agent session."""
+        prompt = event.get_command_args().strip()
+        if not prompt:
+            return (
+                "Usage: /background <prompt>\n"
+                "Example: /background Summarize the top HN stories today\n\n"
+                "Runs the prompt in a separate session. "
+                "You can keep chatting - the result will appear here when done."
+            )
+
+        source = event.source
+        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        asyncio.create_task(self._run_background_task(prompt, source, task_id))
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        return (
+            f'🔄 Background task started: "{preview}"\n'
+            f"Task ID: {task_id}\n"
+            "You can keep chatting - results will appear when done."
+        )
+
+    async def _run_background_task(
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+    ) -> None:
+        """Execute a background agent task and deliver the result back to the chat."""
+        from run_agent import AIAgent
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            return
+
+        thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if not runtime_kwargs.get("api_key"):
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ Background task {task_id} failed: no provider credentials configured.",
+                    metadata=thread_metadata,
+                )
+                return
+
+            model = _resolve_gateway_runtime_model(runtime_kwargs.get("provider"))
+            context_prompt = build_session_context_prompt(build_session_context(source, self.config))
+            if self._ephemeral_system_prompt:
+                context_prompt = (context_prompt + "\n\n" + self._ephemeral_system_prompt).strip()
+
+            default_toolset_map = {
+                Platform.LOCAL: "hermes-cli",
+                Platform.TELEGRAM: "hermes-telegram",
+                Platform.DISCORD: "hermes-discord",
+                Platform.WHATSAPP: "hermes-whatsapp",
+                Platform.SLACK: "hermes-slack",
+            }
+            platform_toolsets_config = {}
+            try:
+                config_path = _hermes_home / "config.yaml"
+                if config_path.exists():
+                    import yaml
+
+                    with open(config_path, "r", encoding="utf-8") as handle:
+                        user_config = yaml.safe_load(handle) or {}
+                    platform_toolsets_config = user_config.get("platform_toolsets", {})
+            except Exception:
+                pass
+
+            platform_config_key = {
+                Platform.LOCAL: "cli",
+                Platform.TELEGRAM: "telegram",
+                Platform.DISCORD: "discord",
+                Platform.WHATSAPP: "whatsapp",
+                Platform.SLACK: "slack",
+            }.get(source.platform, "telegram")
+
+            config_toolsets = platform_toolsets_config.get(platform_config_key)
+            if config_toolsets and isinstance(config_toolsets, list):
+                enabled_toolsets = config_toolsets
+            else:
+                enabled_toolsets = [default_toolset_map.get(source.platform, "hermes-telegram")]
+
+            platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
+            pr = self._provider_routing
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "60"))
+
+            def run_sync():
+                agent = AIAgent(
+                    model=model,
+                    **runtime_kwargs,
+                    max_iterations=max_iterations,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    enabled_toolsets=enabled_toolsets,
+                    ephemeral_system_prompt=context_prompt or None,
+                    prefill_messages=self._prefill_messages or None,
+                    reasoning_config=self._reasoning_config,
+                    providers_allowed=pr.get("only"),
+                    providers_ignored=pr.get("ignore"),
+                    providers_order=pr.get("order"),
+                    provider_sort=pr.get("sort"),
+                    provider_require_parameters=pr.get("require_parameters", False),
+                    provider_data_collection=pr.get("data_collection"),
+                    session_id=task_id,
+                    platform=platform_key,
+                    session_db=self._session_db,
+                )
+                return agent.run_conversation(
+                    user_message=prompt,
+                    task_id=task_id,
+                )
+
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, run_sync)
+
+            response = result.get("final_response", "") if result else ""
+            if not response and result and result.get("error"):
+                response = f"Error: {result['error']}"
+
+            preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+            header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+
+            if response:
+                images, text_content = adapter.extract_images(response)
+                media_files, text_content = adapter.extract_media(text_content)
+
+                if text_content:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=header + text_content,
+                        metadata=thread_metadata,
+                    )
+                elif not images and not media_files:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=header + "(No response generated)",
+                        metadata=thread_metadata,
+                    )
+
+                for image_url, alt_text in images or []:
+                    try:
+                        await adapter.send_image(
+                            chat_id=source.chat_id,
+                            image_url=image_url,
+                            caption=alt_text,
+                        )
+                    except Exception:
+                        pass
+
+                for media_path, is_voice in media_files or []:
+                    try:
+                        if is_voice:
+                            await adapter.send_voice(
+                                chat_id=source.chat_id,
+                                audio_path=media_path,
+                            )
+                        else:
+                            await adapter.send_document(
+                                chat_id=source.chat_id,
+                                file_path=media_path,
+                            )
+                    except Exception:
+                        pass
+            else:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + "(No response generated)",
+                    metadata=thread_metadata,
+                )
+        except Exception as exc:
+            logger.exception("Background task %s failed", task_id)
+            try:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f"❌ Background task {task_id} failed: {exc}",
+                    metadata=thread_metadata,
+                )
+            except Exception:
+                pass
 
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update command for gateway platforms."""

@@ -612,6 +612,7 @@ COMMANDS = {
     "/cron": "Manage scheduled tasks (list, add, remove)",
     "/skills": "Search, install, inspect, or manage skills from online registries",
     "/platforms": "Show gateway/messaging platform status",
+    "/background": "Run a prompt in a separate background session (usage: /background <prompt>)",
     "/reload-mcp": "Reload MCP servers from config.yaml",
     "/quit": "Exit the CLI (also: /exit, /q)",
 }
@@ -887,10 +888,22 @@ class HermesCLI:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
+
+        # Initialize SQLite session store early so command handlers (for example
+        # /background) can safely reference it before first normal chat turn.
+        self._session_db = None
+        try:
+            from hermes_state import SessionDB
+
+            self._session_db = SessionDB()
+        except Exception:
+            pass
         
         # History file for persistent input recall across sessions
         self._history_file = Path.home() / ".hermes_history"
         self._last_invalidate: float = 0.0  # throttle UI repaints
+        self._background_tasks: Dict[str, threading.Thread] = {}
+        self._background_task_counter = 0
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -965,13 +978,14 @@ class HermesCLI:
         if not self._ensure_runtime_credentials():
             return False
 
-        # Initialize SQLite session store for CLI sessions
-        self._session_db = None
-        try:
-            from hermes_state import SessionDB
-            self._session_db = SessionDB()
-        except Exception as e:
-            logger.debug("SQLite session store not available: %s", e)
+        # Initialize SQLite session store for CLI sessions (if not already done in __init__)
+        if self._session_db is None:
+            try:
+                from hermes_state import SessionDB
+
+                self._session_db = SessionDB()
+            except Exception as e:
+                logger.debug("SQLite session store not available: %s", e)
         
         # If resuming, validate the session exists and load its history
         if self._resumed and self._session_db:
@@ -1152,7 +1166,98 @@ class HermesCLI:
 
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
         _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}\n")
-    
+
+    def _handle_background_command(self, cmd: str):
+        """Handle /background <prompt> by running a separate agent session."""
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /background <prompt>")
+            _cprint("  Example: /background Summarize the top HN stories today")
+            _cprint("  The task runs in a separate session and results display here when done.")
+            return
+
+        prompt = parts[1].strip()
+        self._background_task_counter += 1
+        task_num = self._background_task_counter
+        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+        if not self._ensure_runtime_credentials():
+            _cprint("  (>_<) Cannot start background task: no valid credentials.")
+            return
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        _cprint(f'  🔄 Background task #{task_num} started: "{preview}"')
+        _cprint(f"  Task ID: {task_id}")
+        _cprint("  You can continue chatting - results will appear when done.\n")
+
+        def run_background():
+            try:
+                bg_agent = AIAgent(
+                    model=self.model,
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                    provider=self.provider,
+                    api_mode=self.api_mode,
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=self.enabled_toolsets,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
+                    prefill_messages=self.prefill_messages or None,
+                    reasoning_config=self.reasoning_config,
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    session_id=task_id,
+                    platform="cli",
+                    session_db=self._session_db,
+                    pass_session_id=self.pass_session_id,
+                )
+
+                result = bg_agent.run_conversation(
+                    user_message=prompt,
+                    task_id=task_id,
+                )
+                response = result.get("final_response", "") if result else ""
+                if not response and result and result.get("error"):
+                    response = f"Error: {result['error']}"
+
+                print()
+                _cprint(f"{_GOLD}{'-' * 40}{_RST}")
+                _cprint(f"  ✅ Background task #{task_num} complete")
+                _cprint(f'  Prompt: "{preview}"')
+                _cprint(f"{_GOLD}{'-' * 40}{_RST}")
+                if response:
+                    ChatConsole().print(
+                        Panel(
+                            response,
+                            title=f"⚕ Hermes (background #{task_num})",
+                            title_align="left",
+                            border_style="yellow",
+                            padding=(1, 2),
+                        )
+                    )
+                else:
+                    _cprint("  (No response generated)")
+            except Exception as exc:
+                print()
+                _cprint(f"  ❌ Background task #{task_num} failed: {exc}")
+            finally:
+                self._background_tasks.pop(task_id, None)
+                if self._app:
+                    self._invalidate(min_interval=0)
+
+        thread = threading.Thread(
+            target=run_background,
+            daemon=True,
+            name=f"bg-task-{task_id}",
+        )
+        self._background_tasks[task_id] = thread
+        thread.start()
+
     def show_tools(self):
         """Display available tools with kawaii ASCII art."""
         tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
@@ -1770,6 +1875,8 @@ class HermesCLI:
             self._show_usage()
         elif cmd_lower.startswith("/insights"):
             self._show_insights(cmd_original)
+        elif cmd_lower.startswith("/background"):
+            self._handle_background_command(cmd_original)
         elif cmd_lower == "/reload-mcp":
             self._reload_mcp()
         else:

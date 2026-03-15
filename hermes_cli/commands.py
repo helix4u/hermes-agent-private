@@ -30,6 +30,7 @@ COMMANDS = {
     "/compress": "Manually compress conversation context (flush memories + summarize)",
     "/usage": "Show token usage for the current session",
     "/insights": "Show usage insights and analytics (last 30 days)",
+    "/background": "Run a prompt in a separate background session (usage: /background <prompt>)",
     "/quit": "Exit the CLI (also: /exit, /q)",
 }
 
